@@ -34,7 +34,7 @@ one 10-CPU k3d node (Docker Desktop, Apple silicon), Portus and agentgateway v1.
 same backend pods, load generator in-cluster, `kubectl top` sampled every 5 s. Numbers from one machine are
 only comparable with each other; method and full tables are in [`benchmarks/`](benchmarks/README.md).
 
-**Traffic** (3 proxy pods each; Portus limited to 2 Pingora worker threads per pod, agentgateway unlimited):
+**Traffic** (3 proxy pods each; Portus limited to 2 Pingora worker threads per pod, agentgateway unlimited). Requests are bare `GET /` against a small echo response, so these figures measure per-request overhead, not throughput with large payloads, request bodies or TLS termination; those runs are still to come.
 
 | | Peak QPS (256 conns) | p99 at peak | p99 at fixed 30k QPS | Proxy CPU at 30k QPS |
 |---|---|---|---|---|
