@@ -1,0 +1,146 @@
+# Release: a `vX.Y.Z` tag publishes multi-arch images and the Helm chart to GHCR.
+#
+#   ghcr.io/portus-gateway/controller:X.Y.Z (+ latest)   linux/amd64, linux/arm64
+#   ghcr.io/portus-gateway/dataplane:X.Y.Z  (+ latest)   linux/amd64, linux/arm64
+#   oci://ghcr.io/portus-gateway/charts/portus-gateway   version X.Y.Z
+#
+# Each architecture builds natively on its own runner (no QEMU) and pushes by
+# digest; a manifest list then joins them under the version tag. The chart's
+# `version` and `appVersion` must equal the tag.
+name: release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NS: ghcr.io/portus-gateway
+
+jobs:
+  images:
+    name: ${{ matrix.component }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        component: [controller, dataplane]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.${{ matrix.component }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=${{ env.IMAGE_NS }}/${{ matrix.component }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }},mode=max
+      - name: Record digest
+        run: |
+          mkdir -p /tmp/digests
+          echo "${{ steps.build.outputs.digest }}" | sed 's/^sha256://' > "/tmp/digests/${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.component }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  manifests:
+    name: ${{ matrix.component }} manifest
+    needs: images
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        component: [controller, dataplane]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-${{ matrix.component }}-*
+          path: /tmp/digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-arch manifest
+        working-directory: /tmp/digests
+        run: |
+          set -euo pipefail
+          IMAGE="$IMAGE_NS/${{ matrix.component }}"
+          VERSION="${GITHUB_REF_NAME#v}"
+          docker buildx imagetools create \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
+            $(for d in *; do printf '%s@sha256:%s ' "$IMAGE" "$(cat "$d")"; done)
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+
+  chart:
+    name: helm chart
+    needs: manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: Chart version must match the tag
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          chart="$(yq -r .version deploy/helm/Chart.yaml)"
+          app="$(yq -r .appVersion deploy/helm/Chart.yaml)"
+          [ "$chart" = "$VERSION" ] || { echo "Chart.yaml version $chart != tag $VERSION"; exit 1; }
+          [ "$app" = "$VERSION" ] || { echo "Chart.yaml appVersion $app != tag $VERSION"; exit 1; }
+      - name: Lint, package, push
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          helm lint deploy/helm
+          helm package deploy/helm --destination /tmp/chart
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          helm push "/tmp/chart/portus-gateway-$VERSION.tgz" "oci://$IMAGE_NS/charts"
+
+  release:
+    name: github release
+    needs: chart
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > /tmp/notes.md <<NOTES
+          ## Install
+
+          \`\`\`bash
+          kubectl apply --server-side --force-conflicts \\
+            -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
+          helm install portus oci://$IMAGE_NS/charts/portus-gateway --version $VERSION \\
+            --namespace portus --create-namespace
+          \`\`\`
+
+          Images: \`$IMAGE_NS/controller:$VERSION\`, \`$IMAGE_NS/dataplane:$VERSION\` (linux/amd64, linux/arm64).
+
+          See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/$GITHUB_REF_NAME/CHANGELOG.md) for what changed.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file /tmp/notes.md --verify-tag

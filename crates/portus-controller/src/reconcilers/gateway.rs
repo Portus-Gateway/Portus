@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// The dataplane template is read from the controller's environment once.
-fn dataplane_template() -> &'static super::provisioner::DataplaneTemplate {
+pub fn dataplane_template() -> &'static super::provisioner::DataplaneTemplate {
     static TEMPLATE: std::sync::OnceLock<super::provisioner::DataplaneTemplate> = std::sync::OnceLock::new();
     TEMPLATE.get_or_init(super::provisioner::DataplaneTemplate::from_env)
 }

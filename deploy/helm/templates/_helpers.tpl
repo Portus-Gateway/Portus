@@ -58,3 +58,28 @@ Create the name of the service account to use.
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Image references: the tag defaults to the chart's appVersion so a chart
+version pins the images it was released with.
+*/}}
+{{- define "portus-gateway.controllerImage" -}}
+{{- printf "%s:%s" .Values.controller.image.repository (default .Chart.AppVersion .Values.controller.image.tag) }}
+{{- end }}
+
+{{- define "portus-gateway.dataplaneImage" -}}
+{{- printf "%s:%s" .Values.dataplane.image.repository (default .Chart.AppVersion .Values.dataplane.image.tag) }}
+{{- end }}
+
+{{/*
+The controller's gRPC Service name and the mTLS Secret for the config stream:
+the user's Secret when grpcTls.secretName is set, otherwise the one the chart
+generates (templates/grpc-tls-secret.yaml).
+*/}}
+{{- define "portus-gateway.controllerServiceName" -}}
+{{- printf "%s-controller" (include "portus-gateway.fullname" .) }}
+{{- end }}
+
+{{- define "portus-gateway.grpcTlsSecretName" -}}
+{{- default (printf "%s-grpc-tls" (include "portus-gateway.fullname" .)) .Values.grpcTls.secretName }}
+{{- end }}

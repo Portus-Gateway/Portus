@@ -1,6 +1,3 @@
-{{- if and .Values.grpcTls.enabled (empty .Values.grpcTls.secretName) }}
-{{- fail "grpcTls.enabled is true but grpcTls.secretName is not set. Set the Secret name containing TLS certificates, or set grpcTls.enabled=false." }}
-{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -34,7 +31,7 @@ spec:
         - name: controller
           securityContext:
             {{- toYaml .Values.controller.containerSecurityContext | nindent 12 }}
-          image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+          image: {{ include "portus-gateway.controllerImage" . | quote }}
           imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
           ports:
             - name: grpc
@@ -51,8 +48,12 @@ spec:
             - name: CONTROLLER_NAME
               value: {{ .Values.controller.controllerName }}
             # Per-Gateway dataplane provisioning template (see dataplane in values.yaml)
+            - name: PORTUS_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: PORTUS_DATAPLANE_IMAGE
-              value: "{{ .Values.dataplane.image.repository }}:{{ .Values.dataplane.image.tag }}"
+              value: {{ include "portus-gateway.dataplaneImage" . | quote }}
             - name: PORTUS_DATAPLANE_PULL_POLICY
               value: {{ .Values.dataplane.image.pullPolicy | quote }}
             - name: PORTUS_DATAPLANE_REPLICAS
@@ -64,10 +65,11 @@ spec:
               value: {{ range $k, $v := .Values.dataplane.service.annotations }}{{ $k }}={{ $v }},{{ end }}
             {{- end }}
             - name: PORTUS_CONTROLLER_ADDR
-              value: {{ .Values.dataplane.controllerUrl | default (printf "%s-controller.%s:%d" (include "portus-gateway.fullname" .) .Release.Namespace (.Values.controller.grpcPort | int)) | quote }}
+              value: {{ .Values.dataplane.controllerUrl | default (printf "%s.%s:%d" (include "portus-gateway.controllerServiceName" .) .Release.Namespace (.Values.controller.grpcPort | int)) | quote }}
             {{- if .Values.grpcTls.enabled }}
+            # Copied into each Gateway's namespace for its dataplane pods.
             - name: PORTUS_GRPC_TLS_SECRET
-              value: {{ .Values.grpcTls.secretName | quote }}
+              value: {{ include "portus-gateway.grpcTlsSecretName" . | quote }}
             {{- end }}
             - name: PORTUS_DATAPLANE_LOG_LEVEL
               value: {{ .Values.dataplane.logLevel | quote }}
@@ -111,5 +113,5 @@ spec:
       volumes:
         - name: grpc-tls
           secret:
-            secretName: {{ .Values.grpcTls.secretName }}
+            secretName: {{ include "portus-gateway.grpcTlsSecretName" . }}
       {{- end }}

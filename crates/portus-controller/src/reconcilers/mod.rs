@@ -281,6 +281,8 @@ pub fn intersect_hostnames(listener: &str, route: &str) -> Option<String> {
 pub enum ReconcileError {
     #[error("kube error: {0}")]
     Kube(#[from] kube::Error),
+    #[error("provisioning: {0}")]
+    Provision(#[from] provisioner::ProvisionError),
     #[error("missing field: {0}")]
     MissingField(String),
 }

@@ -1,9 +1,12 @@
 //! Per-Gateway dataplane provisioning.
 //!
 //! Every accepted Gateway gets its own dataplane `Deployment`, a `Service`
-//! exposing exactly its listener ports, and a `PodDisruptionBudget`, all owned
-//! by the Gateway (garbage-collected with it). The Service's address is what
-//! the Gateway reports in `status.addresses`, so two Gateways never share an
+//! exposing exactly its listener ports, a `PodDisruptionBudget` and, when the
+//! config stream runs over mTLS, a copy of the controller's TLS `Secret` in
+//! the Gateway's namespace (a pod can only mount Secrets from its own
+//! namespace), all owned by the Gateway (garbage-collected with it). The
+//! Service's address is what the Gateway reports in `status.addresses`, so two
+//! Gateways never share an
 //! address and each dataplane only ever runs its own Gateway's config
 //! (`compiler::scope_config`, selected by the `GATEWAY_NAMESPACE`/`GATEWAY_NAME`
 //! environment the Deployment sets).
@@ -16,7 +19,7 @@ use std::collections::BTreeMap;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy, RollingUpdateDeployment};
 use k8s_openapi::api::core::v1::{
     Capabilities, Container, ContainerPort, EnvVar, HTTPGetAction, PodSecurityContext, PodSpec,
-    PodTemplateSpec, Probe, ResourceRequirements, SecretVolumeSource, SecurityContext, Service,
+    PodTemplateSpec, Probe, ResourceRequirements, Secret, SecretVolumeSource, SecurityContext, Service,
     ServicePort, ServiceSpec, Volume, VolumeMount,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
@@ -56,7 +59,10 @@ pub struct DataplaneTemplate {
     pub service_annotations: BTreeMap<String, String>,
     /// `host:port` of the controller's gRPC config stream.
     pub controller_addr: String,
-    /// Secret with `ca.crt`, `tls.crt`, `tls.key` for the gRPC stream; None =
+    /// Namespace the controller runs in: where `grpc_tls_secret` lives.
+    pub controller_namespace: String,
+    /// Secret in `controller_namespace` with `ca.crt`, `tls.crt`, `tls.key`
+    /// for the gRPC stream, copied into every Gateway's namespace; None =
     /// plaintext (`GRPC_TLS_INSECURE=true`, dev only).
     pub grpc_tls_secret: Option<String>,
     pub log_level: String,
@@ -95,6 +101,7 @@ impl DataplaneTemplate {
             service_type: var("PORTUS_DATAPLANE_SERVICE_TYPE").unwrap_or_else(|| "LoadBalancer".into()),
             service_annotations: kv_list("PORTUS_DATAPLANE_SERVICE_ANNOTATIONS"),
             controller_addr: var("PORTUS_CONTROLLER_ADDR").unwrap_or_else(|| "portus-controller:50051".into()),
+            controller_namespace: var("PORTUS_NAMESPACE").unwrap_or_else(|| "portus".into()),
             grpc_tls_secret: var("PORTUS_GRPC_TLS_SECRET"),
             log_level: var("PORTUS_DATAPLANE_LOG_LEVEL").unwrap_or_else(|| "info".into()),
             service_account: var("PORTUS_DATAPLANE_SERVICE_ACCOUNT"),
@@ -103,6 +110,45 @@ impl DataplaneTemplate {
             memory_limit: var("PORTUS_DATAPLANE_MEMORY_LIMIT").unwrap_or_else(|| "512Mi".into()),
         }
     }
+
+    /// Whether the Secret `namespace/name` is the gRPC TLS material every
+    /// Gateway's dataplane runs with; a change to it re-provisions them all.
+    pub fn is_grpc_tls_source(&self, namespace: &str, name: &str) -> bool {
+        self.grpc_tls_secret.as_deref() == Some(name) && self.controller_namespace == namespace
+    }
+}
+
+/// The TLS Secret keys the config stream needs, copied verbatim per Gateway.
+const GRPC_TLS_KEYS: [&str; 3] = ["ca.crt", "tls.crt", "tls.key"];
+
+/// Why a Gateway could not be provisioned.
+#[derive(Debug, thiserror::Error)]
+pub enum ProvisionError {
+    #[error("{0}")]
+    Kube(#[from] kube::Error),
+    #[error("gRPC TLS Secret {namespace}/{name} has no `{key}` key")]
+    TlsSecretKeyMissing { namespace: String, name: String, key: &'static str },
+}
+
+/// The Gateway-owned copy of the controller's gRPC TLS Secret: only the three
+/// keys the dataplane mounts, so unrelated data in the source never spreads.
+pub fn desired_tls_secret(gw: &GatewayRef, source: &Secret) -> Result<Secret, ProvisionError> {
+    let data = source.data.as_ref();
+    let mut copied = BTreeMap::new();
+    for key in GRPC_TLS_KEYS {
+        let value = data.and_then(|d| d.get(key)).ok_or_else(|| ProvisionError::TlsSecretKeyMissing {
+            namespace: source.metadata.namespace.clone().unwrap_or_default(),
+            name: source.metadata.name.clone().unwrap_or_default(),
+            key,
+        })?;
+        copied.insert(key.to_string(), value.clone());
+    }
+    Ok(Secret {
+        metadata: metadata(gw, BTreeMap::new()),
+        type_: Some("kubernetes.io/tls".into()),
+        data: Some(copied),
+        ..Default::default()
+    })
 }
 
 /// Transport of a listener port on the Service and the pod.
@@ -324,27 +370,27 @@ pub fn desired_deployment(gw: &GatewayRef, tpl: &DataplaneTemplate) -> Deploymen
     ];
     let mut volumes = Vec::new();
     let mut mounts = Vec::new();
-    match &tpl.grpc_tls_secret {
-        Some(secret) => {
-            envs.push(env("GRPC_TLS_CA", "/etc/grpc-tls/ca.crt"));
-            envs.push(env("GRPC_TLS_CERT", "/etc/grpc-tls/tls.crt"));
-            envs.push(env("GRPC_TLS_KEY", "/etc/grpc-tls/tls.key"));
-            volumes.push(Volume {
-                name: "grpc-tls".into(),
-                secret: Some(SecretVolumeSource {
-                    secret_name: Some(secret.clone()),
-                    ..Default::default()
-                }),
+    if tpl.grpc_tls_secret.is_some() {
+        envs.push(env("GRPC_TLS_CA", "/etc/grpc-tls/ca.crt"));
+        envs.push(env("GRPC_TLS_CERT", "/etc/grpc-tls/tls.crt"));
+        envs.push(env("GRPC_TLS_KEY", "/etc/grpc-tls/tls.key"));
+        // The Gateway-owned copy `apply` writes next to the Deployment.
+        volumes.push(Volume {
+            name: "grpc-tls".into(),
+            secret: Some(SecretVolumeSource {
+                secret_name: Some(object_name(&gw.name, &gw.uid)),
                 ..Default::default()
-            });
-            mounts.push(VolumeMount {
-                name: "grpc-tls".into(),
-                mount_path: "/etc/grpc-tls".into(),
-                read_only: Some(true),
-                ..Default::default()
-            });
-        }
-        None => envs.push(env("GRPC_TLS_INSECURE", "true")),
+            }),
+            ..Default::default()
+        });
+        mounts.push(VolumeMount {
+            name: "grpc-tls".into(),
+            mount_path: "/etc/grpc-tls".into(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    } else {
+        envs.push(env("GRPC_TLS_INSECURE", "true"));
     }
 
     let mut container_ports: Vec<ContainerPort> = service_ports(gw)
@@ -582,11 +628,21 @@ pub fn load_balancer_pending(svc: &Service) -> bool {
 }
 
 /// Server-side-apply the generated objects for a Gateway and return the
-/// Service as the API server now has it (for address reporting).
-pub async fn apply(client: &kube::Client, gw: &GatewayRef, tpl: &DataplaneTemplate) -> Result<Service, kube::Error> {
+/// Service as the API server now has it (for address reporting). The TLS
+/// Secret copy is written before the Deployment so the pods never start
+/// against a missing volume.
+pub async fn apply(client: &kube::Client, gw: &GatewayRef, tpl: &DataplaneTemplate) -> Result<Service, ProvisionError> {
     let pp = PatchParams::apply(FIELD_MANAGER).force();
     let ns = gw.namespace.as_str();
     let name = object_name(&gw.name, &gw.uid);
+
+    if let Some(source_name) = &tpl.grpc_tls_secret {
+        let source: Api<Secret> = Api::namespaced(client.clone(), &tpl.controller_namespace);
+        let source = with_write_timeout("gRPC TLS Secret get", source.get(source_name)).await?;
+        let copy = desired_tls_secret(gw, &source)?;
+        let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+        with_write_timeout("gRPC TLS Secret apply", secrets.patch(&name, &pp, &Patch::Apply(copy))).await?;
+    }
 
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), ns);
     with_write_timeout(
@@ -598,11 +654,11 @@ pub async fn apply(client: &kube::Client, gw: &GatewayRef, tpl: &DataplaneTempla
     with_write_timeout("dataplane PDB apply", pdbs.patch(&name, &pp, &Patch::Apply(desired_pdb(gw, tpl)))).await?;
 
     let services: Api<Service> = Api::namespaced(client.clone(), ns);
-    with_write_timeout(
+    Ok(with_write_timeout(
         "Gateway Service apply",
         services.patch(&name, &pp, &Patch::Apply(desired_service(gw, tpl))),
     )
-    .await
+    .await?)
 }
 
 /// `GatewayRef` from a live Gateway object plus the ports the store knows
@@ -631,6 +687,7 @@ mod tests {
             service_type: "LoadBalancer".into(),
             service_annotations: BTreeMap::from([("lb/type".to_string(), "nlb".to_string())]),
             controller_addr: "portus-controller.portus:50051".into(),
+            controller_namespace: "portus".into(),
             grpc_tls_secret: Some("portus-grpc-tls".into()),
             log_level: "info".into(),
             service_account: Some("portus-dataplane".into()),
@@ -773,7 +830,11 @@ mod tests {
         assert_eq!(envs["DATAPLANE_THREADS"], "2", "sized from the 250m CPU request, floor 2");
         assert_eq!(envs["GRPC_TLS_CA"], "/etc/grpc-tls/ca.crt");
         assert!(!envs.contains_key("GRPC_TLS_INSECURE"));
-        assert_eq!(pod.volumes.unwrap()[0].secret.as_ref().unwrap().secret_name.as_deref(), Some("portus-grpc-tls"));
+        assert_eq!(
+            pod.volumes.unwrap()[0].secret.as_ref().unwrap().secret_name.as_deref(),
+            Some("portus-same-namespace-uid123"),
+            "mounts the Gateway-owned copy in its own namespace, not the controller's Secret"
+        );
         let names: Vec<String> = c.ports.clone().unwrap().into_iter().filter_map(|p| p.name).collect();
         assert_eq!(names, vec!["tcp-80", "tcp-443", "tcp-8080", "health", "metrics"]);
         let sc = c.security_context.as_ref().unwrap();
@@ -796,6 +857,55 @@ mod tests {
         assert!(envs.contains(&"GRPC_TLS_INSECURE".to_string()));
         assert!(!envs.contains(&"GRPC_TLS_CA".to_string()));
         assert!(pod.volumes.is_none());
+    }
+
+    fn source_secret(data: &[(&str, &str)]) -> Secret {
+        Secret {
+            metadata: ObjectMeta {
+                name: Some("portus-grpc-tls".into()),
+                namespace: Some("portus".into()),
+                ..Default::default()
+            },
+            type_: Some("Opaque".into()),
+            data: Some(
+                data.iter()
+                    .map(|(k, v)| (k.to_string(), k8s_openapi::ByteString(v.as_bytes().to_vec())))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tls_secret_copy_carries_only_the_stream_material_and_is_owned_by_the_gateway() {
+        let src = source_secret(&[("ca.crt", "CA"), ("tls.crt", "CERT"), ("tls.key", "KEY"), ("unrelated", "x")]);
+        let copy = desired_tls_secret(&gw(), &src).unwrap();
+        assert_eq!(copy.metadata.name.as_deref(), Some("portus-same-namespace-uid123"), "same name as the Deployment it feeds");
+        assert_eq!(copy.metadata.namespace.as_deref(), Some("infra"), "lives where the dataplane pods run");
+        assert_eq!(copy.metadata.owner_references.unwrap()[0].uid, "uid-123");
+        assert_eq!(copy.type_.as_deref(), Some("kubernetes.io/tls"));
+        let data = copy.data.unwrap();
+        assert_eq!(data.len(), 3, "unrelated keys are not spread into other namespaces");
+        assert_eq!(data["tls.key"].0, b"KEY");
+        assert_eq!(copy.metadata.labels.unwrap()[LABEL_COMPONENT], "dataplane");
+    }
+
+    #[test]
+    fn tls_secret_copy_refuses_a_source_missing_a_key() {
+        let src = source_secret(&[("ca.crt", "CA"), ("tls.crt", "CERT")]);
+        let err = desired_tls_secret(&gw(), &src).unwrap_err().to_string();
+        assert_eq!(err, "gRPC TLS Secret portus/portus-grpc-tls has no `tls.key` key");
+    }
+
+    #[test]
+    fn only_the_configured_secret_in_the_controller_namespace_is_the_tls_source() {
+        let t = tpl();
+        assert!(t.is_grpc_tls_source("portus", "portus-grpc-tls"));
+        assert!(!t.is_grpc_tls_source("infra", "portus-grpc-tls"), "a same-named Secret elsewhere is not ours");
+        assert!(!t.is_grpc_tls_source("portus", "other"));
+        let mut plain = tpl();
+        plain.grpc_tls_secret = None;
+        assert!(!plain.is_grpc_tls_source("portus", "portus-grpc-tls"));
     }
 
     #[test]

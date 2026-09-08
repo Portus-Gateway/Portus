@@ -128,7 +128,6 @@ deploy: gateway-api-crds disk-check
 		--set dataplane.image.pullPolicy=Never \
 		--set dataplane.service.type=ClusterIP \
 		--set dataplane.replicasPerGateway=1 \
-		--set grpcTls.enabled=false \
 		--wait
 
 # ── Benchmark (howardjohn/gateway-api-bench traffic method, in-cluster) ─────
