@@ -1,0 +1,52 @@
+[package]
+name = "portus-dataplane"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Pingora-based data plane for Portus Kubernetes Gateway API proxy"
+license = "Apache-2.0"
+repository = "https://github.com/Portus-Gateway/Portus"
+keywords = ["proxy", "gateway-api", "pingora", "networking"]
+categories = ["network-programming"]
+
+[dependencies]
+portus-types = { path = "../portus-types" }
+pingora-core = { workspace = true }
+pingora-proxy = { workspace = true }
+pingora-http = { workspace = true }
+pingora-load-balancing = { workspace = true }
+arc-swap = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+prometheus = { workspace = true }
+async-trait = { workspace = true }
+log = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-log = { workspace = true }
+mimalloc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+x509-parser = { workspace = true }
+notify = { workspace = true }
+regex = { workspace = true }
+hashbrown = { workspace = true }
+arcstr = { workspace = true }
+arrayvec = "0.7"
+dashmap = "6"
+bcrypt = "0.19"
+subtle = "2"
+ipnet = "2"
+rcgen = "0.14"
+rand = "0.10"
+zeroize = { version = "1", features = ["derive"] }

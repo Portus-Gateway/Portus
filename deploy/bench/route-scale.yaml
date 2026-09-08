@@ -1,0 +1,22 @@
+# pilot-load config for the gateway-api-bench "route scale" test: NAMESPACES
+# namespaces x ROUTES applications, each with a pod and an HTTPRoute attached to
+# every Gateway in GATEWAYS, on 20 simulated nodes, churned continuously.
+jitter:
+  workloads: "2s"
+  config: "1s"
+gracePeriod: 500ms
+namespaces:
+  - name: mesh
+    replicas: ${NAMESPACES}
+    applications:
+    - name: app
+      replicas: ${ROUTES}
+      pods: 1
+      type: plain
+      configs:
+      - name: httproute
+        config:
+          gateways: ${GATEWAYS_JSON}
+nodes:
+- name: node
+  count: 20

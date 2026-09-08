@@ -1,0 +1,167 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "portus-gateway.serviceAccountName" . }}
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "portus-gateway.fullname" . }}-controller
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+  # Gateway API resources (read)
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - gatewayclasses
+      - gateways
+      - httproutes
+      - grpcroutes
+      - tlsroutes
+      - tcproutes
+      - udproutes
+      - referencegrants
+      - backendtlspolicies
+      - listenersets
+    verbs: ["get", "list", "watch"]
+  # Gateway API resources (status write)
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - gatewayclasses/status
+      - gateways/status
+      - httproutes/status
+      - grpcroutes/status
+      - tlsroutes/status
+      - tcproutes/status
+      - udproutes/status
+      - backendtlspolicies/status
+      - listenersets/status
+    verbs: ["get", "patch", "update"]
+  # Policy CRDs - portus-gateway.dev (read)
+  - apiGroups: ["portus-gateway.dev"]
+    resources:
+      - ratelimitpolicies
+      - circuitbreakerpolicies
+      - connectionpolicies
+      - basicauthpolicies
+      - apikeyauthpolicies
+      - retrypolicies
+      - ipallowlistpolicies
+      - requestbodysizelimitpolicies
+      - healthcheckpolicies
+      - corspolicies
+      - timeoutpolicies
+    verbs: ["get", "list", "watch"]
+  # Policy CRDs - portus-gateway.dev (status write)
+  - apiGroups: ["portus-gateway.dev"]
+    resources:
+      - ratelimitpolicies/status
+      - circuitbreakerpolicies/status
+      - connectionpolicies/status
+      - basicauthpolicies/status
+      - apikeyauthpolicies/status
+      - retrypolicies/status
+      - ipallowlistpolicies/status
+      - requestbodysizelimitpolicies/status
+      - healthcheckpolicies/status
+      - corspolicies/status
+      - timeoutpolicies/status
+    verbs: ["get", "patch", "update"]
+  # Services: read for port mapping (service port → target port); write for
+  # the per-Gateway Services the provisioner owns.
+  - apiGroups: [""]
+    resources:
+      - services
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # Per-Gateway dataplane Deployments and PodDisruptionBudgets
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # Secrets (for auth policies).
+  # NOTE: Cluster-wide list+watch is required by kube-rs informer cache.
+  # This is broader than ideal — future improvement: per-namespace Roles.
+  - apiGroups: [""]
+    resources:
+      - secrets
+    verbs: ["get", "list", "watch"]
+  # ConfigMaps (for BackendTLSPolicy CA certificate references)
+  - apiGroups: [""]
+    resources:
+      - configmaps
+    verbs: ["get", "list", "watch"]
+  # Namespaces (for ListenerSet allowedListeners selector label matching)
+  - apiGroups: [""]
+    resources:
+      - namespaces
+    verbs: ["get", "list", "watch"]
+  # EndpointSlices (for backend resolution)
+  - apiGroups: ["discovery.k8s.io"]
+    resources:
+      - endpointslices
+    verbs: ["get", "list", "watch"]
+  # Events (for status reporting)
+  - apiGroups: [""]
+    resources:
+      - events
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "portus-gateway.fullname" . }}-controller
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "portus-gateway.fullname" . }}-controller
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "portus-gateway.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Role for leader election Lease (namespaced to controller's namespace)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "portus-gateway.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "portus-gateway.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "portus-gateway.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "portus-gateway.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}

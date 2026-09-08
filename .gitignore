@@ -1,0 +1,23 @@
+# Rust
+target/
+
+# Benchmark raw output and conformance report are produced locally
+benchmarks/results/
+tests/conformance/conformance-report.yaml
+
+# Task runner cache
+.task/
+
+# OS
+.DS_Store
+
+# IDE / editor
+.vscode/settings.json
+*.swp
+*.swo
+*~
+
+# Internal / session
+.planning/
+.claude/*
+!.claude/CLAUDE.md

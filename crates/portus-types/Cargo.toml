@@ -1,0 +1,20 @@
+[package]
+name = "portus-types"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Shared protobuf types for Portus Gateway API proxy"
+license = "Apache-2.0"
+repository = "https://github.com/Portus-Gateway/Portus"
+keywords = ["protobuf", "gateway-api", "types"]
+categories = ["network-programming"]
+
+[dependencies]
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }

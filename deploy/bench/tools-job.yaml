@@ -1,0 +1,56 @@
+# Rendered by deploy/bench/render-job.py: one gateway-api-bench tool run
+# in-cluster with cluster-admin (the tools create namespaces, routes, pods
+# and exec into backend pods).
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bench-tools
+  namespace: bench
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bench-tools
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: bench-tools
+    namespace: bench
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bench-tools
+  namespace: bench
+  labels:
+    app.kubernetes.io/name: bench-tools
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bench-tools
+    spec:
+      serviceAccountName: bench-tools
+      restartPolicy: Never
+      containers:
+        - name: tool
+          image: ${BENCH_TOOLS_IMAGE}
+          imagePullPolicy: Never
+          command: [${BENCH_ARGS_JSON}]
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /work/config
+      volumes:
+        - name: config
+          configMap:
+            name: route-scale
+            optional: true

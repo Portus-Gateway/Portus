@@ -1,0 +1,8 @@
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: {{ .Values.controller.gatewayClassName }}
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+spec:
+  controllerName: {{ .Values.controller.controllerName }}

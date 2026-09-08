@@ -1,0 +1,44 @@
+# Benchmark backend: howardjohn/hyper-server, the same backend as
+# howardjohn/gateway-api-bench. Every gateway under test routes to it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bench
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: bench
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: howardjohn/hyper-server
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: bench
+spec:
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

@@ -1,0 +1,80 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: retrypolicies.portus-gateway.dev
+  labels:
+    gateway.networking.k8s.io/policy: direct
+spec:
+  group: portus-gateway.dev
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [targetRef, retry]
+              properties:
+                targetRef:
+                  type: object
+                  required: [group, kind, name]
+                  properties:
+                    group:
+                      type: string
+                    kind:
+                      type: string
+                      enum: [HTTPRoute, GRPCRoute, Gateway]
+                    name:
+                      type: string
+                    sectionName:
+                      type: string
+                retry:
+                  type: object
+                  properties:
+                    maxRetries:
+                      type: integer
+                      minimum: 0
+                      maximum: 10
+                    retryOn:
+                      description: >-
+                        Conditions that trigger a retry. Retries happen at upstream
+                        connection time only (the request is replayed to another
+                        endpoint when the connection fails); a response already
+                        received from a backend is never retried. `gateway-error`
+                        is accepted as an alias for that connection-failure retry.
+                      type: array
+                      items:
+                        type: string
+                        enum: [connect-failure, gateway-error]
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+  scope: Namespaced
+  names:
+    plural: retrypolicies
+    singular: retrypolicy
+    kind: RetryPolicy
+    shortNames: [rtp]

@@ -1,0 +1,145 @@
+# Portus Standalone Configuration
+#
+# Run with: PORTUS_CONFIG_FILE=examples/standalone.yaml ./portus-dataplane
+#
+# This file configures the Portus proxy without a Kubernetes controller.
+# Changes are hot-reloaded automatically (no restart needed).
+
+listeners:
+  # HTTP listener on port 80
+  - port: 80
+    protocol: HTTP
+    routes:
+      # Simple reverse proxy: all traffic to a single backend
+      - hosts: ["app.example.com"]
+        backends:
+          - address: "10.0.0.1:8080"
+
+      # Path-based routing with multiple backends
+      - hosts: ["api.example.com"]
+        paths:
+          - path: /v1
+            type: Prefix
+        backends:
+          - address: "10.0.1.1:8080"
+            weight: 3
+          - address: "10.0.1.2:8080"
+            weight: 1
+
+      # Redirect HTTP to HTTPS
+      - hosts: ["secure.example.com"]
+        redirect:
+          scheme: https
+          status_code: 301
+
+      # Catch-all: any unmatched host goes here
+      - hosts: ["*"]
+        backends:
+          - address: "10.0.0.100:8080"
+
+  # HTTPS listener on port 443
+  # - port: 443
+  #   protocol: HTTPS
+  #   tls:
+  #     cert_file: /etc/tls/cert.pem
+  #     key_file: /etc/tls/key.pem
+  #   routes:
+  #     - hosts: ["secure.example.com"]
+  #       backends:
+  #         - address: "10.0.0.2:8080"
+
+  # Additional listener on a non-standard port
+  - port: 8080
+    protocol: HTTP
+    routes:
+      # Route with full feature set
+      - hosts: ["internal.example.com"]
+        paths:
+          - path: /api
+            type: Prefix
+        backends:
+          - address: "10.0.2.1:3000"
+        method: POST
+        headers:
+          - name: Content-Type
+            value: "application/json"
+            type: Exact
+        timeouts:
+          request_ms: 30000
+          backend_request_ms: 10000
+          connect_ms: 5000
+        retries:
+          max: 3
+          on: ["connect-failure", "5xx"]
+        rate_limit:
+          requests_per_second: 100
+          per_client: true
+        circuit_breaker:
+          failure_threshold: 5
+          success_threshold: 1
+          timeout_secs: 30
+        max_connections: 128
+        max_request_body_bytes: 10485760  # 10 MB
+        cors:
+          allow_origins: ["https://app.example.com"]
+          allow_methods: [GET, POST, PUT, DELETE]
+          allow_headers: [Content-Type, Authorization]
+          expose_headers: [X-Request-Id]
+          allow_credentials: true
+          max_age: 3600
+        request_headers:
+          add:
+            X-Forwarded-By: portus
+          set:
+            X-Environment: production
+          remove: [X-Debug]
+        response_headers:
+          add:
+            X-Served-By: portus
+
+      # URL rewrite example
+      - hosts: ["legacy.example.com"]
+        paths:
+          - path: /old-api
+            type: Prefix
+        backends:
+          - address: "10.0.2.2:3000"
+        rewrite:
+          path: /new-api
+          path_type: ReplacePrefixMatch
+
+      # IP allowlist example
+      - hosts: ["admin.example.com"]
+        backends:
+          - address: "10.0.2.3:3000"
+        ip_allowlist:
+          allow: ["10.0.0.0/8", "172.16.0.0/12"]
+          deny: ["10.0.0.99/32"]
+          trusted_proxies: ["172.16.0.1/32"]
+
+      # Basic auth example
+      # - hosts: ["protected.example.com"]
+      #   backends:
+      #     - address: "10.0.2.4:3000"
+      #   auth:
+      #     basic:
+      #       realm: "Admin Area"
+      #       credentials:
+      #         admin: "$2b$10$your-bcrypt-hash-here"
+
+      # API key auth example
+      # - hosts: ["api-auth.example.com"]
+      #   backends:
+      #     - address: "10.0.2.5:3000"
+      #   auth:
+      #     api_key:
+      #       header: X-API-Key
+      #       keys: ["your-api-key-1", "your-api-key-2"]
+
+      # Request mirroring example
+      # - hosts: ["mirrored.example.com"]
+      #   backends:
+      #     - address: "10.0.2.6:3000"
+      #   mirrors:
+      #     - address: "10.0.2.7:3000"
+      #       percent: 10  # Mirror 10% of requests

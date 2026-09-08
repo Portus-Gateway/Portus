@@ -1,0 +1,72 @@
+[workspace]
+members = ["crates/portus-types", "crates/portus-controller", "crates/portus-dataplane", "crates/pingora-core-patch"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.98"
+
+[workspace.dependencies]
+# Existing (promoted from cmd/proxy/Cargo.toml)
+kube = { version = "4", features = ["runtime", "client", "derive", "unstable-runtime"] }
+k8s-openapi = { version = "0.28", features = ["latest", "schemars"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+schemars = "1"
+arc-swap = "1"
+prometheus = { version = "0.14", default-features = false }
+pingora-core = { version = "0.8.1", features = ["rustls"] }
+pingora-proxy = { version = "0.8.1", features = ["rustls"] }
+pingora-http = "0.8.1"
+pingora-load-balancing = "0.8.1"
+async-trait = "0.1"
+log = "0.4"
+env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-log = "0.2"
+mimalloc = "0.1"
+futures = "0.3"
+bytes = "1"
+http = "1"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+x509-parser = { version = "0.18", default-features = false }
+notify = { version = "8", default-features = false, features = ["macos_kqueue"] }
+
+# NEW for Phase 7 (Gateway API)
+# gateway-api: deferred -- 0.19 requires kube 2.x/k8s-openapi 0.26, incompatible with workspace kube 3.x/k8s-openapi 0.27
+# Will resolve in Plan 02 when reconcilers actually need CRD types (options: downgrade kube, define types manually, or wait for gateway-api 0.20)
+thiserror = "2"
+
+# NEW for Phase 6 (gRPC + proto)
+tonic = { version = "0.14", features = ["tls-aws-lc"] }
+tonic-build = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+tokio-stream = { version = "0.1", features = ["sync"] }
+dashmap = "6.1"
+regex = "1"
+hashbrown = "0.17"
+arcstr = "1"
+
+[patch.crates-io]
+pingora-core = { path = "crates/pingora-core-patch" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = false
