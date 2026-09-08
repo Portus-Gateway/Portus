@@ -1,0 +1,26 @@
+# Rendered by deploy/bench/render-job.py: runs howardjohn/benchtool (fortio)
+# inside the cluster against the Gateway addresses in BENCH_TARGETS.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: benchtool
+  namespace: bench
+  labels:
+    app.kubernetes.io/name: benchtool
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: benchtool
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: benchtool
+          image: howardjohn/benchtool
+          args: [${BENCH_ARGS_JSON}, "${BENCH_TARGETS}"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: 256Mi

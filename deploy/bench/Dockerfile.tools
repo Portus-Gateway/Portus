@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.7
+# The control-plane and availability tests of howardjohn/gateway-api-bench
+# (attached routes, route propagation probe, route change, backend failover)
+# plus pilot-load for the route-scale scenarios, built at a pinned commit and
+# run inside the cluster as a Job (see deploy/bench/tools-job.yaml).
+FROM golang:1.26-alpine AS builder
+RUN apk add --no-cache git
+ARG BENCH_REF=141add64d254
+WORKDIR /src
+RUN git clone --depth 50 https://github.com/howardjohn/gateway-api-bench . && git checkout ${BENCH_REF}
+# Gateway API v1.6 rejects `retry.attempts: 0` (minimum 1); the tool wants "no
+# retries", which is what an absent `retry` block means. Drop it.
+RUN sed -i '/^      retry:$/,/^        attempts: 0$/d' tests/backendfailover/backendfailover.go \
+    && ! grep -q 'attempts: 0' tests/backendfailover/backendfailover.go
+RUN --mount=type=cache,id=go-mod,target=/go/pkg/mod --mount=type=cache,id=go-build,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go build -o /out/attachedroutes ./tests/attachedroutes \
+    && CGO_ENABLED=0 go build -o /out/probe ./tests/probe \
+    && CGO_ENABLED=0 go build -o /out/routechange ./tests/routechange \
+    && CGO_ENABLED=0 go build -o /out/backendfailover ./tests/backendfailover \
+    && CGO_ENABLED=0 go build -o /out/pilot-load github.com/howardjohn/pilot-load
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates curl \
+    && curl -sLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')/kubectl" \
+    && chmod +x /usr/local/bin/kubectl
+COPY --from=builder /out/ /usr/local/bin/
+WORKDIR /work

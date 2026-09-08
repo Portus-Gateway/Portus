@@ -1,0 +1,354 @@
+syntax = "proto3";
+package portus.config.v1;
+
+service ConfigDistribution {
+  rpc StreamConfig(ConfigRequest) returns (stream CompiledConfig);
+  // Programmed ACK: the data plane reports every config it has applied, keyed
+  // by content fingerprint, so the controller can set Gateway/Policy
+  // `Programmed` from what is really running rather than from what it sent.
+  rpc ReportApplied(AppliedReport) returns (AppliedAck);
+}
+
+message ConfigRequest {
+  string node_id = 1;              // data plane pod hostname
+  uint64 last_known_version = 2;   // informational: last generation seen (resets with the controller)
+  string schema_version = 3;       // e.g., "1.0.0" -- for compatibility check
+  reserved 4;                      // was bound_ports (shared data planes, removed)
+  uint64 last_applied_version = 5; // deprecated: generation applied; use last_applied_fingerprint
+  uint64 last_applied_fingerprint = 6; // content fingerprint of the config currently applied (0 = none)
+  // The Gateway this data plane serves (required): the controller streams only
+  // that Gateway's slice of the config.
+  string gateway_namespace = 7;
+  string gateway_name = 8;
+}
+
+message AppliedReport {
+  string node_id = 1;
+  uint64 fingerprint = 2;          // CompiledConfig.fingerprint that was applied
+  uint64 version = 3;              // CompiledConfig.version that carried it (informational)
+  string gateway_namespace = 4;    // Gateway this data plane serves (empty = shared)
+  string gateway_name = 5;
+}
+
+message AppliedAck {}
+
+message CompiledConfig {
+  string schema_version = 1;       // semantic version for compatibility
+  uint64 version = 2;              // generation counter; restarts with the controller, informational only
+  uint64 fingerprint = 10;         // order-independent content hash; identical content => identical fingerprint
+
+  // Phase 6: populated with basic route/backend data
+  repeated RouteConfig routes = 3;
+  repeated BackendGroup backends = 4;
+
+  // Phase 7+: populated when Gateway API reconcilers are built
+  repeated Listener listeners = 5;
+  reserved 6;                      // was TlsConfig tls (certificates live on Listener.tls_cert_ref)
+
+  // Phase 8: L4 routes
+  repeated TlsPassthroughRoute tls_passthrough_routes = 7;
+  repeated L4ProxyRoute tcp_proxy_routes = 8;
+  // UDPRoute: one entry per (UDP listener, programmed route).
+  repeated L4ProxyRoute udp_proxy_routes = 12;
+
+  // All TLS Passthrough listener hostnames (for SNI rejection of non-matching hostnames)
+  repeated string tls_passthrough_listener_hostnames = 9;
+
+  // Gateway `spec.tls.backend.clientCertificateRef`: the client certificate a
+  // Gateway presents to TLS backends, one entry per Gateway that sets it.
+  // Routes name their owning Gateway (RouteConfig.gateway_*), which is how the
+  // data plane picks the certificate for an upstream connection.
+  repeated GatewayBackendTls gateway_backend_tls = 11;
+
+  // Phase 9: populated when Policy CRDs are implemented
+  // (policies are resolved by controller and inlined into RouteConfig)
+}
+
+message Listener {
+  string name = 1;
+  uint32 port = 2;
+  string protocol = 3;             // HTTP, HTTPS, TLS, TCP
+  string hostname = 4;
+  TlsCertRef tls_cert_ref = 5;
+  // Owning Gateway (ListenerSet listeners are attributed to their parent Gateway).
+  string gateway_namespace = 6;
+  string gateway_name = 7;
+  // Frontend client certificate validation (Gateway `spec.tls.frontend`),
+  // HTTPS listeners only. Absent = clients are not asked for a certificate.
+  optional ClientValidation client_validation = 8;
+}
+
+message TlsCertRef {
+  string cert_pem = 1;
+  string key_pem = 2;
+}
+
+// Client (frontend) certificate validation for an HTTPS listener.
+message ClientValidation {
+  repeated string ca_cert_pems = 1;  // trust anchors (PEM bundles, one per caCertificateRef)
+  // "AllowValidOnly" (default): connections without a valid client certificate are
+  // rejected. "AllowInsecureFallback": a certificate is requested but connections
+  // without one, or with one that does not validate, are still accepted.
+  string mode = 2;
+}
+
+// Client certificate a Gateway presents to TLS backends.
+message GatewayBackendTls {
+  string gateway_namespace = 1;
+  string gateway_name = 2;
+  string cert_pem = 3;
+  string key_pem = 4;
+}
+
+message RouteConfig {
+  string host = 1;
+  repeated PathRule paths = 2;
+  string service_name = 3;
+  uint32 port = 4;
+  TimeoutConfig timeouts = 5;
+  uint32 max_retries = 6;
+  UpstreamTlsConfig upstream_tls = 7;
+  string protocol = 8;             // HTTP or GRPC
+  HeaderMutation request_headers = 9;
+  HeaderMutation response_headers = 10;
+  optional RateLimitConfig rate_limit = 11;
+  optional CircuitBreakerConfig circuit_breaker = 12;
+  optional uint32 max_connections = 13;
+
+  // Phase 7: Gateway API Core matching
+  repeated HeaderMatch header_matches = 14;
+  string method_match = 15;              // GET, POST, etc. Empty = any method
+  repeated QueryParamMatch query_param_matches = 16;
+
+  // Phase 7: Gateway API Core filters
+  optional RedirectFilter redirect = 17;   // If set, redirect instead of proxy
+  optional URLRewriteFilter url_rewrite = 18;
+
+  // Phase 7: GRPCRoute matching
+  optional GrpcRouteMatch grpc_match = 19;
+
+  // Phase 7: Listener binding
+  string listener_name = 20;             // Which listener this route belongs to
+
+  // Phase 8: Extended features
+  // Deprecated: use mirror_backends (field 27) instead.
+  optional MirrorBackend mirror_backend = 21 [deprecated = true];
+  repeated WeightedBackend weighted_backends = 22;
+  uint64 request_timeout_ms = 23;
+  uint64 backend_request_timeout_ms = 24;
+
+  // Phase 9: Auth config (inlined by compiler from policy CRDs)
+  optional AuthConfig auth = 25;
+
+  // Phase 10: Extended HTTP features
+  optional CORSConfig cors = 26;
+
+  // Phase 10: Multiple mirrors (supersedes mirror_backend field 21)
+  repeated MirrorBackend mirror_backends = 27;
+
+  // Listener port this route is bound to (0 = any/unspecified)
+  uint32 listener_port = 28;
+
+  // Phase 11: New policy attachments
+  optional IPAllowlistConfig ip_allowlist = 29;
+  uint64 max_request_body_bytes = 30;  // 0 = no limit
+  repeated string retry_on = 31;       // retry conditions: connect-failure, 5xx, gateway-error
+  // HTTPRoute rule `retry.codes`: upstream response statuses that are retried
+  // (up to max_retries more attempts) before the response is passed through.
+  repeated uint32 retry_codes = 35;
+
+  // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
+  // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.
+  // Exact hostname otherwise. Used to scope which routes are eligible for a request
+  // so requests matching a more-specific listener do not leak into catch-all routes.
+  string listener_hostname = 32;
+
+  // Owning Gateway of the listener this route is bound to (ListenerSet parents
+  // resolve to their parent Gateway). Lets the controller stream a per-Gateway
+  // slice of the config to dedicated data planes.
+  string gateway_namespace = 33;
+  string gateway_name = 34;
+}
+
+message PathRule {
+  string path = 1;
+  string match_type = 2;           // Exact, Prefix, RegularExpression
+}
+
+message TimeoutConfig {
+  uint64 connect_timeout_ms = 1;
+  uint64 read_timeout_ms = 2;
+  uint64 write_timeout_ms = 3;
+}
+
+message UpstreamTlsConfig {
+  bool enabled = 1;
+  bool verify_cert = 2;
+  string sni = 3;
+}
+
+message HeaderMutation {
+  map<string, string> add = 1;
+  repeated string remove = 2;
+  map<string, string> set = 3;
+}
+
+message RateLimitConfig {
+  uint32 requests_per_second = 1;
+  bool per_client = 2;  // When true, each client IP gets its own token bucket
+}
+
+message CircuitBreakerConfig {
+  uint32 failure_threshold = 1;
+  uint32 success_threshold = 2;
+  uint32 timeout_secs = 3;
+}
+
+message BackendGroup {
+  string service_name = 1;
+  uint32 port = 2;
+  repeated BackendEndpoint endpoints = 3;
+  optional HealthCheckConfig health_check = 4;
+  optional BackendTlsConfig backend_tls = 5;
+}
+
+// BackendTLSPolicy: TLS config for proxy-to-backend connections
+message BackendTlsConfig {
+  string ca_cert_pem = 1;                       // resolved CA certificate PEM data
+  string hostname = 2;                           // hostname for TLS server certificate verification
+  repeated SubjectAltName subject_alt_names = 3; // additional SAN validation constraints
+}
+
+message SubjectAltName {
+  string type = 1;    // "Hostname" or "URI"
+  string value = 2;   // the hostname or URI value
+}
+
+message BackendEndpoint {
+  string address = 1;
+  uint32 port = 2;
+}
+
+// Phase 7: Gateway API Core matching types
+
+message HeaderMatch {
+  string name = 1;
+  string value = 2;
+  string match_type = 3;   // Exact (default), RegularExpression (Phase 8)
+}
+
+message QueryParamMatch {
+  string name = 1;
+  string value = 2;
+  string match_type = 3;   // Exact (default)
+}
+
+message RedirectFilter {
+  string scheme = 1;       // http or https
+  string hostname = 2;
+  uint32 port = 3;
+  string path = 4;         // replacement path
+  string path_type = 5;    // ReplaceFullPath or ReplacePrefixMatch
+  uint32 status_code = 6;  // 301, 302, 303, 307, 308
+}
+
+message URLRewriteFilter {
+  string hostname = 1;           // replace Host header
+  string path = 2;               // replacement path
+  string path_type = 3;          // ReplaceFullPath or ReplacePrefixMatch
+}
+
+// Phase 8: L4 route messages
+
+message TlsPassthroughRoute {
+  repeated string sni_hostnames = 1;
+  string backend_service = 2;
+  uint32 backend_port = 3;
+  string listener_name = 4;
+  string listener_hostname = 5;  // Listener's hostname restriction (empty = match all)
+  string tls_mode = 6;           // "Passthrough" or "Terminate"
+  string cert_pem = 7;           // For Terminate mode (from listener's certificateRef Secret)
+  string key_pem = 8;            // For Terminate mode
+  uint32 listener_port = 9;      // Gateway listener port
+  string gateway_namespace = 10;
+  string gateway_name = 11;
+}
+
+message L4ProxyRoute {
+  string backend_service = 1;      // first backend (convenience for logs and tests)
+  uint32 backend_port = 2;
+  string listener_name = 3;
+  uint32 listener_port = 4;
+  // All backendRefs with weights (TCPRoute/UDPRoute weighted routing).
+  // request_headers is unused at L4.
+  repeated WeightedBackend backends = 5;
+  string gateway_namespace = 6;
+  string gateway_name = 7;
+}
+
+// Phase 8: Extended HTTP messages
+
+message MirrorBackend {
+  string service_name = 1;
+  uint32 port = 2;
+  uint32 percent = 3;  // 0 = mirror 100% of requests; 1-100 = percentage-based mirroring
+}
+
+message WeightedBackend {
+  string service_name = 1;
+  uint32 port = 2;
+  uint32 weight = 3;
+  HeaderMutation request_headers = 4;  // Per-backend request header modification
+}
+
+message GrpcRouteMatch {
+  string service = 1;    // gRPC service name (e.g., "mypackage.MyService")
+  string method = 2;     // gRPC method name (e.g., "DoThing"). Empty = match all methods
+  string match_type = 3; // Exact (default), RegularExpression (Phase 8)
+}
+
+// Phase 9: Auth config (inlined into RouteConfig by compiler)
+message AuthConfig {
+  oneof auth_type {
+    BasicAuthConfig basic_auth = 1;
+    ApiKeyAuthConfig api_key = 2;
+  }
+}
+
+message BasicAuthConfig {
+  // Map of username -> bcrypt hash
+  map<string, string> credentials = 1;
+  string realm = 2;
+}
+
+message ApiKeyAuthConfig {
+  // Set of valid API keys
+  repeated string valid_keys = 1;
+  string header_name = 2;  // default: X-API-Key
+}
+
+// Phase 10: CORS configuration
+message CORSConfig {
+  repeated string allow_origins = 1;
+  repeated string allow_methods = 2;
+  repeated string allow_headers = 3;
+  repeated string expose_headers = 4;
+  bool allow_credentials = 5;
+  uint32 max_age = 6;               // seconds; 0 = not set
+}
+
+// Phase 11: IP allowlist policy
+message IPAllowlistConfig {
+  repeated string allow_cidrs = 1;   // e.g., ["10.0.0.0/8"]
+  repeated string deny_cidrs = 2;    // deny takes precedence over allow
+  repeated string trusted_proxy_cidrs = 3;  // CIDRs of trusted proxies/LBs for XFF extraction
+}
+
+// Phase 11: Health check policy (targets Services, carried per-backend-group)
+message HealthCheckConfig {
+  string path = 1;                   // HTTP path to probe (e.g., "/healthz")
+  uint32 interval_secs = 2;
+  uint32 timeout_secs = 3;
+  uint32 healthy_threshold = 4;
+  uint32 unhealthy_threshold = 5;
+}

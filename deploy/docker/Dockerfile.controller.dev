@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.98-alpine AS builder
+
+RUN apk add --no-cache musl-dev cmake make perl build-base protoc
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+
+# BuildKit cache mounts keep the cargo registry and the target dir between
+# builds, so a code change recompiles only the crates that changed instead of
+# the whole dependency graph (~30 min cold on a laptop, seconds warm).
+# Each binary gets its own target cache so parallel builds do not block.
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target-controller-debug,target=/src/target \
+    cargo build -p portus-controller \
+    && mkdir -p /out && cp /src/target/debug/portus-controller /out/portus-controller
+
+FROM alpine:3.21
+
+COPY --from=builder /out/portus-controller /controller
+
+USER 1000
+
+EXPOSE 50051
+ENTRYPOINT ["/controller"]

@@ -1,0 +1,10 @@
+target/
+cmd/proxy/target/
+.git/
+.planning/
+.claude/
+tools/
+deploy/bench/
+deploy/handoff/
+crates/
+proto/

@@ -1,0 +1,25 @@
+# syntax=docker/dockerfile:1.7
+# Gateway API conformance suite, compiled to a test binary and run inside the
+# cluster. Running in-cluster means Gateway addresses only need to be reachable
+# from pods (ClusterIP or LoadBalancer alike), which is what lets the suite
+# exercise one address per Gateway on k3d/kind without host port mappings.
+FROM golang:1.26-alpine AS builder
+
+WORKDIR /src
+COPY tests/conformance/go.mod tests/conformance/go.sum ./
+RUN --mount=type=cache,id=go-mod,target=/go/pkg/mod go mod download
+COPY tests/conformance/ ./
+# The suite reads its manifests from the module cache at runtime; keep the
+# module cache in the image.
+RUN --mount=type=cache,id=go-mod,target=/go/pkg/mod --mount=type=cache,id=go-build,target=/root/.cache/go-build \
+    CGO_ENABLED=0 go test -c -o /conformance.test ./... \
+    && cp -r /go/pkg/mod /go-mod
+
+FROM alpine:3.21
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /conformance.test /conformance.test
+COPY --from=builder /go-mod /go/pkg/mod
+COPY deploy/conformance/run.sh /run.sh
+ENV GOMODCACHE=/go/pkg/mod GOFLAGS=-mod=mod
+USER 1000
+ENTRYPOINT ["/bin/sh", "/run.sh"]

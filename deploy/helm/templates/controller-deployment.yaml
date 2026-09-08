@@ -1,0 +1,115 @@
+{{- if and .Values.grpcTls.enabled (empty .Values.grpcTls.secretName) }}
+{{- fail "grpcTls.enabled is true but grpcTls.secretName is not set. Set the Secret name containing TLS certificates, or set grpcTls.enabled=false." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "portus-gateway.fullname" . }}-controller
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+spec:
+  replicas: {{ .Values.controller.replicas }}
+  # The controller is a leader-elected singleton. RollingUpdate would start the
+  # new pod while the old one still holds the Lease: the new pod blocks on
+  # acquisition, never becomes Ready, and the old one is never terminated.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "portus-gateway.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        {{- include "portus-gateway.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: {{ include "portus-gateway.serviceAccountName" . }}
+      # Enough for the controller to release its Lease on SIGTERM.
+      terminationGracePeriodSeconds: 20
+      securityContext:
+        {{- toYaml .Values.controller.securityContext | nindent 8 }}
+      containers:
+        - name: controller
+          securityContext:
+            {{- toYaml .Values.controller.containerSecurityContext | nindent 12 }}
+          image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+          imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.controller.grpcPort }}
+              protocol: TCP
+            - name: health
+              containerPort: 8082
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.controller.logLevel }}
+            - name: GATEWAY_CLASS_NAME
+              value: {{ .Values.controller.gatewayClassName }}
+            - name: CONTROLLER_NAME
+              value: {{ .Values.controller.controllerName }}
+            # Per-Gateway dataplane provisioning template (see dataplane in values.yaml)
+            - name: PORTUS_DATAPLANE_IMAGE
+              value: "{{ .Values.dataplane.image.repository }}:{{ .Values.dataplane.image.tag }}"
+            - name: PORTUS_DATAPLANE_PULL_POLICY
+              value: {{ .Values.dataplane.image.pullPolicy | quote }}
+            - name: PORTUS_DATAPLANE_REPLICAS
+              value: {{ .Values.dataplane.replicasPerGateway | default 2 | quote }}
+            - name: PORTUS_DATAPLANE_SERVICE_TYPE
+              value: {{ .Values.dataplane.service.type | default "LoadBalancer" | quote }}
+            {{- if .Values.dataplane.service.annotations }}
+            - name: PORTUS_DATAPLANE_SERVICE_ANNOTATIONS
+              value: {{ range $k, $v := .Values.dataplane.service.annotations }}{{ $k }}={{ $v }},{{ end }}
+            {{- end }}
+            - name: PORTUS_CONTROLLER_ADDR
+              value: {{ .Values.dataplane.controllerUrl | default (printf "%s-controller.%s:%d" (include "portus-gateway.fullname" .) .Release.Namespace (.Values.controller.grpcPort | int)) | quote }}
+            {{- if .Values.grpcTls.enabled }}
+            - name: PORTUS_GRPC_TLS_SECRET
+              value: {{ .Values.grpcTls.secretName | quote }}
+            {{- end }}
+            - name: PORTUS_DATAPLANE_LOG_LEVEL
+              value: {{ .Values.dataplane.logLevel | quote }}
+            # Per-Gateway dataplane pods run under their namespace's default
+            # ServiceAccount with token automount disabled; they need no API access.
+            - name: PORTUS_DATAPLANE_CPU_REQUEST
+              value: {{ .Values.dataplane.resources.requests.cpu | quote }}
+            - name: PORTUS_DATAPLANE_MEMORY_REQUEST
+              value: {{ .Values.dataplane.resources.requests.memory | quote }}
+            - name: PORTUS_DATAPLANE_MEMORY_LIMIT
+              value: {{ .Values.dataplane.resources.limits.memory | quote }}
+            {{- if .Values.grpcTls.enabled }}
+            - name: GRPC_TLS_CERT
+              value: /etc/grpc-tls/tls.crt
+            - name: GRPC_TLS_KEY
+              value: /etc/grpc-tls/tls.key
+            - name: GRPC_TLS_CA
+              value: /etc/grpc-tls/ca.crt
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          {{- if .Values.grpcTls.enabled }}
+          volumeMounts:
+            - name: grpc-tls
+              mountPath: /etc/grpc-tls
+              readOnly: true
+          {{- end }}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+      {{- if .Values.grpcTls.enabled }}
+      volumes:
+        - name: grpc-tls
+          secret:
+            secretName: {{ .Values.grpcTls.secretName }}
+      {{- end }}

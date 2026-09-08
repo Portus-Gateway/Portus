@@ -1,0 +1,6 @@
+target/
+.git/
+.claude/
+tests/
+deploy/bench/
+*.md

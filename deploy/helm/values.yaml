@@ -1,0 +1,66 @@
+# Global
+nameOverride: ""
+fullnameOverride: ""
+
+controller:
+  image:
+    repository: portus-gateway-controller
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  grpcPort: 50051
+  logLevel: info
+  gatewayClassName: portus-gateway
+  controllerName: "github.com/Portus-Gateway/Portus"
+
+# The controller provisions a dedicated dataplane Deployment, Service and
+# PodDisruptionBudget for every Gateway (owned by the Gateway, garbage-collected
+# with it). Each dataplane receives only its Gateway's config and the Service's
+# address is what the Gateway reports. These values are the template.
+dataplane:
+  replicasPerGateway: 2
+  image:
+    repository: portus-gateway-dataplane
+    tag: latest
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      memory: 512Mi
+  logLevel: info
+  controllerUrl: ""  # gRPC config stream; auto-generated from the controller Service if empty
+  service:
+    type: LoadBalancer
+    annotations: {}
+
+grpcTls:
+  enabled: true
+  # REQUIRED when enabled: name of a Kubernetes Secret containing tls.crt, tls.key, and ca.crt
+  secretName: ""
+  # When enabled, mounts the Secret into both controller and dataplane pods
+  # and sets GRPC_TLS_CERT, GRPC_TLS_KEY, GRPC_TLS_CA env vars.
+  # WARNING: When disabled, TLS private keys and auth credentials transit in
+  # plaintext between controller and dataplane. Only disable for development.
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}

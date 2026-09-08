@@ -1,0 +1,40 @@
+[package]
+name = "portus-controller"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Kubernetes Gateway API controller for Portus"
+license = "Apache-2.0"
+repository = "https://github.com/Portus-Gateway/Portus"
+keywords = ["kubernetes", "gateway-api", "controller", "networking"]
+categories = ["network-programming"]
+
+[dependencies]
+portus-types = { path = "../portus-types" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+dashmap = { workspace = true }
+prost = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+futures = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+schemars = { workspace = true }
+regex = { workspace = true }
+ipnet = "2"
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+[dev-dependencies]
+http = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "pipeline"
+harness = false

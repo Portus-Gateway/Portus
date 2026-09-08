@@ -1,0 +1,55 @@
+# In-cluster Gateway API conformance run. The suite creates namespaces,
+# Gateways, Routes, Services and Deployments across the cluster, so it runs
+# with cluster-admin. Delete the namespace to clean up.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: portus-conformance
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: conformance
+  namespace: portus-conformance
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portus-conformance
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: conformance
+    namespace: portus-conformance
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: conformance
+  namespace: portus-conformance
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 3000
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: portus-conformance
+    spec:
+      serviceAccountName: conformance
+      restartPolicy: Never
+      containers:
+        - name: conformance
+          image: ${CONFORMANCE_IMAGE}
+          imagePullPolicy: Never
+          env:
+            - name: CONFORMANCE_RUN
+              value: "${CONFORMANCE_RUN}"
+            - name: CONFORMANCE_TIMEOUT
+              value: "${CONFORMANCE_TIMEOUT}"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
