@@ -91,13 +91,13 @@ rules:
     resources:
       - poddisruptionbudgets
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
-  # Secrets (for auth policies).
-  # NOTE: Cluster-wide list+watch is required by kube-rs informer cache.
-  # This is broader than ideal — future improvement: per-namespace Roles.
+  # Secrets: read for Gateway TLS certificates and auth policies (the kube-rs
+  # informer cache needs cluster-wide list+watch); write for the per-Gateway
+  # copies of the gRPC TLS Secret the provisioner owns.
   - apiGroups: [""]
     resources:
       - secrets
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
   # ConfigMaps (for BackendTLSPolicy CA certificate references)
   - apiGroups: [""]
     resources:

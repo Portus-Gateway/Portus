@@ -1,213 +1,98 @@
 # Portus Deployment and Operations Guide
 
-Portus is a Kubernetes Gateway API implementation built on Pingora. It deploys as two components: a controller (Kubernetes operator) and a dataplane (Pingora proxy). The controller watches Gateway API CRDs, compiles routing config, and streams it to dataplanes over gRPC. The dataplane runs as a DaemonSet and handles live traffic.
+Portus is a Kubernetes Gateway API implementation built on Pingora. It deploys as a controller (a Kubernetes operator) that watches Gateway API resources, compiles routing config and streams it over mTLS gRPC to the dataplanes (Pingora proxies) it provisions: one Deployment, Service and PodDisruptionBudget per Gateway.
 
 ## Prerequisites
 
-- Kubernetes 1.28+
-- Helm 3
-- Gateway API CRDs v1.4.0+ (experimental channel)
-- `kubectl` with cluster-admin access (the controller needs a ClusterRole for Gateway API resources, Secrets, Services, and EndpointSlices)
+- Kubernetes 1.32+ (the Gateway API v1.6 CRDs use CEL helpers older API servers lack)
+- Helm 3.8+ (OCI registry support)
+- `kubectl` with cluster-admin access (the controller needs a ClusterRole for Gateway API resources, Secrets, Services, Deployments and EndpointSlices)
 
-## Installing Gateway API CRDs
+## Installing
 
-Portus uses the experimental channel of the Gateway API CRDs because it depends on GRPCRoute, TLSRoute, TCPRoute and UDPRoute, which are not in the standard channel. Install them before deploying the chart:
+### Gateway API CRDs
+
+Portus uses the experimental channel of the Gateway API CRDs because it depends on GRPCRoute, TLSRoute, TCPRoute, UDPRoute and ListenerSet, which are not in the standard channel:
 
 ```bash
 kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 ```
 
-Portus also ships custom policy CRDs for rate limiting, circuit breaking, connection policies, and auth. These live in `deploy/helm/crds/` and must be applied separately -- Helm does not upgrade CRDs after initial install:
+### Helm chart
+
+The chart is published to GHCR as an OCI artifact with every release, and its images (`ghcr.io/portus-gateway/controller`, `ghcr.io/portus-gateway/dataplane`, `linux/amd64` and `linux/arm64`) are tagged with the same version, which the chart pins as its `appVersion`:
 
 ```bash
-kubectl apply --server-side --force-conflicts -f deploy/helm/crds/
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.0 \
+  --namespace portus --create-namespace
 ```
 
-The custom CRDs are:
-- `ratelimitpolicies.portus-gateway.dev`
-- `circuitbreakerpolicies.portus-gateway.dev`
-- `connectionpolicies.portus-gateway.dev`
-- `basicauthpolicies.portus-gateway.dev`
-- `apikeyauthpolicies.portus-gateway.dev`
+The chart creates:
 
-## Helm Installation
+- the controller **Deployment** (leader-elected singleton, `strategy: Recreate`) and its ClusterIP **Service** for the gRPC config stream;
+- the **GatewayClass** `controller.gatewayClassName` (default `portus-gateway`);
+- the **ServiceAccount**, **ClusterRole** and **ClusterRoleBinding** for the controller, plus a Role for its leader-election Lease;
+- the mTLS **Secret** for the config stream (see below);
+- Portus's own policy **CRDs** from `crds/` (RateLimitPolicy, CircuitBreakerPolicy, ConnectionPolicy, BasicAuthPolicy, APIKeyAuthPolicy, RetryPolicy, IPAllowlistPolicy, RequestBodySizeLimitPolicy, HealthCheckPolicy, CORSPolicy, TimeoutPolicy). Helm installs these on first install only; after an upgrade re-apply them with `kubectl apply --server-side --force-conflicts -f deploy/helm/crds/` from the matching tag.
 
-The chart is at `deploy/helm/` (chart name: `portus-gateway`, version 0.2.0).
+Dataplanes are not chart objects. For every accepted Gateway the controller provisions a dataplane **Deployment** (`dataplane.replicasPerGateway` pods), a **Service** (`dataplane.service.type`, one port per listener) and a **PodDisruptionBudget** in the Gateway's namespace, all owned by the Gateway and garbage-collected with it. The `dataplane.*` values are the template for those objects. Generated objects are named `portus-<gateway>-<uid prefix>`, labelled `gateway.portus.dev/name` / `gateway.portus.dev/namespace` and `gateway.networking.k8s.io/gateway-name`, and carry the Gateway's `spec.infrastructure.labels` / `.annotations`. Each dataplane receives only its Gateway's config over the gRPC stream and has no Kubernetes API access. The Gateway's `status.addresses` is the Service's address (the LoadBalancer ingress once assigned, the ClusterIP otherwise), published once the controller can reach a ready dataplane through it.
 
-```bash
-helm upgrade --install portus deploy/helm \
-  --namespace portus \
-  --create-namespace \
-  --wait
-```
+### mTLS on the config stream
 
-### Helm Values Reference
+The stream between controller and dataplanes carries the compiled routing config, the Gateways' TLS private keys and auth credentials, so it is encrypted and mutually authenticated by default (`grpcTls.enabled: true`):
 
-#### Controller
+- With `grpcTls.secretName` empty, the chart generates a CA and a certificate for the controller Service (SANs `<release>-portus-gateway-controller`, `.<namespace>`, `.<namespace>.svc`, `.<namespace>.svc.cluster.local`; ten years) into the Secret `<release>-portus-gateway-grpc-tls`, and keeps the existing material on every upgrade.
+- To bring your own, set `grpcTls.secretName` to a Secret in the release namespace with `ca.crt`, `tls.crt` and `tls.key`. The certificate must be valid for the host the dataplanes dial: the controller Service name, or `dataplane.controllerUrl` when set. The dataplanes present the same certificate as their client identity, so it needs the `clientAuth` extended key usage as well as `serverAuth`.
+- A pod can only mount Secrets from its own namespace, so the controller copies the three keys into a Gateway-owned Secret (named like the Deployment) in each Gateway's namespace and mounts that. Changing the source Secret re-provisions every Gateway; the controller itself reads its certificate at start, so restart it after rotating.
+- `grpcTls.enabled: false` sends the stream in plaintext. Local development only.
+
+### Cloud LoadBalancers
+
+`dataplane.service.type` defaults to `LoadBalancer`, so every Gateway gets its own external address from the cloud provider. `dataplane.service.annotations` (rendered onto every generated Service) carries provider settings such as the load balancer type or scheme. Node security groups must allow every Gateway listener port from the VPC CIDR: ClusterIP traffic between nodes uses the node network, and a group that only allows the NodePort range shows up as intermittent 502s (same-node requests work, cross-node ones do not). The controller talks only to the Kubernetes API and needs no cloud IAM permissions; `serviceAccount.annotations` is there for clusters that require an identity on every pod.
+
+### Helm values reference
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `controller.image.repository` | `portus-gateway-controller` | Container image repository |
-| `controller.image.tag` | `latest` | Image tag |
+| `controller.image.repository` | `ghcr.io/portus-gateway/controller` | Controller image |
+| `controller.image.tag` | `""` (the chart's `appVersion`) | Image tag |
 | `controller.image.pullPolicy` | `IfNotPresent` | Image pull policy |
-| `controller.replicas` | `1` | Number of controller replicas. Only one actively reconciles; additional replicas are standby. The Deployment uses `strategy: Recreate` so an upgrade never leaves a new pod waiting on a Lease the old pod still holds; the outgoing pod releases the Lease on SIGTERM. |
-| `controller.resources.requests.cpu` | `100m` | CPU request |
-| `controller.resources.requests.memory` | `128Mi` | Memory request |
-| `controller.resources.limits.cpu` | `500m` | CPU limit |
-| `controller.resources.limits.memory` | `256Mi` | Memory limit |
-| `controller.grpcPort` | `50051` | Port the controller exposes for gRPC config streaming |
-| `controller.logLevel` | `info` | Sets `RUST_LOG` env var. Accepts standard `env_logger` syntax (`debug`, `info`, `portus_controller=debug`, etc.) |
-| `controller.gatewayClassName` | `portus-gateway` | Name of the GatewayClass resource the chart creates |
-| `controller.controllerName` | `github.com/Portus-Gateway/Portus` | Controller name string in the GatewayClass spec |
-
-#### Dataplane
-
-| Value | Default | Description |
-|-------|---------|-------------|
-| `dataplane.image.repository` | `portus-gateway-dataplane` | Container image repository |
-| `dataplane.image.tag` | `latest` | Image tag |
+| `controller.replicas` | `1` | Only the leader reconciles; extra replicas stand by. `strategy: Recreate` so an upgrade never leaves a new pod waiting on a Lease the old pod still holds |
+| `controller.resources` | 100m / 256Mi requests, 512Mi memory limit | No CPU limit |
+| `controller.grpcPort` | `50051` | Port the controller exposes for the config stream |
+| `controller.logLevel` | `info` | `RUST_LOG` (`env_logger` syntax, e.g. `portus_controller=debug`) |
+| `controller.gatewayClassName` | `portus-gateway` | GatewayClass the chart creates and the controller accepts |
+| `controller.controllerName` | `github.com/Portus-Gateway/Portus` | `controllerName` on the GatewayClass |
+| `controller.securityContext` / `.containerSecurityContext` | non-root UID 1000, read-only root, no capabilities | Pod and container security contexts |
+| `dataplane.image.repository` | `ghcr.io/portus-gateway/dataplane` | Dataplane image the controller provisions |
+| `dataplane.image.tag` | `""` (the chart's `appVersion`) | Image tag |
 | `dataplane.image.pullPolicy` | `IfNotPresent` | Image pull policy |
-| `dataplane.resources.requests.cpu` | `250m` | CPU request |
-| `dataplane.resources.requests.memory` | `256Mi` | Memory request |
-| `dataplane.resources.limits.cpu` | `2` | CPU limit |
-| `dataplane.resources.limits.memory` | `512Mi` | Memory limit |
-| `dataplane.logLevel` | `info` | Sets `RUST_LOG` env var |
-| `dataplane.controllerUrl` | `""` (auto-generated) | gRPC address of the controller. If empty, the chart generates `<release>-controller:<grpcPort>`. |
-| `dataplane.service.type` | `LoadBalancer` | Service type for the dataplane. Use `NodePort` for bare-metal, `LoadBalancer` for cloud. |
-| `dataplane.service.annotations` | `{}` | Annotations on the dataplane Service (e.g., for cloud LB configuration) |
+| `dataplane.replicasPerGateway` | `2` | Pods per Gateway; the PDB keeps one available |
+| `dataplane.resources` | 250m / 256Mi requests, 512Mi memory limit | The CPU request also sizes the Pingora worker pool (`DATAPLANE_THREADS`, at least 2) |
+| `dataplane.logLevel` | `info` | `RUST_LOG` |
+| `dataplane.controllerUrl` | `""` | `host:port` the dataplanes dial; empty means the controller Service (`<release>-portus-gateway-controller.<namespace>:<grpcPort>`) |
+| `dataplane.service.type` | `LoadBalancer` | Type of every per-Gateway Service; `ClusterIP` on k3d and for in-cluster clients |
+| `dataplane.service.annotations` | `{}` | Annotations on every per-Gateway Service |
+| `grpcTls.enabled` | `true` | mTLS on the config stream |
+| `grpcTls.secretName` | `""` | Your own Secret (`ca.crt`, `tls.crt`, `tls.key`); empty generates one |
+| `serviceAccount.create` / `.name` / `.annotations` | `true` / `""` / `{}` | Controller ServiceAccount |
+| `nameOverride` / `fullnameOverride` | `""` | Resource naming |
 
-#### Global
+## Building Images
 
-| Value | Default | Description |
-|-------|---------|-------------|
-| `nameOverride` | `""` | Override chart name in resource names |
-| `fullnameOverride` | `""` | Override full resource name prefix |
-| `serviceAccount.create` | `true` | Create a ServiceAccount |
-| `serviceAccount.name` | `""` | Override ServiceAccount name (auto-generated if empty) |
-| `serviceAccount.annotations` | `{}` | ServiceAccount annotations (useful for IAM role binding on EKS) |
-
-### What the Chart Creates
-
-The Helm chart creates:
-- **Deployment** for the controller (1 replica by default)
-- **Service** (ClusterIP) for the controller gRPC endpoint
-- **GatewayClass** resource matching `controller.gatewayClassName`
-- **ServiceAccount**, **ClusterRole**, and **ClusterRoleBinding** for the controller
-
-Dataplanes are not chart objects. For every accepted Gateway the controller provisions a dataplane **Deployment** (`dataplane.replicasPerGateway`), a **Service** (`dataplane.service.type`, one port per listener) and a **PodDisruptionBudget** in the Gateway's namespace, all owned by the Gateway and garbage-collected with it. The `dataplane.*` values are the template for those objects. Generated objects are named `portus-<gateway>-<uid prefix>`, labelled `gateway.portus.dev/name` / `gateway.portus.dev/namespace`, and carry the Gateway's `spec.infrastructure.labels` / `.annotations`. Each dataplane receives only its Gateway's config over the gRPC stream and has no Kubernetes API access. The Gateway's `status.addresses` is the Service's address, published once the controller can reach it.
-
-## Building Container Images
-
-Both images build from `rust:1.98-alpine` using musl, producing statically-linked binaries. The final stage is `FROM scratch` -- no shell, no libc, just the binary. They run as UID 1000 (non-root).
-
-### Local Builds (Native Architecture)
+Both images build from `rust:1.98-alpine` with musl into a `FROM scratch` final stage: no shell, no libc, just the binary, running as UID 1000. `deploy/docker/Dockerfile.controller` and `Dockerfile.dataplane` are the release builds; the `.dev` variants build the debug profile for fast iteration. BuildKit cache mounts keep the cargo registry and target directory between builds.
 
 ```bash
-docker build -t portus-gateway/controller:dev -f deploy/docker/Dockerfile.controller .
-docker build -t portus-gateway/dataplane:dev -f deploy/docker/Dockerfile.dataplane .
+make build                # both release images, tagged portus-gateway/{controller,dataplane}:dev
+docker buildx build --platform linux/amd64 -t my-registry/portus-controller:x -f deploy/docker/Dockerfile.controller .
 ```
 
-Or use the Makefile:
+Cross-architecture builds go through QEMU and are slow (the release workflow avoids this by building each architecture on a native runner). To run your own images, override `controller.image.*` and `dataplane.image.*`.
 
-```bash
-make build-controller
-make build-dataplane
-make build          # builds the controller and dataplane images
-```
+### Releasing
 
-### Cross-Compilation (ARM64 / AMD64)
-
-The Dockerfiles use Alpine's musl toolchain, so cross-compilation requires `docker buildx`. If you're building on Apple Silicon for an AMD64 cluster (or vice versa):
-
-```bash
-docker buildx build --platform linux/amd64 \
-  -t portus-gateway/controller:dev \
-  -f deploy/docker/Dockerfile.controller .
-
-docker buildx build --platform linux/amd64 \
-  -t portus-gateway/dataplane:dev \
-  -f deploy/docker/Dockerfile.dataplane .
-```
-
-This is slow because QEMU emulates the Rust compiler. Expect 10-15 minute build times for cross-arch builds versus 2-3 minutes for native. There is currently no cross-compilation setup that avoids QEMU (e.g., using `xx` or Zig as a cross-linker) -- that would be a worthwhile optimization if cross-arch builds happen frequently.
-
-### Image Repositories
-
-For local development with k3d, images are imported directly into the cluster (no registry needed). For production, push to your container registry of choice:
-
-```bash
-TAG="v0.2.0"
-docker tag portus-gateway/controller:dev your-registry/gateway-controller:$TAG
-docker push your-registry/gateway-controller:$TAG
-```
-
-Then override the image values in Helm:
-
-```bash
-helm upgrade --install portus deploy/helm \
-  --namespace portus \
-  --set controller.image.repository=your-registry/gateway-controller \
-  --set controller.image.tag=$TAG \
-  --set dataplane.image.repository=your-registry/gateway-dataplane \
-  --set dataplane.image.tag=$TAG
-```
-
-## EKS Deployment
-
-### ECR Setup
-
-Create repositories and push images:
-
-```bash
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-REGION=us-west-2
-ECR_PREFIX="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
-
-aws ecr create-repository --repository-name portus-gateway/controller
-aws ecr create-repository --repository-name portus-gateway/dataplane
-
-aws ecr get-login-password --region $REGION | \
-  docker login --username AWS --password-stdin $ECR_PREFIX
-
-docker tag portus-gateway/controller:dev $ECR_PREFIX/portus-gateway/controller:latest
-docker tag portus-gateway/dataplane:dev $ECR_PREFIX/portus-gateway/dataplane:latest
-docker push $ECR_PREFIX/portus-gateway/controller:latest
-docker push $ECR_PREFIX/portus-gateway/dataplane:latest
-```
-
-### Helm Install on EKS
-
-```bash
-helm upgrade --install portus deploy/helm \
-  --namespace portus --create-namespace \
-  --set controller.image.repository=$ECR_PREFIX/portus-gateway/controller \
-  --set controller.image.tag=latest \
-  --set dataplane.image.repository=$ECR_PREFIX/portus-gateway/dataplane \
-  --set dataplane.image.tag=latest \
-  --set dataplane.service.type=LoadBalancer \
-  --wait
-```
-
-Each Gateway's `status.addresses` reflects the LoadBalancer ingress address AWS assigns to that Gateway's Service (its ClusterIP until then).
-
-### Security Group Requirements
-
-Every Gateway's dataplane Deployment sits behind its own LoadBalancer Service. For cross-node traffic to work, the EKS node security group needs:
-
-- **Every Gateway listener port (TCP) ingress from the VPC CIDR** -- ClusterIP traffic between nodes uses the node network, not the pod network. If your security group only allows traffic on the NodePort range (30000-32767), cross-node ClusterIP routing will silently fail. This manifests as intermittent 502s where some requests work (same-node) and others don't (cross-node).
-
-### IAM Considerations
-
-The controller needs Kubernetes API access (provided by the ClusterRole), but does not need any AWS IAM permissions. If you use IRSA (IAM Roles for Service Accounts), you can annotate the ServiceAccount:
-
-```yaml
-serviceAccount:
-  annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/portus-controller
-```
-
-In practice, the controller only talks to the Kubernetes API server and streams config to dataplanes. It does not interact with AWS services directly, so IRSA is only needed if your cluster enforces it for all pods.
+Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: native `linux/amd64` and `linux/arm64` image builds pushed by digest and joined into one manifest list (`X.Y.Z` and `latest`), the chart pushed to `oci://ghcr.io/portus-gateway/charts/portus-gateway`, and a GitHub release with the install commands. The workflow refuses a tag whose version differs from the chart's `version` and `appVersion` in `deploy/helm/Chart.yaml`.
 
 ## k3d Local Development
 
@@ -257,10 +142,11 @@ k3d image import portus-gateway/controller:$TAG portus-gateway/dataplane:$TAG -c
 helm upgrade --install portus deploy/helm --namespace portus \
   --set controller.image.repository=portus-gateway/controller --set controller.image.tag=$TAG --set controller.image.pullPolicy=Never \
   --set dataplane.image.repository=portus-gateway/dataplane --set dataplane.image.tag=$TAG --set dataplane.image.pullPolicy=Never \
+  --set dataplane.service.type=ClusterIP --set dataplane.replicasPerGateway=1 \
   --wait
 ```
 
-The `pullPolicy=Never` is important for k3d -- without it, Kubernetes will try to pull from a registry that doesn't have your locally-built image.
+`pullPolicy=Never` keeps Kubernetes from pulling the chart's default `ghcr.io` images instead of the ones imported into k3d. The default mTLS path runs locally too; nothing needs to be disabled.
 
 ### Teardown
 
@@ -278,6 +164,8 @@ make clean       # alias for k3d-down
 | `RUST_LOG` | `info` | Log level. Supports `env_logger` filter syntax. |
 | `GATEWAY_CLASS_NAME` | `portus-gateway` | Name of the GatewayClass this controller manages. Only Gateways referencing this class are reconciled. |
 | `CONTROLLER_NAME` | `github.com/Portus-Gateway/Portus` | Controller name string set in the GatewayClass spec. |
+
+The dataplane template the provisioner uses comes from `PORTUS_DATAPLANE_*` variables plus `PORTUS_CONTROLLER_ADDR`, `PORTUS_GRPC_TLS_SECRET` and `PORTUS_NAMESPACE` (downward API), all rendered by the chart from the `dataplane.*` and `grpcTls.*` values; they are not meant to be set by hand.
 
 The controller hardcodes the gRPC listen address to `[::]:50051`. This is not configurable via environment variable -- change `controller.grpcPort` in the Helm values if you need a different port (though you'd also need to update the Dockerfile `EXPOSE` directive and the source).
 

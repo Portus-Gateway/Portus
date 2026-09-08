@@ -4,3 +4,11 @@ description: Portus Gateway - Kubernetes Gateway API implementation with Pingora
 type: application
 version: 0.2.0
 appVersion: "0.2.0"
+home: https://github.com/Portus-Gateway/Portus
+sources:
+  - https://github.com/Portus-Gateway/Portus
+keywords:
+  - gateway-api
+  - ingress
+  - pingora
+  - proxy

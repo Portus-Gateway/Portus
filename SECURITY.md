@@ -31,7 +31,7 @@ Portus has three trust domains with different threat exposure:
 
 **Controller (trusted).** Runs inside the Kubernetes cluster with RBAC-scoped access to Gateway API CRDs. It watches Gateways, HTTPRoutes, GRPCRoutes, TLSRoutes, TCPRoutes and UDPRoutes, reconciles them into a compiled configuration, and pushes that config to the dataplane over a gRPC stream. The controller is trusted infrastructure -- compromise of the controller means compromise of the routing configuration.
 
-**gRPC config stream (must be secured).** The config stream between controller and dataplane carries the full compiled routing configuration, including backend addresses, TLS certificate references, and authentication credentials. This stream **must** be encrypted with mTLS in production. Set the `GRPC_TLS_CA`, `GRPC_TLS_CERT`, and `GRPC_TLS_KEY` environment variables on both controller and dataplane. If these are unset, the stream is plaintext, which is only acceptable for local development.
+**gRPC config stream (must be secured).** The config stream between controller and dataplane carries the full compiled routing configuration, including backend addresses, TLS certificate references, and authentication credentials. It runs over mTLS by default: the Helm chart generates a CA and a controller certificate on first install (`grpcTls.secretName` swaps in your own), the controller presents the certificate and requires client certificates signed by the CA, and it copies the Secret into each Gateway's namespace for the dataplane pods it provisions. `grpcTls.enabled=false` sends the stream in plaintext, which is only acceptable for local development.
 
 **Dataplane (untrusted input).** The Pingora-based proxy handles external traffic from the internet. It is the primary attack surface. All request parsing, path matching, header inspection, and upstream routing happens here. The dataplane trusts only the compiled config it receives from the controller -- it does not access the Kubernetes API directly.
 
@@ -40,7 +40,7 @@ Portus has three trust domains with different threat exposure:
 
 ## Deployment Hardening Checklist
 
-- **Enable gRPC mTLS.** Set `GRPC_TLS_CA`, `GRPC_TLS_CERT`, and `GRPC_TLS_KEY` on both controller and dataplane pods. Without these, the config stream is plaintext.
+- **Keep gRPC mTLS on.** `grpcTls.enabled` defaults to `true`; leave it. To use your own CA, set `grpcTls.secretName` to a Secret with `ca.crt`, `tls.crt`, `tls.key` whose certificate names the controller Service.
 - **Never set `GRPC_TLS_INSECURE=true` in production.** This flag disables TLS certificate verification on the gRPC stream. It exists for local development only.
 - **Never run with `RUST_LOG=trace` in production.** Pingora's HTTP layer logs full request headers at trace level, which can include `Authorization` headers and other credentials.
 - **Restrict access to controller port 50051.** Use a Kubernetes NetworkPolicy to ensure only dataplane pods can reach the controller's gRPC port.

@@ -58,18 +58,20 @@ bench-latency` and the `bench-*` control-plane targets.
 
 ## Quick Start
 
-Prerequisites: Docker, [mise](https://mise.jdx.dev/) (manages k3d, helm, kubectl, go, protoc).
+Prerequisites: a Kubernetes 1.32+ cluster, `kubectl`, Helm 3.8+.
 
 ```bash
-# Create a local k3d cluster
-make k3d-up
+# Gateway API CRDs (experimental channel: GRPCRoute, TLSRoute, TCPRoute, UDPRoute, ListenerSet)
+kubectl apply --server-side --force-conflicts \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
-# Build controller + dataplane images
-make build
-
-# Install Gateway API CRDs and deploy via Helm
-make deploy
+# Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.0 \
+  --namespace portus --create-namespace
 ```
+
+Images are published to `ghcr.io/portus-gateway/controller` and `ghcr.io/portus-gateway/dataplane`
+for `linux/amd64` and `linux/arm64`; the chart pins the tag matching its version.
 
 Once deployed, create a Gateway and HTTPRoute:
 
@@ -149,30 +151,30 @@ The **proto schema** (`proto/portus/v1/config.proto`) defines the contract betwe
 
 ### Helm Values
 
-Install with Helm:
-
 ```bash
-helm upgrade --install portus deploy/helm \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.0 \
   --namespace portus --create-namespace \
-  --set controller.image.tag=v0.2.0 \
-  --set dataplane.image.tag=v0.2.0
+  --set dataplane.replicasPerGateway=3
 ```
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `controller.image.repository` / `.tag` | `portus-gateway-controller` / `latest` | Controller image |
+| `controller.image.repository` / `.tag` | `ghcr.io/portus-gateway/controller` / chart `appVersion` | Controller image |
 | `controller.replicas` | `1` | Leader election via a Lease; extra replicas stand by |
 | `controller.grpcPort` | `50051` | Config stream gRPC port |
 | `controller.logLevel` | `info` | `RUST_LOG` |
 | `controller.gatewayClassName` | `portus-gateway` | GatewayClass this controller accepts |
 | `controller.controllerName` | `github.com/Portus-Gateway/Portus` | `controllerName` on the GatewayClass |
 | `controller.resources` | 100m / 256Mi requests, 512Mi limit | No CPU limit |
-| `dataplane.image.repository` / `.tag` | `portus-gateway-dataplane` / `latest` | Dataplane image (the controller provisions the Deployments) |
+| `dataplane.image.repository` / `.tag` | `ghcr.io/portus-gateway/dataplane` / chart `appVersion` | Dataplane image (the controller provisions the Deployments) |
 | `dataplane.replicasPerGateway` | `2` | Pods per Gateway |
 | `dataplane.resources` | 250m / 256Mi requests, 512Mi limit | The CPU request also sizes the Pingora worker pool |
 | `dataplane.service.type` | `LoadBalancer` | Per-Gateway Service type; use `ClusterIP` on k3d |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
-| `grpcTls.enabled` / `grpcTls.secretName` | `true` / `""` | mTLS on the config stream; a Secret with `tls.crt`, `tls.key`, `ca.crt`. Disable only for local development |
+| `grpcTls.enabled` | `true` | mTLS on the config stream. The chart generates a CA and controller certificate on first install and keeps them across upgrades; the controller copies the Secret into each Gateway's namespace |
+| `grpcTls.secretName` | `""` | Bring your own Secret (`ca.crt`, `tls.crt`, `tls.key`) instead of the generated one |
+
+Full reference: [`docs/deployment.md`](docs/deployment.md).
 
 ## Building from Source
 
@@ -187,6 +189,14 @@ cargo test --workspace -- --test-threads=1 -q
 
 # Build container images
 make build
+```
+
+Local cluster with [mise](https://mise.jdx.dev/) managing k3d, helm, kubectl, go and protoc:
+
+```bash
+make k3d-up     # k3d cluster `portus-local`
+make build      # controller + dataplane images
+make deploy     # Gateway API CRDs, image import, helm install (ClusterIP Services, one pod per Gateway)
 ```
 
 The workspace contains three crates:

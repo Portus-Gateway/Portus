@@ -158,10 +158,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (Some(ns), Some(name)) = (secret.metadata.namespace.as_deref(), secret.metadata.name.as_deref()) else {
                 return Vec::new();
             };
+            // The gRPC TLS material is copied into every Gateway's namespace, so
+            // rotating it re-provisions them all.
+            let tls_source = reconcilers::gateway::dataplane_template().is_grpc_tls_source(ns, name);
             gw_reader_for_secret
                 .state()
                 .iter()
-                .filter(|gw| gateway_references_client_cert_secret(gw, ns, name))
+                .filter(|gw| tls_source || gateway_references_client_cert_secret(gw, ns, name))
                 .map(|gw| ObjectRef::from_obj(gw.as_ref()))
                 .collect::<Vec<_>>()
         }))

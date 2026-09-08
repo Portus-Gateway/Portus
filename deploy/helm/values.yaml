@@ -4,8 +4,8 @@ fullnameOverride: ""
 
 controller:
   image:
-    repository: portus-gateway-controller
-    tag: latest
+    repository: ghcr.io/portus-gateway/controller
+    tag: ""  # defaults to the chart's appVersion
     pullPolicy: IfNotPresent
   replicas: 1
   securityContext:
@@ -36,8 +36,8 @@ controller:
 dataplane:
   replicasPerGateway: 2
   image:
-    repository: portus-gateway-dataplane
-    tag: latest
+    repository: ghcr.io/portus-gateway/dataplane
+    tag: ""  # defaults to the chart's appVersion
     pullPolicy: IfNotPresent
   resources:
     requests:
@@ -51,14 +51,18 @@ dataplane:
     type: LoadBalancer
     annotations: {}
 
+# mTLS on the controller -> dataplane config stream. It carries the compiled
+# routing config, Gateway TLS private keys and auth credentials, so it is on by
+# default: the chart generates a CA and a certificate for the controller
+# Service on first install and keeps them across upgrades. The controller
+# copies the Secret into every Gateway's namespace for its dataplane pods.
 grpcTls:
   enabled: true
-  # REQUIRED when enabled: name of a Kubernetes Secret containing tls.crt, tls.key, and ca.crt
+  # Bring your own Secret (ca.crt, tls.crt, tls.key) instead of the generated
+  # one. Its server certificate must name the controller Service
+  # (<release>-portus-gateway-controller.<namespace>) or dataplane.controllerUrl.
   secretName: ""
-  # When enabled, mounts the Secret into both controller and dataplane pods
-  # and sets GRPC_TLS_CERT, GRPC_TLS_KEY, GRPC_TLS_CA env vars.
-  # WARNING: When disabled, TLS private keys and auth credentials transit in
-  # plaintext between controller and dataplane. Only disable for development.
+  # enabled: false sends everything in plaintext; local development only.
 
 serviceAccount:
   create: true

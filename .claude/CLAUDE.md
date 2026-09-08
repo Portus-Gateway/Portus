@@ -100,7 +100,7 @@ cargo test -p portus-controller -- test_name --nocapture
 
 **IMPORTANT: Use `.dev` Dockerfiles for fast iteration (debug profile). `helm upgrade` works (controller uses Recreate + Lease release); uninstall+install remains the clean-slate path. Delete the lease first on a fresh install.**
 
-The k3d cluster is `portus-local`. The helm release is `portus` in namespace `portus`. gRPC TLS must be disabled for local dev. There is one deployment model: the controller provisions a dataplane Deployment + Service + PDB per Gateway (`make deploy` uses ClusterIP Services and one replica per Gateway).
+The k3d cluster is `portus-local`. The helm release is `portus` in namespace `portus`. gRPC mTLS stays on (the chart generates the Secret; the provisioner copies it per Gateway). There is one deployment model: the controller provisions a dataplane Deployment + Service + PDB per Gateway (`make deploy` uses ClusterIP Services and one replica per Gateway).
 
 ```bash
 TAG="dev-$(date +%s)"
@@ -120,12 +120,11 @@ mise exec -- kubectl delete lease portus-gateway-controller -n portus 2>/dev/nul
 mise exec -- helm uninstall portus -n portus 2>/dev/null
 sleep 3
 
-# Fresh install with gRPC TLS disabled
+# Fresh install (chart defaults: mTLS on, images from ghcr.io; overridden to the local build here)
 mise exec -- helm install portus deploy/helm --namespace portus --create-namespace \
   --set controller.image.repository=portus-gateway/controller --set controller.image.tag=$TAG --set controller.image.pullPolicy=Never \
   --set dataplane.image.repository=portus-gateway/dataplane --set dataplane.image.tag=$TAG --set dataplane.image.pullPolicy=Never \
   --set dataplane.service.type=ClusterIP --set dataplane.replicasPerGateway=1 \
-  --set grpcTls.enabled=false \
   --wait
 
 # Verify: the controller pod 1/1 Running with ZERO restarts (dataplanes appear per Gateway)
