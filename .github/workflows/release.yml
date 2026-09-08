@@ -27,8 +27,12 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: true
+      # `arch` is a real matrix axis; `include` only maps each arch to its
+      # native runner. (An include that itself introduced `arch` let the
+      # second entry overwrite the first, and v0.2.0's first run built arm64 only.)
       matrix:
         component: [controller, dataplane]
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             runner: ubuntu-24.04
@@ -49,6 +53,8 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile.${{ matrix.component }}
           platforms: linux/${{ matrix.arch }}
+          # No provenance attestation: it adds an unknown/unknown entry to the manifest list.
+          provenance: false
           outputs: type=image,name=${{ env.IMAGE_NS }}/${{ matrix.component }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }}
           cache-to: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }},mode=max
