@@ -877,7 +877,8 @@ pub async fn reconcile_http_route(
     )
     .await
     {
-        log::warn!("failed to write HTTPRoute status for {}/{}: {}; will retry on next reconcile", namespace, name, e);
+        log::warn!("failed to write HTTPRoute status for {}/{}: {}; retrying", namespace, name, e);
+        return Err(e.into());
     }
 
     // Everything this status was derived from re-triggers the route through
@@ -904,14 +905,20 @@ mod tests {
         ReferenceGrantState, ReferenceGrantTo, ServiceKey,
     };
 
-    /// Create a dummy kube::Client for unit tests that don't make API calls.
+    /// A kube::Client whose API server accepts every write: the status patch
+    /// a reconcile ends with is answered with a minimal HTTPRoute, so the
+    /// reconcile returns `Ok` and the tests can look at the store. (A failed
+    /// status write is an `Err` that the registry requeues.)
     fn dummy_client() -> kube::Client {
         use kube::client::Body;
         let svc = tower::service_fn(|_req: http::Request<Body>| async {
             Ok::<_, Box<dyn std::error::Error + Send + Sync>>(
                 http::Response::builder()
-                    .status(500)
-                    .body(Body::empty())
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        br#"{"apiVersion":"gateway.networking.k8s.io/v1","kind":"HTTPRoute","metadata":{"name":"r","namespace":"default"},"spec":{}}"#.to_vec(),
+                    ))
                     .unwrap(),
             )
         });

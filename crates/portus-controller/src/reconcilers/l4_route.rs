@@ -408,7 +408,8 @@ pub async fn reconcile_l4_route<K: L4Route>(
         )
         .await
         {
-            log::warn!("failed to write {} status for {}/{}: {}; will retry on next reconcile", K::KIND, namespace, name, e);
+            log::warn!("failed to write {} status for {}/{}: {}; retrying", K::KIND, namespace, name, e);
+            return Err(e.into());
         }
     }
 

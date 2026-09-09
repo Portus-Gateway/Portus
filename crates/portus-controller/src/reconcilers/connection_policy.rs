@@ -151,11 +151,12 @@ pub async fn reconcile_connection_policy(
     .await
     {
         log::warn!(
-            "failed to write ConnectionPolicy status for {}/{}: {}; will retry on next reconcile",
+            "failed to write ConnectionPolicy status for {}/{}: {}; retrying",
             namespace,
             name,
             e
         );
+        return Err(e.into());
     }
 
     // Siblings on the same target and data plane acks re-run this policy

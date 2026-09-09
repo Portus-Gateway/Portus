@@ -252,11 +252,12 @@ pub async fn reconcile_api_key_auth_policy(
     .await
     {
         log::warn!(
-            "failed to write APIKeyAuthPolicy status for {}/{}: {}; will retry on next reconcile",
+            "failed to write APIKeyAuthPolicy status for {}/{}: {}; retrying",
             namespace,
             name,
             e
         );
+        return Err(e.into());
     }
 
     // Siblings on the same target and data plane acks re-run this policy

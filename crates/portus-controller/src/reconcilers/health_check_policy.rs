@@ -154,11 +154,12 @@ pub async fn reconcile_health_check_policy(
     .await
     {
         log::warn!(
-            "failed to write HealthCheckPolicy status for {}/{}: {}; will retry on next reconcile",
+            "failed to write HealthCheckPolicy status for {}/{}: {}; retrying",
             namespace,
             name,
             e
         );
+        return Err(e.into());
     }
 
     // Siblings on the same target and data plane acks re-run this policy

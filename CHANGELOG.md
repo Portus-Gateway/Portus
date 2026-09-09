@@ -4,6 +4,17 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **Route changes propagate in milliseconds, not 105 ms.** The compile loop's 100 ms debounce was leading-edge: every wake slept the full window before compiling, so a single HTTPRoute took ~105 ms to reach the data plane (the sub-millisecond figures in the 2026-09-06/07 reports were an artifact of a catch-all route attached during the probe). It is now trailing-edge: an idle loop compiles at once and only writes that follow a compile within the window wait for the next one, so a burst still coalesces. Test: `compilation_loop_compiles_at_once_when_idle_and_batches_a_burst`.
+- **`Programmed` no longer flaps on every recompile.** A Gateway whose data planes still run the previous slice stays `Programmed=True` for `PROGRAMMED_GRACE` (10 s) after a recompile; it goes False only if no data plane applies the new slice within that window (a check the compile loop schedules) or its data planes leave. `Event::Programmed` is published only when the answer moves, so a route change no longer costs a Gateway status write and a wake of every policy reconciler (the attached-routes bench wrote status 417 times for 100 routes, 146 before the event-driven controller). Tests: `programmed_survives_a_slice_change_while_the_data_plane_catches_up`, `programmed_lapses_when_the_grace_window_passes`, `programmed_events_fire_only_when_the_answer_moves`.
+
+### Fixed
+
+- **A failed status write is retried.** Every route and policy reconciler swallowed a failed status patch with "will retry on next reconcile"; since reconciles are event-driven, nothing scheduled that next reconcile, so an API-server stall left the object without status until something else changed. Seen once in conformance (`TCPRouteParentRefAttachAll`: a 15 s API stall, then 60 s with no `Accepted`). The failure now returns an error and the registry requeues in 30 s, as `BackendTLSPolicy` already did.
+
 ## [0.2.0] - 2026-09-08
 
 ### Added

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use log;
 use tokio::sync::watch;
@@ -1930,21 +1930,32 @@ pub(crate) fn config_fingerprint(config: &CompiledConfig) -> u64 {
     fp
 }
 
-/// Writes landing within this window after the first one compile together.
+/// Quiet period: after a write the loop waits this long for more writes before
+/// compiling, so a burst arriving a few milliseconds apart compiles once while a
+/// single change still propagates in about this time.
+pub const COMPILE_QUIET: Duration = Duration::from_millis(10);
+/// Cap on how long writes can keep extending the quiet period: under
+/// continuous churn the loop compiles at least this often.
 pub const COMPILE_DEBOUNCE: Duration = Duration::from_millis(100);
 
-/// Compilation loop: wakes on `change_notify`, coalesces writes that land
-/// within a short debounce window, compiles once. `Notify::notify_one` stores
-/// a permit when no waiter is parked, so a notification sent between two
-/// iterations is never lost; there is no timer. Panics inside compile_config
-/// are caught and logged — the loop never dies silently.
+/// Compilation loop: wakes on `change_notify`, waits until writes have been
+/// quiet for `COMPILE_QUIET` (at most `COMPILE_DEBOUNCE` after the first
+/// one), compiles once. `Notify::notify_one` stores a permit when no waiter is
+/// parked, so a notification sent between two iterations is never lost; there
+/// is no timer. Panics inside compile_config are caught and logged — the loop
+/// never dies silently.
 pub async fn compilation_loop(store: Arc<ConfigStore>, tx: watch::Sender<CompiledConfig>) {
     let mut version: u64 = 0;
     let mut last_fingerprint: u64 = 0;
     let mut iterations: u64 = 0;
     loop {
         store.change_notify.notified().await;
-        tokio::time::sleep(COMPILE_DEBOUNCE).await;
+        let deadline = Instant::now() + COMPILE_DEBOUNCE;
+        while let Ok(()) = tokio::time::timeout(COMPILE_QUIET, store.change_notify.notified()).await {
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
         // Clear the dirty flag *before* compiling so writes that race with this
         // compilation are picked up by the next wake.
         if !store.take_dirty() {
@@ -1985,8 +1996,10 @@ pub async fn compilation_loop(store: Arc<ConfigStore>, tx: watch::Sender<Compile
         // the compiled config (all listeners invalid, or its content identical
         // to what a departing Gateway contributed) would otherwise never get an
         // entry here, and `is_programmed_for` would report it unprogrammed for
-        // ever. Waking the Programmed trigger lets its reconciler pick the new
-        // value up immediately rather than on its next timed requeue.
+        // ever. The store publishes `Programmed` only when a Gateway's answer
+        // moves; a data plane still on the previous slice keeps it Programmed
+        // for `PROGRAMMED_GRACE`, after which the scheduled check reports a
+        // data plane that never caught up.
         {
             let live: Vec<NamespacedName> = store.gateways.iter().map(|e| e.key().clone()).collect();
             let departed: Vec<NamespacedName> = store
@@ -1996,13 +2009,16 @@ pub async fn compilation_loop(store: Arc<ConfigStore>, tx: watch::Sender<Compile
                 .filter(|k| !live.contains(k))
                 .collect();
             for key in departed {
-                store.compiled_gateway_fingerprints.remove(&key);
-                store.notify_programmed(&key);
+                store.remove_compiled_slice(&key);
             }
             for key in live {
                 let slice_fp = scope_config(&config, &key.namespace, &key.name).fingerprint;
-                if store.compiled_gateway_fingerprints.insert(key.clone(), slice_fp) != Some(slice_fp) {
-                    store.notify_programmed(&key);
+                if store.set_compiled_slice(&key, slice_fp) {
+                    let store = Arc::clone(&store);
+                    tokio::spawn(async move {
+                        tokio::time::sleep(crate::store::PROGRAMMED_GRACE).await;
+                        store.expire_programmed_grace(&key);
+                    });
                 }
             }
         }
@@ -3434,6 +3450,99 @@ mod tests {
             1
         );
 
+        handle.abort();
+    }
+
+    fn bench_gateway(ports: &[u16]) -> GatewayState {
+        GatewayState {
+            name: "gw".into(),
+            namespace: "default".into(),
+            listeners: ports
+                .iter()
+                .map(|port| ListenerState {
+                    name: format!("l{port}"),
+                    port: *port,
+                    protocol: "HTTP".into(),
+                    hostname: None,
+                    accepted: true,
+                    conflicted: false,
+                    resolved_refs: true,
+                    allowed_routes: AllowedRoutesState { namespaces_from: "Same".into(), namespace_selector: None },
+                    tls_cert_refs: vec![],
+                    tls_mode: None,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn compilation_loop_compiles_after_a_short_quiet_period_and_batches_a_burst() {
+        // PERF-CP-2: a single write compiles after COMPILE_QUIET, not after the
+        // full window; writes closer together than that coalesce into one
+        // compile; back-to-back single writes each propagate quickly.
+        let store = Arc::new(ConfigStore::new());
+        let (tx, mut rx) = watch::channel::<CompiledConfig>(CompiledConfig::default());
+        let handle = tokio::spawn(compilation_loop(Arc::clone(&store), tx));
+        tokio::time::sleep(COMPILE_QUIET * 2).await;
+        let gw_key = NamespacedName { namespace: "default".into(), name: "gw".into() };
+
+        let started = std::time::Instant::now();
+        store.insert_and_notify(&store.gateways, gw_key.clone(), bench_gateway(&[80]));
+        tokio::time::timeout(Duration::from_secs(2), rx.changed()).await.expect("first compile").unwrap();
+        let first = started.elapsed();
+        assert!(first < COMPILE_DEBOUNCE / 2, "a lone write must not wait out the debounce cap: took {first:?}");
+        assert_eq!(rx.borrow_and_update().listeners.len(), 1);
+
+        // Sequential changes, each after the previous one landed: each is quick.
+        let started = std::time::Instant::now();
+        store.insert_and_notify(&store.gateways, gw_key.clone(), bench_gateway(&[80, 81]));
+        tokio::time::timeout(Duration::from_secs(2), rx.changed()).await.expect("second compile").unwrap();
+        let second = started.elapsed();
+        assert!(second < COMPILE_DEBOUNCE / 2, "a write right after a compile must not be rate limited: took {second:?}");
+        assert_eq!(rx.borrow_and_update().version, 2);
+
+        // A burst inside the quiet period: exactly one more compile.
+        for ports in [&[80, 81, 82][..], &[80, 81, 82, 83], &[80, 81, 82, 83, 84]] {
+            store.insert_and_notify(&store.gateways, gw_key.clone(), bench_gateway(ports));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(2), rx.changed()).await.expect("burst compile").unwrap();
+        assert_eq!(rx.borrow_and_update().listeners.len(), 5, "the burst compiled as one");
+        assert_eq!(rx.borrow().version, 3);
+        assert!(tokio::time::timeout(COMPILE_DEBOUNCE * 2, rx.changed()).await.is_err(), "no fourth compile");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn compilation_loop_still_compiles_under_continuous_churn() {
+        // Writes that never go quiet must not starve the loop: the quiet
+        // period is capped at COMPILE_DEBOUNCE.
+        let store = Arc::new(ConfigStore::new());
+        let (tx, mut rx) = watch::channel::<CompiledConfig>(CompiledConfig::default());
+        let handle = tokio::spawn(compilation_loop(Arc::clone(&store), tx));
+        tokio::time::sleep(COMPILE_QUIET * 2).await;
+        let gw_key = NamespacedName { namespace: "default".into(), name: "gw".into() };
+        let churn = tokio::spawn({
+            let store = Arc::clone(&store);
+            let gw_key = gw_key.clone();
+            async move {
+                for i in 0u16..120 {
+                    let ports: Vec<u16> = (0..=i % 7).map(|p| 80 + p).collect();
+                    store.insert_and_notify(&store.gateways, gw_key.clone(), bench_gateway(&ports));
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                }
+            }
+        });
+        let mut compiles = 0;
+        while tokio::time::timeout(COMPILE_DEBOUNCE * 3, rx.changed()).await.is_ok() {
+            rx.borrow_and_update();
+            compiles += 1;
+        }
+        churn.await.unwrap();
+        // ~360 ms of writes 3 ms apart: at least one compile per cap window, far fewer than writes.
+        assert!(compiles >= 3, "loop starved under churn: {compiles} compiles");
+        assert!(compiles <= 12, "quiet period not coalescing: {compiles} compiles");
         handle.abort();
     }
 
