@@ -23,7 +23,7 @@ WORKERS     ?= 64
 
 .PHONY: all k3d-up k3d-down build-controller build-dataplane build-proxy build deploy conformance-image conformance-run conformance-clean \
        gateway-api-crds clean disk-check disk-report disk-prune \
-       bench-backend bench-portus bench-agentgateway bench-envoy-gateway bench-nginx bench-wait bench-traffic bench-latency bench-teardown \
+       bench-backend bench-portus bench-agentgateway bench-envoy-gateway bench-nginx bench-wait bench-traffic bench-latency bench-download bench-upload bench-https bench-h2 bench-teardown \
        bench-tools-image bench-attached-routes bench-probe bench-route-change bench-backend-failover bench-route-scale
 
 all: k3d-up build deploy
@@ -153,8 +153,13 @@ BENCH_RESULTS  ?= benchmarks/results
 GATEWAYS       ?= bench/portus
 
 bench-backend:
-	$(MISE) kubectl apply -f deploy/bench/backend.yaml
+	$(MISE) kubectl apply -f deploy/bench/backend.yaml -f deploy/bench/echo-backend.yaml
 	$(MISE) kubectl -n bench rollout status deploy/backend --timeout=120s
+	$(MISE) kubectl -n bench rollout status deploy/echo --timeout=120s
+	@$(MISE) kubectl -n bench get secret bench-tls >/dev/null 2>&1 || { \
+	  openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=bench.example.com' \
+	    -keyout /tmp/bench-tls.key -out /tmp/bench-tls.crt >/dev/null 2>&1 && \
+	  $(MISE) kubectl -n bench create secret tls bench-tls --cert=/tmp/bench-tls.crt --key=/tmp/bench-tls.key; }
 
 # Portus: bump the dataplane template so each bench Gateway gets BENCH_REPLICAS
 # pods with BENCH_CPU cores requested (worker threads follow the CPU request).
@@ -219,6 +224,49 @@ bench-traffic:
 
 bench-latency:
 	$(call bench_run,-t fortio -c $(BENCH_LATENCY_CONNS) -q $(BENCH_QPS) -d 30,latency)
+
+# Payload ladder against the fortio echo backend (`/echo`), driven by fortio
+# itself rather than benchtool: benchtool cannot raise fortio's 128 KiB response
+# buffer, and above it the fast client closes every connection and runs the
+# client out of ports. Response bodies of BENCH_SIZES bytes (download), POST
+# bodies of the same sizes echoed back (upload), the download ladder over the
+# HTTPS listener (self-signed cert, verification off) and over HTTP/2 (h2c).
+# BENCH_PAYLOAD_CONNS connections, unlimited QPS, BENCH_DURATION s per rung.
+BENCH_SIZES ?= 1024,16384,131072,1048576
+BENCH_PAYLOAD_CONNS ?= 64
+FORTIO_IMAGE ?= fortio/fortio:1.69.5
+bench-download:
+	$(call bench_fortio,download,http,/echo?size=SIZE,)
+bench-upload:
+	$(call bench_fortio,upload,http,/echo,-payload-size SIZE)
+bench-https:
+	$(call bench_fortio,https,https,/echo?size=SIZE,-k)
+bench-h2:
+	$(call bench_fortio,h2,http,/echo?size=SIZE,-h2)
+
+# $(1) result name, $(2) scheme, $(3) path, $(4) extra fortio flags; SIZE in
+# the path or flags is replaced by each BENCH_SIZES value. One fortio pod per
+# rung, output appended to one result file per run with a kubectl top summary.
+define bench_fortio
+	@mkdir -p $(BENCH_RESULTS); out=$(BENCH_RESULTS)/$$(date +%Y%m%d-%H%M%S)-$(1)-$$(echo "$(GATEWAYS)" | tr ' /' '_-').txt; \
+	echo "# fortio load -c $(BENCH_PAYLOAD_CONNS) -qps 0 -t $(BENCH_DURATION)s -httpbufferkb 2048 -nocatchup -uniform $(4) $(2)://<gateway>$(3) sizes=$(BENCH_SIZES)" | tee $$out; \
+	KUBECTL="$(MISE) kubectl" python3 deploy/bench/sample-top.py $$out.top.tsv 5 & sampler=$$!; \
+	for gw in $(GATEWAYS); do ns=$${gw%/*}; name=$${gw#*/}; \
+	  addr=$$($(MISE) kubectl get gateway -n $$ns $$name -o jsonpath='{.status.addresses[0].value}'); \
+	  [ -n "$$addr" ] || { echo "$$gw has no address"; exit 1; }; \
+	  for size in $$(echo "$(BENCH_SIZES)" | tr ',' ' '); do \
+	    path=$$(echo "$(3)" | sed "s/SIZE/$$size/"); extra=$$(echo "$(4)" | sed "s/SIZE/$$size/"); \
+	    echo "==> $$name size=$$size $(2)://$$addr$$path $$extra" | tee -a $$out; \
+	    $(MISE) kubectl delete pod fortio -n bench --ignore-not-found --wait=true >/dev/null 2>&1; \
+	    $(MISE) kubectl run fortio -n bench --restart=Never --image=$(FORTIO_IMAGE) --overrides='{"spec":{"containers":[{"name":"fortio","image":"$(FORTIO_IMAGE)","args":["load","-quiet","-c","$(BENCH_PAYLOAD_CONNS)","-qps","0","-t","$(BENCH_DURATION)s","-httpbufferkb","2048","-nocatchup","-uniform"'"$$(for f in $$extra; do printf ',"%s"' "$$f"; done)"',"'"$(2)://$$addr$$path"'"],"resources":{"requests":{"cpu":"2","memory":"256Mi"}}}]}}' >/dev/null; \
+	    $(MISE) kubectl wait pod/fortio -n bench --for=jsonpath='{.status.phase}'=Succeeded --timeout=$$(( $(BENCH_DURATION) + 90 ))s >/dev/null 2>&1 || echo "fortio pod did not finish" | tee -a $$out; \
+	    $(MISE) kubectl logs fortio -n bench 2>&1 | grep -E 'target 50%|target 90%|target 99%|All done|Sockets used|Code |Aborting|error' | tee -a $$out; \
+	  done; done; \
+	$(MISE) kubectl delete pod fortio -n bench --ignore-not-found --wait=false >/dev/null 2>&1; \
+	kill $$sampler 2>/dev/null; wait $$sampler 2>/dev/null; \
+	echo "==> resource usage while running (kubectl top, 5 s samples):" | tee -a $$out; \
+	python3 deploy/bench/sample-top.py --summarise $$out.top.tsv | tee -a $$out; echo "==> saved $$out"
+endef
 
 # ── gateway-api-bench control-plane / availability tests (in-cluster tools Job) ─
 # Tools from howardjohn/gateway-api-bench built into $(BENCH_TOOLS_IMAGE); each
@@ -300,7 +348,7 @@ bench-teardown:
 	-$(MISE) helm uninstall eg -n envoy-gateway-system --wait 2>/dev/null
 	-$(MISE) helm uninstall nginx -n nginx-system --wait 2>/dev/null
 	-$(MISE) kubectl delete namespace agentgateway-system envoy-gateway-system nginx-system --ignore-not-found
-	-$(MISE) kubectl delete -f deploy/bench/backend.yaml --ignore-not-found
+	-$(MISE) kubectl delete -f deploy/bench/backend.yaml -f deploy/bench/echo-backend.yaml --ignore-not-found
 	$(MISE) helm upgrade $(HELM_RELEASE) $(HELM_CHART) -n $(NAMESPACE) --reuse-values \
 		--set dataplane.replicasPerGateway=1 --set dataplane.resources.requests.cpu=250m --wait
 

@@ -34,26 +34,43 @@ one 10-CPU k3d node (Docker Desktop, Apple silicon), Portus and agentgateway v1.
 same backend pods, load generator in-cluster, `kubectl top` sampled every 5 s. Numbers from one machine are
 only comparable with each other; method and full tables are in [`benchmarks/`](benchmarks/README.md).
 
-**Traffic** (3 proxy pods each; Portus limited to 2 Pingora worker threads per pod, agentgateway unlimited). Requests are bare `GET /` against a small echo response, so these figures measure per-request overhead, not throughput with large payloads, request bodies or TLS termination; those runs are still to come.
+**Traffic** (3 proxy pods each; Portus limited to 2 Pingora worker threads per pod, agentgateway unlimited). Requests are bare `GET /` with empty responses, so this table measures per-request overhead; payload, upload, HTTPS and HTTP/2 figures follow.
 
 | | Peak QPS (256 conns) | p99 at peak | p99 at fixed 30k QPS | Proxy CPU at 30k QPS |
 |---|---|---|---|---|
 | **Portus** | **119,372** | **7.2 ms** | **0.62 ms** | **3.2 cores** |
 | agentgateway | 76,462 | 12.9 ms | 1.90 ms | 3.8 cores |
 
-**Control plane and availability** (the rest of the gateway-api-bench suite):
+**Payloads** (Portus 0.2.0 alone on a clean box, 2026-09-09; fortio echo backend, 64 connections, 10 s per rung,
+all requests `200`, every connection kept alive):
+
+| Response size | Download QPS | Upload (POST, echoed) QPS | HTTPS download QPS | HTTP/2 download QPS |
+|---|---|---|---|---|
+| 1 KB | 62,699 | 69,388 | 78,724 | 63,974 |
+| 16 KB | 59,991 | 29,830 | 55,881 | 44,015 |
+| 128 KB | 34,074 (4.5 GB/s) | 8,982 | 26,978 | 22,304 |
+| 1 MiB | 6,279 (6.6 GB/s) | 5,076 | 4,898 | 4,103 |
+
+**Control plane and availability** (the rest of the gateway-api-bench suite, 2026-09-06/07):
 
 | Test | Portus | agentgateway |
 |---|---|---|
-| Route propagation, 200 routes | 0 errors, 0.4 ms per route, controller 64 m CPU | 0 errors, 1.2 ms per route, controller 29 m |
+| Route propagation, 200 routes | see note | see note |
 | Route changes, 60 flips under load | 0 errors in 83,464 requests | 0 errors in 75,698 requests |
 | Route scale, 500 pods + routes over 10 min | controller 50 m mean, 21 Mi | controller 18 m mean, 72 Mi |
 | Backend failover, 1 of 4 endpoints blackholed, no policy | 0.03 % errors (passive outlier ejection) | 4.0 % errors |
 | Backend failover with a Gateway `RetryPolicy` | 0 errors | not run |
 
+Route propagation: the earlier sub-millisecond figures for both implementations were an artifact of a catch-all
+route left attached during the probe. Measured correctly on 2026-09-09, Portus takes about 105 ms per route, almost
+all of it a 100 ms compile debounce that is being replaced with a leading-edge compile; agentgateway has not been
+re-measured yet.
+
 Details: [`benchmarks/gateway-comparison-2026-09-06-k3d.md`](benchmarks/gateway-comparison-2026-09-06-k3d.md)
-(traffic) and [`benchmarks/gateway-api-bench-v2-2026-09-06.md`](benchmarks/gateway-api-bench-v2-2026-09-06.md)
-(control plane, including the harness pitfalls). Reproduce with `make bench-backend bench-portus bench-traffic
+(traffic), [`benchmarks/gateway-api-bench-v2-2026-09-06.md`](benchmarks/gateway-api-bench-v2-2026-09-06.md)
+(control plane, including the harness pitfalls) and
+[`benchmarks/portus-0.2.0-clean-box-2026-09-09.md`](benchmarks/portus-0.2.0-clean-box-2026-09-09.md) (released
+0.2.0 on a clean box: 134,638 QPS peak, payload, HTTPS and HTTP/2 ladders). Reproduce with `make bench-backend bench-portus bench-traffic
 bench-latency` and the `bench-*` control-plane targets.
 
 ## Quick Start
