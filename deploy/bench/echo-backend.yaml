@@ -1,0 +1,42 @@
+# Payload benchmark backend: fortio's echo server. `GET /echo?size=N` returns
+# N bytes, `POST /echo` echoes the request body; -maxpayloadsizekb lifts the 256 KiB cap
+# so the 1 MiB rung of the ladder is real. Same namespace and shape as the
+# hyper-server backend, selected by a second HTTPRoute rule on `/echo`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: bench
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      containers:
+        - name: echo
+          image: fortio/fortio:1.69.5
+          args: ["server", "-maxpayloadsizekb", "2048", "-http-port", "8080", "-grpc-port", "disabled"]
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo
+  namespace: bench
+spec:
+  selector:
+    app: echo
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8080

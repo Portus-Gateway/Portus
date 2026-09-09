@@ -12,12 +12,21 @@ make bench-backend                            # namespace `bench`, hyper-server 
 make bench-portus                             # Portus Gateway; dataplane template -> BENCH_REPLICAS pods, BENCH_CPU cores each
 make bench-traffic GATEWAYS=bench/portus      # ladder 1..256 connections, 10 s each, unlimited QPS
 make bench-latency GATEWAYS=bench/portus      # 30k QPS on 64 connections for 30 s -> p50/p90/p99
+make bench-download GATEWAYS=bench/portus     # 1 KB..1 MiB responses from the fortio echo backend, 64 conns
+make bench-upload GATEWAYS=bench/portus       # POST bodies of the same sizes, echoed back
+make bench-https GATEWAYS=bench/portus        # download ladder over the HTTPS listener
+make bench-h2 GATEWAYS=bench/portus           # download ladder over h2c
 kubectl delete -f deploy/bench/portus.yaml    # one implementation at a time keeps the box to itself
 make bench-agentgateway                       # agentgateway chart v1.5.0, scaled to BENCH_REPLICAS
 make bench-traffic GATEWAYS=bench/agentgateway
 make bench-latency GATEWAYS=bench/agentgateway
 make bench-teardown                           # everything above, dataplane template back to defaults
 ```
+
+`bench-backend` also deploys fortio's echo server (`echo-backend.yaml`) behind a `/echo` rule
+and an HTTPS listener (self-signed `bench-tls` Secret) on each bench Gateway; the payload
+targets run one fortio pod per size with `-httpbufferkb 2048`, because benchtool cannot raise
+fortio's 128 KiB response buffer and above it the client closes every connection.
 
 Raw benchtool output is saved under `benchmarks/results/<timestamp>-<traffic|latency>-<gateways>.txt`,
 followed by a resource summary: `deploy/bench/sample-top.py` samples `kubectl top pods` every 5 s
@@ -48,7 +57,8 @@ implementation (stub CRDs in `deploy/bench/stub-crds.yaml`, namespace `envoy`) a
 per-request results at debug level; `routechange` reuses the `app=backend` selector and must not
 see the failover test's single-port pods (the target deletes them). ListenerSet scale is not
 wired: the tool drives `XListenerSet`, Portus implements `ListenerSet` v1. Results:
-`gateway-api-bench-v2-2026-09-06.md`.
+`gateway-api-bench-v2-2026-09-06.md`; the clean-box Portus 0.2.0 run with the payload ladders is
+`portus-0.2.0-clean-box-2026-09-09.md`.
 
 Rules that keep the comparison honest:
 
@@ -60,5 +70,8 @@ Rules that keep the comparison honest:
 - `bench-portus` changes the chart's dataplane template for *every* Gateway (replicas and CPU
   request). Run `make bench-teardown` before a conformance run, or the suite's base Gateways
   will not schedule on a small node.
+- **Remove the bench catch-all HTTPRoute before `probe` and `attachedroutes`**: with it attached
+  the probe's requests succeed before its own route exists and "propagation" measures nothing
+  (the 2026-09-06/07 propagation figures have this flaw).
 - Numbers are only comparable with runs on the same machine. Raw tool output under
   `benchmarks/results/` is git-ignored; the reports in this directory carry the figures.
