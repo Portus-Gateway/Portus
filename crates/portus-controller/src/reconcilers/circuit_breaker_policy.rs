@@ -153,11 +153,12 @@ pub async fn reconcile_circuit_breaker_policy(
     .await
     {
         log::warn!(
-            "failed to write CircuitBreakerPolicy status for {}/{}: {}; will retry on next reconcile",
+            "failed to write CircuitBreakerPolicy status for {}/{}: {}; retrying",
             namespace,
             name,
             e
         );
+        return Err(e.into());
     }
 
     // Siblings on the same target and data plane acks re-run this policy

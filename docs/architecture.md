@@ -79,7 +79,7 @@ The reconciler also updates the HTTPRoute's status conditions via the Kubernetes
 
 ### 2. Compilation loop wakes
 
-The compilation loop (`compiler::compilation_loop`) runs on its own OS thread. It blocks on `store.change_notify.notified()`; `Notify::notify_one` stores a permit when nobody is waiting, so a notification sent between two iterations is never lost and there is no timer. When woken, it sleeps `COMPILE_DEBOUNCE` (100 ms) — writes landing in that window coalesce into a single compilation — and compiles only if the store is still marked dirty.
+The compilation loop (`compiler::compilation_loop`) runs on its own OS thread. It blocks on `store.change_notify.notified()`; `Notify::notify_one` stores a permit when nobody is waiting, so a notification sent between two iterations is never lost and there is no timer. When woken it compiles at once if the last compile is more than `COMPILE_DEBOUNCE` (100 ms) old, otherwise it waits out the remainder of that window first, so a single change propagates in milliseconds while a burst of writes coalesces into one compilation per window; it compiles only if the store is still marked dirty.
 
 ### 3. compile_config reads ConfigStore
 
@@ -110,7 +110,7 @@ We chose `watch` over `broadcast` for a specific reason: `watch` always delivers
 
 The gRPC server (`ConfigServer`) runs on its own dedicated OS thread. When a dataplane connects via `StreamConfig`, the server subscribes to the watch channel and wraps it in a `WatchStream`, which yields the current value immediately (so the dataplane always gets a config on connect) and then yields on each subsequent change.
 
-The dataplane's config receiver (`config_stream_loop`) runs in its own OS thread too, with a reconnecting loop. On connect, it sends a `ConfigRequest` with its node ID, bound ports, schema version, and the fingerprint of the config it is currently running. For every message it decides with `apply_decision`: a fingerprint different from what it runs is applied; the same fingerprint is a heartbeat (redundant push, or a restarted controller recompiling identical content); only a controller that predates fingerprints falls back to the old generation-order rule. After `apply_config` the dataplane calls the `ReportApplied` RPC with the fingerprint it applied. The controller records bound ports (used by the Gateway reconciler for listener programming) and per-node applied fingerprints; `ConfigStore::is_programmed()` is true when at least one dataplane runs the currently compiled fingerprint, which drives the `Programmed` condition on Gateways and policies. A change in programmed state wakes `programmed_notify`, which feeds the Gateway controller's `reconcile_all_on` trigger stream, so no user object is written to requeue.
+The dataplane's config receiver (`config_stream_loop`) runs in its own OS thread too, with a reconnecting loop. On connect, it sends a `ConfigRequest` with its node ID, bound ports, schema version, and the fingerprint of the config it is currently running. For every message it decides with `apply_decision`: a fingerprint different from what it runs is applied; the same fingerprint is a heartbeat (redundant push, or a restarted controller recompiling identical content); only a controller that predates fingerprints falls back to the old generation-order rule. After `apply_config` the dataplane calls the `ReportApplied` RPC with the fingerprint it applied. The controller records bound ports (used by the Gateway reconciler for listener programming) and per-node applied fingerprints; `ConfigStore::is_programmed_for(gateway)` is true when a dataplane serving that Gateway runs the current fingerprint of its slice, or the previous one within `PROGRAMMED_GRACE` (10 s) of it being superseded — a dataplane still picking up a new slice is not a Gateway that stopped working, so a route change does not flip `Programmed` to False and back. The store publishes `Event::Programmed(gateway)` only when that answer moves (an ack, a disconnect, a slice change with no current dataplane, or the grace window lapsing, which the compile loop schedules), so status is written only when it changes and no user object is touched to requeue.
 
 ### 7. Route map building and ArcSwap
 
@@ -153,7 +153,7 @@ The controller runs three OS threads, each with its own single-threaded tokio ru
 
 **Main runtime** (`#[tokio::main]`): Runs all kube-rs controllers (one per CRD type) as spawned tasks. Each controller watches its CRD via the Kubernetes API and runs a reconcile function that validates the resource and writes state to the ConfigStore. The controllers also set up cross-resource watches — for example, the HTTPRoute controller watches Gateway and ReferenceGrant resources so that routes are re-reconciled when their parent Gateway is created or a grant is revoked.
 
-**Compilation thread** (`std::thread::spawn` with `tokio::runtime::Builder::new_current_thread`): Runs the compilation loop exclusively. The isolation guarantees that even if the main runtime is saturated with reconciler tasks (common during initial cluster sync or mass resource updates), compilation still runs promptly. The 100ms debounce is deliberately short — we'd rather compile a few extra times than delay config propagation.
+**Compilation thread** (`std::thread::spawn` with `tokio::runtime::Builder::new_current_thread`): Runs the compilation loop exclusively. The isolation guarantees that even if the main runtime is saturated with reconciler tasks (common during initial cluster sync or mass resource updates), compilation still runs promptly. The debounce is trailing-edge only: an idle loop compiles immediately, and 100 ms is deliberately short — we'd rather compile a few extra times than delay config propagation.
 
 **gRPC server thread** (`std::thread::spawn` with `tokio::runtime::Builder::new_multi_thread` and 2 worker threads): Runs the tonic gRPC server. Isolated so that a slow dataplane or network issue can't block reconcilers or compilation.
 
@@ -354,7 +354,7 @@ Each isolated component (compilation loop, gRPC server, config receiver, SNI mux
 
 - **No starvation**: During initial cluster sync, the main runtime may have hundreds of reconciler tasks queued. A compilation loop running as just another task on that runtime could be delayed by seconds. On its own thread, it runs immediately.
 - **Panic isolation**: `catch_unwind` in the compilation loop catches panics without affecting reconcilers. On a shared runtime, a panic in one task can poison the runtime.
-- **Predictable scheduling**: The compilation thread does one thing — wake, debounce, compile, fingerprint, maybe send. No competing work.
+- **Predictable scheduling**: The compilation thread does one thing — wake, compile (after the rest of the debounce window if one is running), fingerprint, maybe send. No competing work.
 
 The cost is a few extra OS threads, which is negligible.
 

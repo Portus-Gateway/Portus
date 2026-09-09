@@ -343,7 +343,8 @@ pub async fn reconcile_grpc_route(
         )
         .await
         {
-            log::warn!("failed to write GRPCRoute status for {}/{}: {}; will retry on next reconcile", namespace, name, e);
+            log::warn!("failed to write GRPCRoute status for {}/{}: {}; retrying", namespace, name, e);
+            return Err(e.into());
         }
     }
 

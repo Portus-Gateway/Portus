@@ -62,9 +62,9 @@ all requests `200`, every connection kept alive):
 | Backend failover with a Gateway `RetryPolicy` | 0 errors | not run |
 
 Route propagation: the earlier sub-millisecond figures for both implementations were an artifact of a catch-all
-route left attached during the probe. Measured correctly on 2026-09-09, Portus takes about 105 ms per route, almost
-all of it a 100 ms compile debounce that is being replaced with a leading-edge compile; agentgateway has not been
-re-measured yet.
+route left attached during the probe. Measured correctly on 2026-09-09, the released 0.2.0 took about 105 ms per
+route (its 100 ms compile debounce); with the quiet-period compile now on `main`, 200 routes applied back to back
+propagate in 15–42 ms each (mean 27 ms, 0 failed polls). agentgateway has not been re-measured yet.
 
 Details: [`benchmarks/gateway-comparison-2026-09-06-k3d.md`](benchmarks/gateway-comparison-2026-09-06-k3d.md)
 (traffic), [`benchmarks/gateway-api-bench-v2-2026-09-06.md`](benchmarks/gateway-api-bench-v2-2026-09-06.md)

@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Notify};
 
 use portus_types::BackendEndpoint;
@@ -68,6 +69,11 @@ pub struct ConfigStore {
     /// Fingerprint of each Gateway's slice of the last compiled config
     /// (`compiler::scope_config`), for per-Gateway Programmed decisions.
     pub compiled_gateway_fingerprints: DashMap<NamespacedName, u64>,
+    /// Fingerprints a Gateway's slice had before its current one, with the
+    /// moment each was superseded. A data plane still running one of these
+    /// keeps the Gateway Programmed for [`PROGRAMMED_GRACE`] while it picks up
+    /// the new slice; entries older than that are pruned as they are seen.
+    pub superseded_slices: DashMap<NamespacedName, Vec<(u64, Instant)>>,
     /// node_id -> what that data plane runs: which Gateway it is dedicated to
     /// (None = shared data plane that receives everything) and the fingerprint
     /// of the config it has applied.
@@ -118,6 +124,12 @@ pub enum Event {
     /// data plane acked or disconnected, or the slice was recompiled.
     Programmed(NamespacedName),
 }
+
+/// How long a Gateway stays Programmed after its slice was recompiled while
+/// its data planes still run the previous slice. Long enough for a stream
+/// round trip under load, short enough that a data plane that never applies
+/// the new slice is reported.
+pub const PROGRAMMED_GRACE: Duration = Duration::from_secs(10);
 
 /// Route kinds the store tracks, for [`Event::Route`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +191,7 @@ impl ConfigStore {
             compiled_version: AtomicU64::new(0),
             compiled_fingerprint: AtomicU64::new(0),
             compiled_gateway_fingerprints: DashMap::new(),
+            superseded_slices: DashMap::new(),
             data_plane_applied: DashMap::new(),
             change_notify: Notify::new(),
             dirty: AtomicBool::new(true),
@@ -248,9 +261,21 @@ impl ConfigStore {
     /// node ids cannot grow the maps without bound.
     pub const MAX_DATA_PLANE_NODES: usize = 1000;
 
-    /// True when at least one data plane runs its Gateway's current slice.
-    /// False before the first compile or while every data plane still runs
-    /// something else. Policies use this aggregate; Gateways use
+    /// Whether `fingerprint` is `gateway`'s current slice, or one it had within
+    /// the last [`PROGRAMMED_GRACE`]: a data plane on the previous slice while
+    /// a new one streams to it is not a Gateway that stopped working.
+    fn slice_is_current_or_in_grace(&self, gateway: &NamespacedName, fingerprint: u64) -> bool {
+        if self.compiled_gateway_fingerprints.get(gateway).is_some_and(|fp| *fp == fingerprint) {
+            return true;
+        }
+        self.superseded_slices.get(gateway).is_some_and(|old| {
+            old.iter().any(|(fp, superseded_at)| *fp == fingerprint && superseded_at.elapsed() < PROGRAMMED_GRACE)
+        })
+    }
+
+    /// True when at least one data plane runs its Gateway's current slice (or
+    /// the previous one, within the grace window). False before the first
+    /// compile. Policies use this aggregate; Gateways use
     /// [`Self::is_programmed_for`].
     pub fn is_programmed(&self) -> bool {
         if self.compiled_fingerprint.load(Ordering::Acquire) == 0 {
@@ -258,36 +283,95 @@ impl ConfigStore {
         }
         self.data_plane_applied.iter().any(|entry| {
             let applied = entry.value();
-            self.compiled_gateway_fingerprints
-                .get(&applied.gateway)
-                .is_some_and(|fp| *fp == applied.fingerprint)
+            self.compiled_gateway_fingerprints.contains_key(&applied.gateway)
+                && self.slice_is_current_or_in_grace(&applied.gateway, applied.fingerprint)
         })
     }
 
     /// True when `gateway` is served by a data plane running the current
-    /// fingerprint of its config slice.
+    /// fingerprint of its config slice, or the previous one within the grace
+    /// window.
     pub fn is_programmed_for(&self, gateway: &NamespacedName) -> bool {
-        if self.compiled_fingerprint.load(Ordering::Acquire) == 0 {
+        if self.compiled_fingerprint.load(Ordering::Acquire) == 0
+            || !self.compiled_gateway_fingerprints.contains_key(gateway)
+        {
             return false;
         }
-        let Some(slice) = self.compiled_gateway_fingerprints.get(gateway).map(|v| *v) else {
-            return false;
-        };
-        self.data_plane_applied
-            .iter()
-            .any(|entry| entry.value().gateway == *gateway && entry.value().fingerprint == slice)
+        self.data_plane_applied.iter().any(|entry| {
+            entry.value().gateway == *gateway && self.slice_is_current_or_in_grace(gateway, entry.value().fingerprint)
+        })
+    }
+
+    /// Run `change` and publish [`Event::Programmed`] for `gateway` only if its
+    /// Programmed answer moved. Every reconciler that listens derives the same
+    /// value, so an unchanged answer is not worth a wake.
+    fn with_programmed_change<R>(&self, gateway: &NamespacedName, change: impl FnOnce() -> R) -> R {
+        let before = self.is_programmed_for(gateway);
+        let result = change();
+        if self.is_programmed_for(gateway) != before {
+            self.notify_programmed(gateway);
+        }
+        result
+    }
+
+    /// Record the fingerprint of `gateway`'s freshly compiled slice. The one it
+    /// replaces is kept for [`PROGRAMMED_GRACE`]. Returns whether it changed.
+    pub fn set_compiled_slice(&self, gateway: &NamespacedName, fingerprint: u64) -> bool {
+        self.with_programmed_change(gateway, || {
+            let previous = self.compiled_gateway_fingerprints.insert(gateway.clone(), fingerprint);
+            match previous {
+                Some(prev) if prev == fingerprint => false,
+                Some(prev) => {
+                    let mut old = self.superseded_slices.entry(gateway.clone()).or_default();
+                    old.retain(|(_, at)| at.elapsed() < PROGRAMMED_GRACE);
+                    old.push((prev, Instant::now()));
+                    true
+                }
+                None => true,
+            }
+        })
+    }
+
+    /// Forget a departed Gateway's slice.
+    pub fn remove_compiled_slice(&self, gateway: &NamespacedName) {
+        self.with_programmed_change(gateway, || {
+            self.compiled_gateway_fingerprints.remove(gateway);
+            self.superseded_slices.remove(gateway);
+        });
+    }
+
+    /// The grace window of a superseded slice ran out: prune it and, if the
+    /// Gateway is no longer Programmed, say so. The compile loop schedules this
+    /// [`PROGRAMMED_GRACE`] after every slice change, since nothing else would
+    /// wake the Gateway's reconciler for a data plane that never caught up.
+    pub fn expire_programmed_grace(&self, gateway: &NamespacedName) {
+        let had_grace = self
+            .superseded_slices
+            .get_mut(gateway)
+            .map(|mut old| {
+                let before = old.len();
+                old.retain(|(_, at)| at.elapsed() < PROGRAMMED_GRACE);
+                before > old.len()
+            })
+            .unwrap_or(false);
+        if had_grace && !self.is_programmed_for(gateway) {
+            self.notify_programmed(gateway);
+        }
     }
 
     /// Forget a data plane that disconnected: drop its applied fingerprint and
-    /// wake the Programmed trigger (its Gateway may have lost its only current
-    /// data plane). Without this, pod churn (one dataplane Deployment per
-    /// Gateway, hundreds of Gateways per conformance run) fills the node cap
-    /// with dead entries and new pods' ACKs are rejected, leaving Gateways
+    /// wake the Programmed trigger if its Gateway lost its only current data
+    /// plane. Without this, pod churn (one dataplane Deployment per Gateway,
+    /// hundreds of Gateways per conformance run) fills the node cap with dead
+    /// entries and new pods' ACKs are rejected, leaving Gateways
     /// `Programmed=False/Pending`.
     pub fn forget_data_plane(&self, node_id: &str) {
-        if let Some((_, gone)) = self.data_plane_applied.remove(node_id) {
-            self.notify_programmed(&gone.gateway);
-        }
+        let Some(gateway) = self.data_plane_applied.get(node_id).map(|s| s.gateway.clone()) else {
+            return;
+        };
+        self.with_programmed_change(&gateway, || {
+            self.data_plane_applied.remove(node_id);
+        });
     }
 
     /// Whether `node_id` may be (or already is) tracked under the node cap.
@@ -296,22 +380,31 @@ impl ConfigStore {
             || self.data_plane_applied.contains_key(node_id)
     }
 
-    /// Record that `node_id` (serving `gateway`) has
-    /// applied `fingerprint`. Wakes the Programmed trigger whenever the applied
-    /// content of a node changes, so Gateway status can move even if another
-    /// node already made the aggregate true. Returns false if the node was
-    /// rejected by the cap.
+    /// Record that `node_id` (serving `gateway`) has applied `fingerprint`.
+    /// Wakes the Programmed trigger for every Gateway whose answer moved (the
+    /// one the node serves, and the one it left if it moved). Returns false if
+    /// the node was rejected by the cap.
     pub fn record_applied(&self, node_id: &str, gateway: NamespacedName, fingerprint: u64) -> bool {
         if fingerprint == 0 || !self.accepts_data_plane(node_id) {
             return false;
         }
         let state = AppliedState { gateway, fingerprint };
-        let previous = self.data_plane_applied.insert(node_id.to_string(), state.clone());
-        if previous.as_ref() != Some(&state) {
-            if let Some(prev) = previous.filter(|p| p.gateway != state.gateway) {
-                self.notify_programmed(&prev.gateway);
-            }
-            self.notify_programmed(&state.gateway);
+        let left = self
+            .data_plane_applied
+            .get(node_id)
+            .map(|p| p.gateway.clone())
+            .filter(|g| *g != state.gateway);
+        let joined = state.gateway.clone();
+        let left_before = left.as_ref().map(|g| self.is_programmed_for(g));
+        let joined_before = self.is_programmed_for(&joined);
+        self.data_plane_applied.insert(node_id.to_string(), state);
+        if let (Some(left), Some(before)) = (left, left_before)
+            && self.is_programmed_for(&left) != before
+        {
+            self.notify_programmed(&left);
+        }
+        if self.is_programmed_for(&joined) != joined_before {
+            self.notify_programmed(&joined);
         }
         true
     }
@@ -985,15 +1078,18 @@ mod tests {
     #[test]
     fn record_applied_names_the_gateway_a_node_left_and_the_one_it_joined() {
         let store = ConfigStore::new();
-        let mut rx = store.events.subscribe();
+        store.compiled_fingerprint.store(1, Ordering::Release);
         let a = NamespacedName { namespace: "ns".into(), name: "a".into() };
         let b = NamespacedName { namespace: "ns".into(), name: "b".into() };
+        store.set_compiled_slice(&a, 1);
+        store.set_compiled_slice(&b, 1);
+        let mut rx = store.events.subscribe();
         assert!(store.record_applied("node", a.clone(), 1));
         assert_eq!(rx.try_recv().unwrap(), Event::Programmed(a.clone()));
         // Same content again: silence.
         assert!(store.record_applied("node", a.clone(), 1));
         assert!(rx.try_recv().is_err());
-        // Node moves to another Gateway: both may have changed.
+        // Node moves to another Gateway: `a` loses its data plane, `b` gains one.
         assert!(store.record_applied("node", b.clone(), 1));
         assert_eq!(rx.try_recv().unwrap(), Event::Programmed(a));
         assert_eq!(rx.try_recv().unwrap(), Event::Programmed(b.clone()));
@@ -1220,6 +1316,80 @@ mod tests {
     }
 
     #[test]
+    fn programmed_survives_a_slice_change_while_the_data_plane_catches_up() {
+        // A Gateway whose data plane runs the previous slice stays Programmed
+        // while the new slice is in flight (PERF-CP-3); the old behaviour
+        // flipped it to False on every recompile.
+        let store = ConfigStore::new();
+        store.compiled_fingerprint.store(1, Ordering::Release);
+        assert!(store.set_compiled_slice(&gw("ns", "gw"), 0xa));
+        assert!(store.record_applied("dp", gw("ns", "gw"), 0xa));
+        assert!(store.is_programmed_for(&gw("ns", "gw")));
+
+        assert!(store.set_compiled_slice(&gw("ns", "gw"), 0xb), "changed");
+        assert!(store.is_programmed_for(&gw("ns", "gw")), "previous slice within the grace window");
+        assert!(store.is_programmed(), "the aggregate follows the same rule");
+        assert!(!store.set_compiled_slice(&gw("ns", "gw"), 0xb), "unchanged");
+
+        // The data plane catches up: programmed, no grace needed.
+        assert!(store.record_applied("dp", gw("ns", "gw"), 0xb));
+        assert!(store.is_programmed_for(&gw("ns", "gw")));
+        // A slice the data plane never ran does not count, grace or not.
+        assert!(store.set_compiled_slice(&gw("ns", "gw"), 0xc));
+        assert!(store.set_compiled_slice(&gw("ns", "gw"), 0xd));
+        assert!(store.is_programmed_for(&gw("ns", "gw")), "0xb superseded twice but still inside the window");
+        store.data_plane_applied.insert("dp".into(), dedicated("ns", "gw", 0x999));
+        assert!(!store.is_programmed_for(&gw("ns", "gw")));
+    }
+
+    #[test]
+    fn programmed_lapses_when_the_grace_window_passes() {
+        let store = ConfigStore::new();
+        store.compiled_fingerprint.store(1, Ordering::Release);
+        store.set_compiled_slice(&gw("ns", "gw"), 0xa);
+        store.record_applied("dp", gw("ns", "gw"), 0xa);
+        store.set_compiled_slice(&gw("ns", "gw"), 0xb);
+        // Age the superseded slice past the window.
+        let long_ago = std::time::Instant::now().checked_sub(PROGRAMMED_GRACE * 2).expect("clock");
+        for entry in store.superseded_slices.get_mut(&gw("ns", "gw")).expect("recorded").iter_mut() {
+            entry.1 = long_ago;
+        }
+        assert!(!store.is_programmed_for(&gw("ns", "gw")));
+        assert!(!store.is_programmed());
+        let mut rx = store.events.subscribe();
+        store.expire_programmed_grace(&gw("ns", "gw"));
+        assert_eq!(rx.try_recv().unwrap(), Event::Programmed(gw("ns", "gw")), "the lapse is announced");
+        assert!(store.superseded_slices.get(&gw("ns", "gw")).is_none_or(|v| v.is_empty()), "pruned");
+        store.expire_programmed_grace(&gw("ns", "gw"));
+        assert!(rx.try_recv().is_err(), "nothing left to announce");
+    }
+
+    #[test]
+    fn programmed_events_fire_only_when_the_answer_moves() {
+        let store = ConfigStore::new();
+        store.compiled_fingerprint.store(1, Ordering::Release);
+        let mut rx = store.events.subscribe();
+        // First slice: no data plane yet, still not programmed -> silence.
+        store.set_compiled_slice(&gw("ns", "gw"), 0xa);
+        assert!(rx.try_recv().is_err());
+        // Data plane runs it: False -> True.
+        store.record_applied("dp", gw("ns", "gw"), 0xa);
+        assert_eq!(rx.try_recv().unwrap(), Event::Programmed(gw("ns", "gw")));
+        // Recompile: still True through the grace window -> silence.
+        store.set_compiled_slice(&gw("ns", "gw"), 0xb);
+        assert!(rx.try_recv().is_err());
+        // Ack of the new slice: still True -> silence.
+        store.record_applied("dp", gw("ns", "gw"), 0xb);
+        assert!(rx.try_recv().is_err());
+        // Only data plane leaves: True -> False.
+        store.forget_data_plane("dp");
+        assert_eq!(rx.try_recv().unwrap(), Event::Programmed(gw("ns", "gw")));
+        // Slice removed for a departed Gateway that was not programmed -> silence.
+        store.remove_compiled_slice(&gw("ns", "gw"));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn test_forget_data_plane_frees_the_cap_and_may_unprogram() {
         let store = ConfigStore::new();
         store.compiled_fingerprint.store(9, Ordering::Release);
@@ -1257,7 +1427,7 @@ mod tests {
         });
         store.compiled_gateway_fingerprints.insert(gw("ns", "gw"), 7);
         tokio::task::yield_now().await;
-        // Stale fingerprint: recorded, not programmed (still wakes: content changed).
+        // Stale fingerprint: recorded, not programmed, nothing to announce.
         assert!(store.record_applied("node-1", gw("ns", "gw"), 6));
         assert!(!store.is_programmed());
         // Current fingerprint: programmed flips and waiters wake.

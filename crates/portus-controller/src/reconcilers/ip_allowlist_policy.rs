@@ -195,11 +195,12 @@ pub async fn reconcile_ip_allowlist_policy(
     .await
     {
         log::warn!(
-            "failed to write IPAllowlistPolicy status for {}/{}: {}; will retry on next reconcile",
+            "failed to write IPAllowlistPolicy status for {}/{}: {}; retrying",
             namespace,
             name,
             e
         );
+        return Err(e.into());
     }
 
     // Siblings on the same target and data plane acks re-run this policy

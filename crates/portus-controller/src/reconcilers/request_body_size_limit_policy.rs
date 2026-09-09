@@ -146,11 +146,12 @@ pub async fn reconcile_request_body_size_limit_policy(
     .await
     {
         log::warn!(
-            "failed to write RequestBodySizeLimitPolicy status for {}/{}: {}; will retry on next reconcile",
+            "failed to write RequestBodySizeLimitPolicy status for {}/{}: {}; retrying",
             namespace,
             name,
             e
         );
+        return Err(e.into());
     }
 
     // Siblings on the same target and data plane acks re-run this policy

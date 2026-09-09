@@ -88,7 +88,7 @@ bottleneck", not what a NIC would deliver.
 | Backend failover, Gateway `RetryPolicy` | 44,107 requests, 0 errors | — |
 | Route scale, 500 pods + routes, 10 min | pilot-load exit 0 | 49 m / 95 m, 19 Mi mean / 25 Mi peak; proxies 19 m, 279 Mi |
 
-Two findings, tracked in the backlog as PERF-CP-2 and PERF-CP-3:
+Two findings, fixed on `main` the same night (re-measured below):
 
 - **The 0.4 ms propagation figure in the 2026-09-06/07 reports was an artifact.** Those runs
   left the bench catch-all HTTPRoute (`bench/portus`, no hostname) attached, so the probe's
@@ -98,6 +98,19 @@ Two findings, tracked in the backlog as PERF-CP-2 and PERF-CP-3:
 - **Status writes tripled** (417 vs 146 on 2026-09-06): `Programmed` flips to False on every
   recompile until the data planes ack the new fingerprint, and the Gateway reconciled 1,051
   times for 200 routes. Correct, but noisy.
+
+### After the fixes (same box, controller built from `main`, dataplanes still 0.2.0)
+
+| Test | 0.2.0 | `main` |
+|---|---|---|
+| Route propagation, 200 routes | 104–109 ms per route, first 1.8 s, 287 non-200 polls | **15–42 ms per route (mean 27 ms), first 20 ms, 0 non-200 polls** |
+| Attached routes, 100 | 417 status writes | **212 status writes** (one per `attachedRoutes` change, up and down) |
+| `Programmed` condition flips during both tests | one per recompile | **0** (3 total in the run: initial provisioning and Gateway re-creation) |
+
+The compile loop now waits for writes to go quiet for 10 ms (capped at 100 ms under continuous churn)
+instead of sleeping 100 ms after every wake, and a Gateway whose data planes still run the previous
+slice stays `Programmed=True` for 10 s while the new one streams to them, with `Programmed` events
+published only when the answer moves.
 
 ## Harness notes
 
