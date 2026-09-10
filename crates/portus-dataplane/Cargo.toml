@@ -15,6 +15,7 @@ pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
 pingora-http = { workspace = true }
 pingora-load-balancing = { workspace = true }
+pingora-prometheus = { workspace = true }
 arc-swap = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }

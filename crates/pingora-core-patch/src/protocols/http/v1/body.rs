@@ -20,9 +20,11 @@ use pingora_error::{
     OrErr, Result,
 };
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::{pin, Pin};
+use std::task::{ready, Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::protocols::l4::stream::AsyncWriteVec;
 use crate::utils::BufRef;
 
 // TODO: make this dynamically adjusted
@@ -172,24 +174,64 @@ impl BodyReader {
     }
 
     fn prepare_buf(&mut self, buf_to_rewind: &[u8]) {
-        let mut body_buf = BytesMut::with_capacity(self.body_buf_size);
+        let mut body_buf = BytesMut::with_capacity(self.body_buf_size.max(buf_to_rewind.len()));
         if !buf_to_rewind.is_empty() {
             self.rewind_buf_len = buf_to_rewind.len();
             // TODO: this is still 1 copy. Make it zero
             body_buf.put_slice(buf_to_rewind);
         }
-        if self.body_buf_size > buf_to_rewind.len() {
-            //body_buf.resize(self.body_buf_size, 0);
-            unsafe {
-                body_buf.set_len(self.body_buf_size);
-            }
-        }
         self.body_buf = Some(body_buf);
+    }
+
+    /// Adopt `buf_to_rewind` as the body buffer instead of copying it.
+    ///
+    /// Unlike [`Self::prepare_buf`] this keeps the caller's allocation, so bytes that were read
+    /// past the end of a request header stay in place all the way through body parsing and, for
+    /// pipelined connections, into the next request's buffer.
+    fn prepare_owned_buf(&mut self, buf_to_rewind: BytesMut) {
+        self.rewind_buf_len = buf_to_rewind.len();
+        self.body_buf = Some(buf_to_rewind);
+    }
+
+    /// Empty the body buffer and return it with room for at least `read_size` more bytes,
+    /// ready to be filled by [`AsyncReadExt::read_buf`].
+    ///
+    /// This **discards** whatever the buffer currently holds, so callers must only use it once
+    /// every previously buffered byte has been parsed and handed to the caller. Paths that still
+    /// need the buffered bytes (a pending rewind, a partial chunk head, or the trailer tail left
+    /// behind by [`Self::do_read_chunked_body`]) must reuse the existing buffer instead.
+    fn prepare_buf_for_io(&mut self, read_size: usize) -> &mut BytesMut {
+        let body_buf = self.body_buf.get_or_insert_default();
+        body_buf.clear();
+        body_buf.reserve(read_size);
+        body_buf
+    }
+
+    /// Grow the body buffer so it has room for `body_buf_size` bytes in total without discarding
+    /// what it already holds.
+    ///
+    /// Used by the partial chunk head path, which must keep the bytes it has already buffered
+    /// while making room to read the rest of the head.
+    fn reserve_buf_for_io(&mut self) {
+        let body_buf = self.body_buf.get_or_insert_default();
+        if body_buf.len() < self.body_buf_size {
+            body_buf.reserve(self.body_buf_size - body_buf.len());
+        }
     }
 
     pub fn init_chunked(&mut self, buf_to_rewind: &[u8]) {
         self.body_state = PS::Chunked(0, 0, 0, 0);
         self.prepare_buf(buf_to_rewind);
+    }
+
+    /// Zero-copy variant of [`Self::init_chunked`].
+    ///
+    /// `buf_to_rewind` is adopted as the body buffer rather than copied into a fresh one, so any
+    /// bytes the header parser read past the end of the header (the start of the body, and
+    /// possibly of following pipelined requests) keep their original allocation.
+    pub fn init_chunked_owned(&mut self, buf_to_rewind: BytesMut) {
+        self.body_state = PS::Chunked(0, 0, 0, 0);
+        self.prepare_owned_buf(buf_to_rewind);
     }
 
     pub fn init_content_length(&mut self, cl: usize, buf_to_rewind: &[u8]) {
@@ -210,8 +252,34 @@ impl BodyReader {
         }
     }
 
+    /// Zero-copy variant of [`Self::init_content_length`].
+    ///
+    /// `buf_to_rewind` is adopted as the body buffer (or, when `cl` is 0, as the overread buffer)
+    /// rather than copied into a fresh one. See [`Self::init_chunked_owned`].
+    pub fn init_content_length_owned(&mut self, cl: usize, buf_to_rewind: BytesMut) {
+        match cl {
+            0 => {
+                self.body_state = PS::Complete(0);
+                self.body_buf_overread = (!buf_to_rewind.is_empty()).then_some(buf_to_rewind);
+            }
+            _ => {
+                self.prepare_owned_buf(buf_to_rewind);
+                self.body_state = PS::Partial(0, cl);
+            }
+        }
+    }
+
     pub fn init_close_delimited(&mut self, buf_to_rewind: &[u8]) {
         self.prepare_buf(buf_to_rewind);
+        self.body_state = PS::UntilClose(0);
+    }
+
+    /// Zero-copy variant of [`Self::init_close_delimited`].
+    ///
+    /// `buf_to_rewind` is adopted as the body buffer rather than copied into a fresh one. See
+    /// [`Self::init_chunked_owned`].
+    pub fn init_close_delimited_owned(&mut self, buf_to_rewind: BytesMut) {
+        self.prepare_owned_buf(buf_to_rewind);
         self.body_state = PS::UntilClose(0);
     }
 
@@ -228,9 +296,8 @@ impl BodyReader {
         if self.rewind_buf_len == 0 {
             // take any extra bytes and send them as-is,
             // reset body counter
-            let extra = self.body_buf_overread.take();
-            let buf = extra.as_deref().unwrap_or_default();
-            self.prepare_buf(buf);
+            let extra = self.body_buf_overread.take().unwrap_or_default();
+            self.prepare_owned_buf(extra);
         } // if rewind_buf_len is not 0, body read has not yet been polled
         self.body_state = PS::UntilClose(0);
     }
@@ -249,8 +316,54 @@ impl BodyReader {
         self.get_body_overread().is_some_and(|b| !b.is_empty())
     }
 
+    /// Take ownership of the overread bytes, leaving `None` in their place.
+    ///
+    /// Overread bytes are bytes that were read from the stream but are beyond the
+    /// end of the current request's body — i.e. they belong to a pipelined next
+    /// request on the same connection. Callers that support HTTP/1.1 pipelining
+    /// extract these bytes here and feed them to the next session's request
+    /// parser via [`HttpSession::set_pipelined_prefix`](super::server::HttpSession::set_pipelined_prefix).
+    pub fn take_body_overread(&mut self) -> Option<BytesMut> {
+        self.body_buf_overread.take()
+    }
+
+    /// Append bytes to the overread buffer from outside the body-parsing path.
+    ///
+    /// The body reader's overread buffer is normally populated by
+    /// [`Self::init_content_length`] (for zero-length bodies) and
+    /// [`Self::finish_body_buf`] (for sized bodies) when the stream read
+    /// that completed the current request also pulled in bytes from the
+    /// next pipelined request. That path covers the "both requests in one
+    /// read" shape.
+    ///
+    /// The "second request arrives in a separate read after the first
+    /// request's body is already done" shape is different: the body
+    /// reader never sees those bytes — they land on the idle-branch read
+    /// in [`super::server::HttpSession::read_body_or_idle`]. When
+    /// pipelining is enabled, that caller stashes the idle read here so
+    /// a single downstream overread surface covers both shapes and
+    /// [`Self::take_body_overread`] returns them uniformly.
+    pub fn push_body_overread(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        match self.body_buf_overread.as_mut() {
+            Some(buf) => buf.extend_from_slice(bytes),
+            None => {
+                let mut buf = BytesMut::with_capacity(bytes.len());
+                buf.extend_from_slice(bytes);
+                self.body_buf_overread = Some(buf);
+            }
+        }
+    }
+
     pub fn body_done(&self) -> bool {
         matches!(self.body_state, PS::Complete(_) | PS::Done(_))
+    }
+
+    /// Whether the message body reached its framing-defined end without an error.
+    pub fn body_complete(&self) -> bool {
+        matches!(self.body_state, PS::Complete(_))
     }
 
     pub fn body_empty(&self) -> bool {
@@ -284,21 +397,22 @@ impl BodyReader {
     where
         S: AsyncRead + Unpin + Send,
     {
-        let mut body_buf = self.body_buf.as_deref_mut().unwrap();
+        // we only need to read rewind data once
         let mut n = self.rewind_buf_len;
-        self.rewind_buf_len = 0; // we only need to read rewind data once
+        self.rewind_buf_len = 0;
+
+        // downstream should not discard remaining data if peer sent more, so cap the read at what
+        // is left of this body and leave anything past it on the stream
+        let read_size = match self.body_state {
+            PS::Partial(_, remaining) if !self.upstream => remaining.min(self.body_buf_size),
+            _ => self.body_buf_size,
+        };
         if n == 0 {
-            // downstream should not discard remaining data if peer sent more.
-            if !self.upstream {
-                if let PS::Partial(_, to_read) = self.body_state {
-                    if to_read < body_buf.len() {
-                        body_buf = &mut body_buf[..to_read];
-                    }
-                }
-            }
             /* Need to actually read */
+            let body_buf = self.prepare_buf_for_io(read_size);
             n = stream
-                .read(body_buf)
+                .take(read_size as u64)
+                .read_buf(body_buf)
                 .await
                 .or_err(ReadError, "when reading body")?;
         }
@@ -316,11 +430,17 @@ impl BodyReader {
                     ))
                 } else if n >= to_read {
                     if n > to_read {
-                        warn!(
-                            "Peer sent more data then expected: extra {}\
-                               bytes, discarding them",
-                            n - to_read
-                        )
+                        let extra = n - to_read;
+                        // The extra bytes are not dropped here: finish_body_buf() moves them to
+                        // the overread buffer. Downstream they are the start of a pipelined
+                        // request and get handed to the next session, which is ordinary traffic
+                        // and must not warn on every request. Whether they are actually usable
+                        // is decided by the caller, which logs when it has to drop them.
+                        if self.upstream {
+                            warn!("Peer sent more data than expected: extra {extra} bytes");
+                        } else {
+                            debug!("Peer sent {extra} bytes past the end of the request body");
+                        }
                     }
                     self.body_state = PS::Complete(read + to_read);
                     self.finish_body_buf(to_read, n);
@@ -338,13 +458,15 @@ impl BodyReader {
     where
         S: AsyncRead + Unpin + Send,
     {
-        let body_buf = self.body_buf.as_deref_mut().unwrap();
         let mut n = self.rewind_buf_len;
         self.rewind_buf_len = 0; // we only need to read rewind data once
         if n == 0 {
             /* Need to actually read */
+            let read_size = self.body_buf_size;
+            let body_buf = self.prepare_buf_for_io(read_size);
             n = stream
-                .read(body_buf)
+                .take(read_size as u64)
+                .read_buf(body_buf)
                 .await
                 .or_err(ReadError, "when reading body")?;
         }
@@ -374,14 +496,15 @@ impl BodyReader {
                 mut expecting_from_io,
             ) => {
                 if existing_buf_start == 0 {
-                    // read a new buf from IO
-                    let body_buf = self.body_buf.as_deref_mut().unwrap();
                     if existing_buf_end == 0 {
                         existing_buf_end = self.rewind_buf_len;
                         self.rewind_buf_len = 0; // we only need to read rewind data once
                         if existing_buf_end == 0 {
+                            let read_size = self.body_buf_size;
+                            let body_buf = self.prepare_buf_for_io(read_size);
                             existing_buf_end = stream
-                                .read(body_buf)
+                                .take(read_size as u64)
+                                .read_buf(body_buf)
                                 .await
                                 .or_err(ReadError, "when reading body")?;
                         }
@@ -390,11 +513,31 @@ impl BodyReader {
                         /* copy the #expecting_from_io bytes until index existing_buf_end
                          * to the front and read more to form a valid chunk head.
                          * existing_buf_end is the end of the partial head and
-                         * expecting_from_io is the len of it */
-                        body_buf
-                            .copy_within(existing_buf_end - expecting_from_io..existing_buf_end, 0);
+                         * expecting_from_io is the len of it.
+                         * Unlike the pipeline handoff this compacts in place rather than
+                         * split_off()-ing at the head. The head is capped at
+                         * PARTIAL_CHUNK_HEAD_LIMIT and is normally a few bytes, so the move is
+                         * bounded and cheap, while split_off() would leave only
+                         * capacity - partial_head_start of room behind it and force the reserve
+                         * below to move the same bytes anyway (or reallocate) to fit the read. */
+                        self.reserve_buf_for_io();
+                        let body_buf = self
+                            .body_buf
+                            .as_mut()
+                            .expect("body buf exists once a partial chunk head was buffered");
+                        let partial_head_start = existing_buf_end - expecting_from_io;
+                        if partial_head_start != 0 {
+                            body_buf.copy_within(partial_head_start..existing_buf_end, 0);
+                        }
+                        body_buf.truncate(expecting_from_io);
+                        // Commit the compacted offsets before awaiting so cancellation leaves the
+                        // parser and buffer in a state that the next call can safely resume.
+                        self.body_state = self
+                            .body_state
+                            .partial_chunk_head(expecting_from_io, expecting_from_io);
                         let new_bytes = stream
-                            .read(&mut body_buf[expecting_from_io..])
+                            .take((self.body_buf_size - expecting_from_io) as u64)
+                            .read_buf(body_buf)
                             .await
                             .or_err(ReadError, "when reading body")?;
                         if new_bytes == 0 {
@@ -491,14 +634,20 @@ impl BodyReader {
                     if buf_res.is_some() {
                         if let Some(idx) = last_chunk_size_end {
                             // just read the last 0 + CRLF, but not final end CRLF
-                            // copy the rest of the buffer to the start of the body_buf
-                            // so we can parse the remaining bytes as trailers / end
-                            let body_buf = self.body_buf.as_deref_mut().unwrap();
+                            // Split the rest of the buffer to the start in O(1) so trailers and
+                            // any following pipelined request remain in the same allocation.
+                            // `do_read_chunked_body_final` must not reset this buffer, see the
+                            // `existing_buf_end` handling there.
+                            let mut body_buf = self
+                                .body_buf
+                                .take()
+                                .expect("body buf exists once a chunk was parsed out of it");
                             trace!(
                                 "last chunk size end buf {:?}",
-                                &body_buf[..existing_buf_end].escape_ascii(),
+                                body_buf[..existing_buf_end].escape_ascii(),
                             );
-                            body_buf.copy_within(idx..existing_buf_end, 0);
+                            body_buf.truncate(existing_buf_end);
+                            self.body_buf = Some(body_buf.split_off(idx));
                         }
                     }
                     Ok(buf_res)
@@ -522,18 +671,32 @@ impl BodyReader {
             Ok(status) => {
                 match status {
                     httparse::Status::Complete((payload_index, chunk_size)) => {
-                        // TODO: Check chunk_size overflow
                         trace!(
                             "Got size {chunk_size}, payload_index: {payload_index}, chunk: {:?}",
                             String::from_utf8_lossy(buf).escape_default(),
                         );
-                        let chunk_size = chunk_size as usize;
+                        let chunk_size = match usize::try_from(chunk_size) {
+                            Ok(chunk_size) => chunk_size,
+                            Err(_) => {
+                                self.body_state = self.body_state.done(0);
+                                return Error::e_explain(
+                                    INVALID_CHUNK,
+                                    "chunk size overflows usize",
+                                );
+                            }
+                        };
                         // https://github.com/seanmonstar/httparse/issues/149
                         // httparse does not treat zero-size chunk differently, it does not check
                         // that terminating chunk is 0 + double CRLF
                         if chunk_size == 0 {
                             /* terminating chunk, also need to handle trailer. */
-                            let chunk_end_index = payload_index + 2;
+                            let Some(chunk_end_index) = payload_index.checked_add(2) else {
+                                self.body_state = self.body_state.done(0);
+                                return Error::e_explain(
+                                    INVALID_CHUNK,
+                                    "chunk terminator overflows buffer index",
+                                );
+                            };
                             return if chunk_end_index <= buf.len()
                                 && buf[payload_index..chunk_end_index] == CRLF[..]
                             {
@@ -560,8 +723,20 @@ impl BodyReader {
                             };
                         }
                         // chunk-size CRLF [payload_index] byte*[chunk_size] CRLF
-                        let data_end_index = payload_index + chunk_size;
-                        let chunk_end_index = data_end_index + 2;
+                        let Some(data_end_index) = payload_index.checked_add(chunk_size) else {
+                            self.body_state = self.body_state.done(0);
+                            return Error::e_explain(
+                                INVALID_CHUNK,
+                                "chunk size overflows buffer index",
+                            );
+                        };
+                        let Some(chunk_end_index) = data_end_index.checked_add(2) else {
+                            self.body_state = self.body_state.done(0);
+                            return Error::e_explain(
+                                INVALID_CHUNK,
+                                "chunk terminator overflows buffer index",
+                            );
+                        };
                         if chunk_end_index >= buf.len() {
                             // no multi chunk in this buf
                             let actual_size = if data_end_index > buf.len() {
@@ -642,21 +817,25 @@ impl BodyReader {
         // Really we are just waiting for a consecutive CRLF + CRLF to end the body.
         match self.body_state {
             PS::ChunkedFinal(read, trailers_read, existing_buf_end, end_read) => {
-                let body_buf = self.body_buf.as_deref_mut().unwrap();
-                let (buf, n) = if existing_buf_end != 0 {
-                    // finish rest of buf that was read with Chunked state
-                    // existing_buf_end is non-zero only once
+                let n = if existing_buf_end != 0 {
+                    // Finish the rest of the buf that was read while in the Chunked state.
+                    // `do_read_chunked_body` split that tail to the front of `body_buf`, so it
+                    // must be parsed in place: resetting the buffer here would discard both the
+                    // trailers and any pipelined request bytes sitting behind them.
+                    // existing_buf_end is non-zero only once.
                     self.body_state = PS::ChunkedFinal(read, trailers_read, 0, end_read);
-                    (&body_buf[..existing_buf_end], existing_buf_end)
+                    existing_buf_end
                 } else {
-                    let n = stream
-                        .read(body_buf)
+                    // Every previously buffered byte has already been parsed by the loop below
+                    // (it only exits once `start` reaches `n`), so the buffer can be reset.
+                    let read_size = self.body_buf_size;
+                    let body_buf = self.prepare_buf_for_io(read_size);
+                    stream
+                        .take(read_size as u64)
+                        .read_buf(body_buf)
                         .await
-                        .or_err(ReadError, "when reading trailers end")?;
-
-                    (&body_buf[..n], n)
+                        .or_err(ReadError, "when reading trailers end")?
                 };
-
                 if n == 0 {
                     self.body_state = PS::Done(read);
                     return Error::e_explain(
@@ -667,6 +846,12 @@ impl BodyReader {
                         ),
                     );
                 }
+
+                // Re-borrow just the buffer field so `self.body_state` stays assignable below.
+                let buf = &self
+                    .body_buf
+                    .as_deref()
+                    .expect("body buf is initialized before reading trailers")[..n];
 
                 let mut start = 0;
                 // try to find end within the current IO buffer
@@ -905,14 +1090,201 @@ pub enum BodyMode {
 
 type BM = BodyMode;
 
+// ============================================================================
+// Cancel-safe body writing types
+// ============================================================================
+
+impl BodyMode {
+    /// Extract `(total, written)` from `ContentLength`, panicking on mismatch.
+    fn expect_content_length(&self) -> (usize, usize) {
+        match self {
+            BodyMode::ContentLength(total, written) => (*total, *written),
+            _ => panic!("wrong body mode: expected ContentLength, got {:?}", self),
+        }
+    }
+
+    /// Extract `written` from `ChunkedEncoding`, panicking on mismatch.
+    fn expect_chunked(&self) -> usize {
+        match self {
+            BodyMode::ChunkedEncoding(written) => *written,
+            _ => panic!("wrong body mode: expected ChunkedEncoding, got {:?}", self),
+        }
+    }
+
+    /// Extract `written` from `UntilClose`, panicking on mismatch.
+    fn expect_until_close(&self) -> usize {
+        match self {
+            BodyMode::UntilClose(written) => *written,
+            _ => panic!("wrong body mode: expected UntilClose, got {:?}", self),
+        }
+    }
+}
+
+/// Type alias for the chunked encoding buffer chain
+type ChunkedBuf = bytes::buf::Chain<bytes::buf::Chain<Bytes, Bytes>, &'static [u8]>;
+
+enum WriteBuf<C = ChunkedBuf> {
+    /// Simple bytes buffer
+    Simple(Bytes),
+    /// Chained buffer for chunked encoding or other complex writes
+    Chained(C),
+}
+
+// Implement Buf for WriteBuf to delegate to the inner buffer
+impl<C: Buf> Buf for WriteBuf<C> {
+    fn remaining(&self) -> usize {
+        match self {
+            WriteBuf::Simple(b) => b.remaining(),
+            WriteBuf::Chained(c) => c.remaining(),
+        }
+    }
+
+    fn chunk(&self) -> &[u8] {
+        match self {
+            WriteBuf::Simple(b) => b.chunk(),
+            WriteBuf::Chained(c) => c.chunk(),
+        }
+    }
+
+    fn advance(&mut self, cnt: usize) {
+        match self {
+            WriteBuf::Simple(b) => b.advance(cnt),
+            WriteBuf::Chained(c) => c.advance(cnt),
+        }
+    }
+
+    // Forward to the inner buffer so callers (e.g. tokio's `write_all_buf`)
+    // see every constituent slice. The default [`Buf::chunks_vectored`]
+    // impl only populates one slot, which collapses a multi-piece chained
+    // buffer (such as a chunked-encoding frame's size + payload + CRLF)
+    // into a single-slice vectored write — issuing one syscall per inner
+    // piece instead of one `writev` covering the whole frame.
+    fn chunks_vectored<'a>(&'a self, dst: &mut [std::io::IoSlice<'a>]) -> usize {
+        match self {
+            WriteBuf::Simple(b) => b.chunks_vectored(dst),
+            WriteBuf::Chained(c) => c.chunks_vectored(dst),
+        }
+    }
+}
+
+enum WriteState {
+    /// No write in progress
+    Idle,
+    /// Writing data (original size, bytes remaining to write)
+    Writing(usize, WriteBuf<ChunkedBuf>),
+    /// Flushing after write (original size to return)
+    Flushing(usize),
+    /// Write complete (bytes written in this task)
+    Done(usize),
+    /// Write timed out - cannot be reused
+    TimedOut,
+}
+
+// Custom Debug implementation since we can't derive it with futures
+impl std::fmt::Debug for WriteState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteState::Idle => write!(f, "Idle"),
+            WriteState::Writing(size, _buf) => {
+                write!(f, "Writing(size: {})", size)
+            }
+            WriteState::Flushing(size) => write!(f, "Flushing(size: {})", size),
+            WriteState::Done(size) => write!(f, "Done(size: {})", size),
+            WriteState::TimedOut => write!(f, "TimedOut"),
+        }
+    }
+}
+
+enum FinishWriteState {
+    /// No finish task queued
+    NotStarted,
+    /// Finish queued but not started yet
+    Idle,
+    /// Writing last chunk marker (for chunked encoding)
+    WritingLastChunk(WriteBuf),
+    /// Flushing after writing last chunk
+    Flushing,
+    /// Finish complete
+    Done,
+}
+
+// Custom Debug implementation since WriteBuf doesn't implement Debug
+impl std::fmt::Debug for FinishWriteState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FinishWriteState::NotStarted => write!(f, "NotStarted"),
+            FinishWriteState::Idle => write!(f, "Idle"),
+            FinishWriteState::WritingLastChunk(_) => write!(f, "WritingLastChunk"),
+            FinishWriteState::Flushing => write!(f, "Flushing"),
+            FinishWriteState::Done => write!(f, "Done"),
+        }
+    }
+}
+
+/// Internal state for the cancel-safe body write state machine.
+///
+/// Tracks the pending body bytes, write progress
+/// (idle → writing → flushing → done), and an optional timeout.
+struct SendBodyState {
+    /// Application bytes queued to be written
+    pending_bytes: Option<Bytes>,
+    /// Current write state for cancel-safe operations
+    write_state: WriteState,
+    /// Timeout duration for this write task
+    timeout_duration: Option<std::time::Duration>,
+    /// Timeout future (only created if write returns Pending)
+    timeout_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for SendBodyState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendBodyState")
+            .field("pending_bytes", &self.pending_bytes)
+            .field("write_state", &self.write_state)
+            .field("timeout_duration", &self.timeout_duration)
+            .field(
+                "timeout_fut",
+                &self.timeout_fut.as_ref().map(|_| "Some(Future)"),
+            )
+            .finish()
+    }
+}
+
+impl SendBodyState {
+    fn new() -> Self {
+        SendBodyState {
+            pending_bytes: None,
+            write_state: WriteState::Idle,
+            timeout_duration: None,
+            timeout_fut: None,
+        }
+    }
+}
+
+/// Tracks how response body bytes are framed and written to the wire.
+///
+/// Supports both a legacy async API (`write_body` / `finish`) and a cancel-safe
+/// task API that can be driven inside a `tokio::select!` loop without losing
+/// write progress.
 pub struct BodyWriter {
     pub body_mode: BodyMode,
+    // Boxed to reduce inline size. Only used by the cancel-safe proxy task API.
+    send_body_state: Box<SendBodyState>,
+    send_finish_state: FinishWriteState,
+}
+
+impl Default for BodyWriter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BodyWriter {
     pub fn new() -> Self {
         BodyWriter {
             body_mode: BM::ToSelect,
+            send_body_state: Box::new(SendBodyState::new()),
+            send_finish_state: FinishWriteState::NotStarted,
         }
     }
 
@@ -1019,7 +1391,7 @@ impl BodyWriter {
                 let chuck_size_buf = format!("{:X}\r\n", chunk_size);
                 let mut output_buf = Bytes::from(chuck_size_buf).chain(buf).chain(&b"\r\n"[..]);
                 stream
-                    .write_vec_all(&mut output_buf)
+                    .write_all_buf(&mut output_buf)
                     .await
                     .or_err(WriteError, "while writing body")?;
                 stream.flush().await.or_err(WriteError, "flushing body")?;
@@ -1109,6 +1481,549 @@ impl BodyWriter {
             _ => panic!("wrong body mode: {:?}", self.body_mode),
         }
     }
+
+    // ========================================================================
+    // Cancel-safe body task API
+    // ========================================================================
+
+    #[cfg(test)]
+    pub fn has_pending_body_task(&self) -> bool {
+        self.send_body_state.pending_bytes.is_some()
+            || !matches!(
+                self.send_body_state.write_state,
+                WriteState::Idle | WriteState::Done(_) | WriteState::TimedOut
+            )
+    }
+
+    /// Queue application bytes as a body write task with an optional timeout.
+    /// This is a non-async function that just saves the bytes.
+    /// Call `write_current_body_task()` to actually perform the write.
+    ///
+    /// The timeout, if provided, will be enforced internally across all
+    /// write attempts, even if the write is cancelled and resumed via `tokio::select!`.
+    pub fn send_body_task(&mut self, bytes: Bytes, timeout: Option<std::time::Duration>) {
+        assert!(
+            matches!(
+                self.send_body_state.write_state,
+                WriteState::Idle | WriteState::Done(_)
+            ),
+            "send_body_task called while previous task is still in progress: {:?}",
+            self.send_body_state.write_state
+        );
+        self.send_body_state.pending_bytes = Some(bytes);
+        self.send_body_state.write_state = WriteState::Idle;
+        self.send_body_state.timeout_duration = timeout;
+        self.send_body_state.timeout_fut = None;
+    }
+
+    /// Writes the current queued body task to the stream.
+    ///
+    /// ## Cancel-safety
+    ///
+    /// This function can be safely used in a `tokio::select!` loop.
+    /// Returns `Ok(Some(bytes_written))` when complete, `Ok(None)` if no bytes to write.
+    pub async fn write_current_body_task<S>(&mut self, stream: &mut S) -> Result<Option<usize>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        // Use poll_fn to wrap our poll-based implementation
+        std::future::poll_fn(|cx| self.poll_write_current_body_task(cx, Pin::new(stream))).await
+    }
+
+    /// Poll-based implementation for writing body tasks.
+    /// This is the core implementation that maintains state across cancellations.
+    fn poll_write_current_body_task<S>(
+        &mut self,
+        cx: &mut Context<'_>,
+        stream: Pin<&mut S>,
+    ) -> Poll<Result<Option<usize>>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        // Check if already timed out - don't allow reuse
+        if matches!(self.send_body_state.write_state, WriteState::TimedOut) {
+            return Poll::Ready(Error::e_explain(
+                WriteTimedout,
+                "write task previously timed out",
+            ));
+        }
+
+        // Lazy timeout optimization: Poll write first, create timeout only if needed.
+        //
+        // This follows the pattern from `pingora_timeout::Timeout` to avoid allocating
+        // and registering timeout futures when writes complete immediately (the common case).
+        //
+        // Fast path: Write completes → return immediately, no timeout future created
+        // Slow path: Write blocks → lazily create timeout future and poll both
+
+        // First, try the write operation
+        // Dispatch to the appropriate body mode handler
+        let result = match self.body_mode {
+            BM::Complete(_) => Poll::Ready(Ok(None)),
+            BM::ContentLength(_, _) => self.poll_write_content_length_body_task(cx, stream),
+            BM::ChunkedEncoding(_) => self.poll_write_chunked_body_task(cx, stream),
+            BM::UntilClose(_) => self.poll_write_until_close_body_task(cx, stream),
+            BM::ToSelect => Poll::Ready(Ok(None)),
+        };
+
+        // If write completed immediately, return without ever creating/polling timeout
+        if result.is_ready() {
+            return result;
+        }
+
+        // Write returned Pending - lazily create and check timeout if duration is set
+        if let Some(duration) = self.send_body_state.timeout_duration {
+            let timeout = self.send_body_state.timeout_fut.get_or_insert_with(|| {
+                Box::pin(pingora_timeout::sleep(duration))
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + Sync>>
+            });
+
+            if timeout.as_mut().poll(cx).is_ready() {
+                // Timeout fired! Mark state as timed out and clear the timeout future
+                self.send_body_state.write_state = WriteState::TimedOut;
+                self.send_body_state.timeout_fut = None;
+                return Poll::Ready(Error::e_explain(
+                    WriteTimedout,
+                    "writing body task timed out",
+                ));
+            }
+        }
+
+        // Both write and timeout are pending
+        Poll::Pending
+    }
+
+    // ========================================================================
+    // Cancel-safe finish task API
+    // ========================================================================
+
+    #[cfg(test)]
+    pub fn has_pending_finish_task(&self) -> bool {
+        !matches!(
+            self.send_finish_state,
+            FinishWriteState::NotStarted | FinishWriteState::Done
+        )
+    }
+
+    /// Queue a finish operation as a task.
+    /// This is a non-async function that just marks the finish as pending.
+    /// Call `write_current_finish_task()` to actually perform the finish.
+    ///
+    /// This API is stateful and cancel-safe - use it when you need to finish
+    /// the body in a `tokio::select!` loop or other cancellable context.
+    pub fn send_finish_task(&mut self) {
+        self.send_finish_state = FinishWriteState::Idle;
+    }
+
+    /// Async function that performs the current queued finish task on the stream.
+    /// This function is cancel-safe and can be called in a `tokio::select!` loop.
+    /// Returns `Ok(Some(bytes_written))` when complete, `Ok(None)` if already complete.
+    ///
+    /// This API is stateful - it tracks progress across cancellations and can be
+    /// safely resumed after being dropped mid-execution.
+    pub async fn write_current_finish_task<S>(&mut self, stream: &mut S) -> Result<Option<usize>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        // Use poll_fn to wrap our poll-based implementation
+        std::future::poll_fn(|cx| self.poll_write_current_finish_task(cx, Pin::new(stream))).await
+    }
+
+    /// Poll-based implementation for finish tasks.
+    /// This is the core implementation that maintains state across cancellations.
+    fn poll_write_current_finish_task<S>(
+        &mut self,
+        cx: &mut Context<'_>,
+        stream: Pin<&mut S>,
+    ) -> Poll<Result<Option<usize>>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        // If no finish queued, return None
+        if matches!(
+            self.send_finish_state,
+            FinishWriteState::NotStarted | FinishWriteState::Done
+        ) {
+            return Poll::Ready(Ok(None));
+        }
+
+        // Route to body-mode-specific implementation
+        match self.body_mode {
+            BM::Complete(_) => Poll::Ready(Ok(None)),
+            BM::ContentLength(_, _) => self.poll_finish_content_length_task(cx, stream),
+            BM::ChunkedEncoding(_) => self.poll_finish_chunked_task(cx, stream),
+            BM::UntilClose(_) => self.poll_finish_until_close_task(cx, stream),
+            BM::ToSelect => Poll::Ready(Ok(None)),
+        }
+    }
+
+    /// Finish content-length body - just validates and updates state.
+    /// No I/O needed since body write tasks already flushed after the last write.
+    fn poll_finish_content_length_task<S>(
+        &mut self,
+        _cx: &mut Context<'_>,
+        _stream: Pin<&mut S>,
+    ) -> Poll<Result<Option<usize>>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        let written = match self.body_mode {
+            BM::ContentLength(total, w) => {
+                if w < total {
+                    self.send_finish_state = FinishWriteState::Done;
+                    return Poll::Ready(Error::e_explain(
+                        PREMATURE_BODY_END,
+                        format!("Content-length: {total} bytes written: {w}"),
+                    ));
+                }
+                w
+            }
+            _ => panic!("wrong body mode: {:?}", self.body_mode),
+        };
+
+        // All bytes written - just update state to Complete
+        self.body_mode = BM::Complete(written);
+        self.send_finish_state = FinishWriteState::Done;
+        Poll::Ready(Ok(Some(written)))
+    }
+
+    /// Poll-based helper to finish chunked encoding body
+    fn poll_finish_chunked_task<S>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut stream: Pin<&mut S>,
+    ) -> Poll<Result<Option<usize>>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        let written = match self.body_mode {
+            BM::ChunkedEncoding(w) => w,
+            _ => panic!("wrong body mode: {:?}", self.body_mode),
+        };
+
+        loop {
+            match &mut self.send_finish_state {
+                FinishWriteState::Idle => {
+                    // Start writing last chunk marker "0\r\n\r\n"
+                    let buf = WriteBuf::Simple(Bytes::from_static(&LAST_CHUNK[..]));
+                    self.send_finish_state = FinishWriteState::WritingLastChunk(buf);
+                }
+                FinishWriteState::WritingLastChunk(buf) => {
+                    // Re-create tokio's stateless `write_all_buf` future per
+                    // poll; progress is carried by `buf`.
+                    ready!(pin!(stream.as_mut().get_mut().write_all_buf(buf)).poll(cx))
+                        .map_err(|e| Error::because(WriteError, "while writing last chunk", e))?;
+
+                    // All bytes written, move to flushing state
+                    self.send_finish_state = FinishWriteState::Flushing;
+                }
+                FinishWriteState::Flushing => {
+                    // Poll flush
+                    ready!(stream.as_mut().poll_flush(cx))
+                        .map_err(|e| Error::because(WriteError, "flushing after last chunk", e))?;
+
+                    // Flush complete! Update body_mode and mark done
+                    self.body_mode = BM::Complete(written);
+                    self.send_finish_state = FinishWriteState::Done;
+                    return Poll::Ready(Ok(Some(written)));
+                }
+                FinishWriteState::Done => {
+                    unreachable!(
+                        "Done state should have been handled in poll_write_current_finish_task"
+                    )
+                }
+                FinishWriteState::NotStarted => {
+                    unreachable!("NotStarted state should have been handled in poll_write_current_finish_task")
+                }
+            }
+        }
+    }
+
+    /// Finish until-close body - just updates state.
+    /// No I/O needed since body write tasks already flushed after each write.
+    fn poll_finish_until_close_task<S>(
+        &mut self,
+        _cx: &mut Context<'_>,
+        _stream: Pin<&mut S>,
+    ) -> Poll<Result<Option<usize>>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        let written = match self.body_mode {
+            BM::UntilClose(w) => w,
+            _ => panic!("wrong body mode: {:?}", self.body_mode),
+        };
+
+        // Just update state to Complete
+        self.body_mode = BM::Complete(written);
+        self.send_finish_state = FinishWriteState::Done;
+        Poll::Ready(Ok(Some(written)))
+    }
+
+    // ========================================================================
+    // Internal helpers
+    // ========================================================================
+
+    /// Internal helper to poll a body task that writes in content-length mode
+    /// and flushes at end.
+    fn poll_write_content_length_body_task<S>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut stream: Pin<&mut S>,
+    ) -> Poll<Result<Option<usize>>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        // Move to Writing state if we're Idle
+        if matches!(self.send_body_state.write_state, WriteState::Idle) {
+            if let Some(mut bytes) = self.send_body_state.pending_bytes.take() {
+                let (total, written) = self.body_mode.expect_content_length();
+
+                // Check if we've already written everything
+                if written >= total {
+                    self.send_body_state.write_state = WriteState::Done(0);
+                    return Poll::Ready(Ok(None));
+                }
+
+                let original_size = bytes.len();
+                let remaining = total - written;
+
+                // Truncate bytes if they exceed content-length
+                if original_size > remaining {
+                    warn!(
+                        "Trying to write {} bytes over content-length: {}, truncating to {}",
+                        original_size, total, remaining
+                    );
+                    bytes.truncate(remaining);
+                }
+
+                let bytes_to_write = bytes.len();
+                self.send_body_state.write_state =
+                    WriteState::Writing(bytes_to_write, WriteBuf::Simple(bytes));
+            } else {
+                self.send_body_state.write_state = WriteState::Done(0);
+                return Poll::Ready(Ok(None));
+            }
+        }
+
+        // Handle Writing state - do the write, transition to Flushing or Done
+        if let WriteState::Writing(size, ref mut buf) = &mut self.send_body_state.write_state {
+            let bytes_written = *size;
+
+            // Attempt write. Re-create tokio's stateless `write_all_buf`
+            // future per poll; progress is carried by `buf`.
+            match ready!(pin!(stream.as_mut().get_mut().write_all_buf(buf)).poll(cx)) {
+                Ok(()) => {
+                    // Write completed - update body_mode to track bytes written
+                    let (total, written) = self.body_mode.expect_content_length();
+                    self.body_mode = BM::ContentLength(total, written + bytes_written);
+
+                    if written + bytes_written >= total {
+                        // All content-length bytes written, flush needed
+                        self.send_body_state.write_state = WriteState::Flushing(bytes_written);
+                    } else {
+                        // More bytes to come, no flush needed
+                        self.send_body_state.write_state = WriteState::Done(bytes_written);
+                    }
+                }
+                Err(e) => {
+                    return Poll::Ready(Error::e_because(WriteError, "while writing body", e))
+                }
+            }
+        }
+
+        // Handle Flushing state - do the flush, transition to Done
+        if let WriteState::Flushing(size) = self.send_body_state.write_state {
+            let bytes_written = size;
+
+            // Attempt flush
+            match ready!(stream.poll_flush(cx)) {
+                Ok(()) => {
+                    // Flush completed - transition to Done
+                    self.send_body_state.write_state = WriteState::Done(bytes_written);
+                }
+                Err(e) => return Poll::Ready(Error::e_because(WriteError, "flushing body", e)),
+            }
+        }
+
+        // Return based on final state
+        match self.send_body_state.write_state {
+            WriteState::Done(size) => {
+                self.send_body_state.timeout_fut = None;
+                Poll::Ready(Ok(Some(size)))
+            }
+            WriteState::TimedOut => Poll::Ready(Error::e_explain(
+                WriteTimedout,
+                "write task previously timed out",
+            )),
+            WriteState::Writing(..) | WriteState::Flushing(..) => {
+                unreachable!("Writing/Flushing states should have been handled above or returned Pending via ready!")
+            }
+            WriteState::Idle => {
+                unreachable!("Idle state should have been handled in setup")
+            }
+        }
+    }
+
+    /// Poll-based implementation for chunked encoding mode
+    fn poll_write_chunked_body_task<S>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut stream: Pin<&mut S>,
+    ) -> Poll<Result<Option<usize>>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        // Move to Writing state if we're Idle
+        if matches!(self.send_body_state.write_state, WriteState::Idle) {
+            if let Some(bytes) = self.send_body_state.pending_bytes.take() {
+                let application_bytes_size = bytes.len();
+
+                // Format the chunk: size\r\ndata\r\n
+                let chunk_size_header = format!("{:X}\r\n", application_bytes_size);
+                let output_buf = Bytes::from(chunk_size_header)
+                    .chain(bytes)
+                    .chain(&b"\r\n"[..]);
+
+                // Store the chained buffer directly to avoid copying
+                self.send_body_state.write_state =
+                    WriteState::Writing(application_bytes_size, WriteBuf::Chained(output_buf));
+            } else {
+                self.send_body_state.write_state = WriteState::Done(0);
+                return Poll::Ready(Ok(None));
+            }
+        }
+
+        // Handle Writing state - do the write using vectored I/O, transition to Flushing
+        if let WriteState::Writing(size, ref mut buf) = &mut self.send_body_state.write_state {
+            let bytes_written = *size;
+
+            // Attempt vectored write for chained buffer (chunk size + data + CRLF).
+            // Re-create tokio's stateless `write_all_buf` future per poll; it
+            // opportunistically uses vectored writes when the stream supports
+            // them. Progress is carried by `buf`.
+            match ready!(pin!(stream.as_mut().get_mut().write_all_buf(buf)).poll(cx)) {
+                Ok(()) => {
+                    // Write completed - update body_mode with application bytes (not wire bytes)
+                    let written = self.body_mode.expect_chunked();
+                    self.body_mode = BM::ChunkedEncoding(written + bytes_written);
+
+                    // Chunked encoding always flushes
+                    self.send_body_state.write_state = WriteState::Flushing(bytes_written);
+                }
+                Err(e) => {
+                    return Poll::Ready(Error::e_because(WriteError, "while writing body", e))
+                }
+            }
+        }
+
+        // Handle Flushing state - do the flush, transition to Done
+        if let WriteState::Flushing(size) = self.send_body_state.write_state {
+            let bytes_written = size;
+
+            // Attempt flush
+            match ready!(stream.poll_flush(cx)) {
+                Ok(()) => {
+                    // Flush completed - transition to Done
+                    self.send_body_state.write_state = WriteState::Done(bytes_written);
+                }
+                Err(e) => return Poll::Ready(Error::e_because(WriteError, "flushing body", e)),
+            }
+        }
+
+        // Return based on final state
+        match self.send_body_state.write_state {
+            WriteState::Done(size) => {
+                self.send_body_state.timeout_fut = None;
+                Poll::Ready(Ok(Some(size)))
+            }
+            WriteState::TimedOut => Poll::Ready(Error::e_explain(
+                WriteTimedout,
+                "write task previously timed out",
+            )),
+            WriteState::Writing(..) | WriteState::Flushing(..) => {
+                unreachable!("Writing/Flushing states should have been handled above or returned Pending via ready!")
+            }
+            WriteState::Idle => {
+                unreachable!("Idle state should have been handled in setup")
+            }
+        }
+    }
+
+    /// Poll-based implementation for UntilClose (close-delimited) body mode
+    fn poll_write_until_close_body_task<S>(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut stream: Pin<&mut S>,
+    ) -> Poll<Result<Option<usize>>>
+    where
+        S: AsyncWrite + Unpin + Send,
+    {
+        // Move to Writing state if we're Idle
+        if matches!(self.send_body_state.write_state, WriteState::Idle) {
+            if let Some(bytes) = self.send_body_state.pending_bytes.take() {
+                let original_size = bytes.len();
+                self.send_body_state.write_state =
+                    WriteState::Writing(original_size, WriteBuf::Simple(bytes));
+            } else {
+                self.send_body_state.write_state = WriteState::Done(0);
+                return Poll::Ready(Ok(None));
+            }
+        }
+
+        // Handle Writing state - do the write, transition to Flushing
+        if let WriteState::Writing(size, ref mut buf) = &mut self.send_body_state.write_state {
+            let bytes_written = *size;
+
+            // Attempt write. Re-create tokio's stateless `write_all_buf`
+            // future per poll; progress is carried by `buf`.
+            match ready!(pin!(stream.as_mut().get_mut().write_all_buf(buf)).poll(cx)) {
+                Ok(()) => {
+                    // Write completed - update body_mode to track bytes written
+                    let written = self.body_mode.expect_until_close();
+                    self.body_mode = BM::UntilClose(written + bytes_written);
+
+                    // Close-delimited mode always flushes
+                    self.send_body_state.write_state = WriteState::Flushing(bytes_written);
+                }
+                Err(e) => {
+                    return Poll::Ready(Error::e_because(WriteError, "while writing body", e))
+                }
+            }
+        }
+
+        // Handle Flushing state - do the flush, transition to Done
+        if let WriteState::Flushing(size) = self.send_body_state.write_state {
+            let bytes_written = size;
+
+            // Attempt flush
+            match ready!(stream.poll_flush(cx)) {
+                Ok(()) => {
+                    // Flush completed - transition to Done
+                    self.send_body_state.write_state = WriteState::Done(bytes_written);
+                }
+                Err(e) => return Poll::Ready(Error::e_because(WriteError, "flushing body", e)),
+            }
+        }
+
+        // Return based on final state
+        match self.send_body_state.write_state {
+            WriteState::Done(size) => {
+                self.send_body_state.timeout_fut = None;
+                Poll::Ready(Ok(Some(size)))
+            }
+            WriteState::TimedOut => Poll::Ready(Error::e_explain(
+                WriteTimedout,
+                "write task previously timed out",
+            )),
+            WriteState::Writing(..) | WriteState::Flushing(..) => {
+                unreachable!("Writing/Flushing states should have been handled above or returned Pending via ready!")
+            }
+            WriteState::Idle => {
+                unreachable!("Idle state should have been handled in setup")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1118,6 +2033,32 @@ mod tests {
 
     fn init_log() {
         let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    #[test]
+    fn content_length_zero_owned_rewind_becomes_overread_without_copying() {
+        let rewind = BytesMut::from(&b"next request"[..]);
+        let rewind_ptr = rewind.as_ptr();
+        let mut body_reader = BodyReader::new(false);
+
+        body_reader.init_content_length_owned(0, rewind);
+
+        let overread = body_reader.take_body_overread().unwrap();
+        assert_eq!(overread.as_ptr(), rewind_ptr);
+        assert_eq!(overread.as_ref(), b"next request");
+    }
+
+    #[tokio::test]
+    async fn partial_owned_body_allocates_only_remaining_content_length() {
+        let mut mock_io = Builder::new().read(b"bc").build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_content_length_owned(3, BytesMut::from(&b"a"[..]));
+
+        let first = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(body_reader.get_body(&first), b"a");
+        let second = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+        assert_eq!(body_reader.get_body(&second), b"bc");
+        assert!(body_reader.body_buf.as_ref().unwrap().capacity() < BODY_BUFFER_SIZE);
     }
 
     #[tokio::test]
@@ -1284,6 +2225,32 @@ mod tests {
         assert_eq!(res, None);
         assert_eq!(body_reader.body_state, ParseState::Complete(0));
         assert_eq!(body_reader.get_body_overread(), None);
+    }
+
+    #[tokio::test]
+    async fn read_with_body_overflowing_chunk_size() {
+        init_log();
+        let input = b"FFFFFFFFFFFFFFFE\r\nAAAA\r\n0\r\n\r\n";
+        let mut mock_io = Builder::new().read(&input[..]).build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_chunked(b"");
+
+        let err = body_reader.read_body(&mut mock_io).await.unwrap_err();
+        assert_eq!(*err.etype(), INVALID_CHUNK);
+        assert_eq!(body_reader.body_state, ParseState::Done(0));
+    }
+
+    #[tokio::test]
+    async fn read_with_body_max_chunk_size() {
+        init_log();
+        let input = b"FFFFFFFFFFFFFFFF\r\nAAAA\r\n0\r\n\r\n";
+        let mut mock_io = Builder::new().read(&input[..]).build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_chunked(b"");
+
+        let err = body_reader.read_body(&mut mock_io).await.unwrap_err();
+        assert_eq!(*err.etype(), INVALID_CHUNK);
+        assert_eq!(body_reader.body_state, ParseState::Done(0));
     }
 
     #[tokio::test]
@@ -1717,14 +2684,46 @@ mod tests {
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, BufRef::new(0, 0));
         assert_eq!(body_reader.body_state, ParseState::Chunked(0, 0, 2, 2));
+        let _res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_chunk_head_read_resumes_after_cancellation() {
+        init_log();
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(100))
+            .read(b"\na\r\n0\r\n\r\n")
+            .build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.body_state = ParseState::Chunked(0, 0, 8, 2);
+        body_reader.body_buf = Some(BytesMut::from(&b"unused1\r"[..]));
+
+        tokio::select! {
+            result = body_reader.read_body(&mut mock_io) => {
+                panic!("body read unexpectedly completed before cancellation: {result:?}");
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+
+        assert_eq!(body_reader.body_state, ParseState::Chunked(0, 0, 2, 2));
+        assert_eq!(body_reader.body_buf.as_deref().unwrap(), b"1\r");
+
+        body_reader.read_body(&mut mock_io).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_with_body_partial_head_chunk_incomplete() {
+        init_log();
+        let input1 = b"1\r";
+        let mut mock_io = Builder::new().read(&input1[..]).build();
+        let mut body_reader = BodyReader::new(false);
+        body_reader.init_chunked(b"");
         let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(3, 1)); // input1 concat input2
-        assert_eq!(&input2[1..2], body_reader.get_body(&res));
-        assert_eq!(body_reader.body_state, ParseState::Chunked(1, 6, 11, 0));
-        let res = body_reader.read_body(&mut mock_io).await.unwrap();
-        assert_eq!(res, None);
-        assert_eq!(body_reader.body_state, ParseState::Complete(1));
-        assert_eq!(body_reader.get_body_overread(), None);
+        assert_eq!(res, BufRef::new(0, 0));
+        assert_eq!(body_reader.body_state, ParseState::Chunked(0, 0, 2, 2));
+        let res = body_reader.read_body(&mut mock_io).await;
+        assert!(res.is_err());
+        assert_eq!(body_reader.body_state, ParseState::Done(0));
     }
 
     #[tokio::test]
@@ -1923,21 +2922,6 @@ mod tests {
         assert_eq!(res, None);
         assert_eq!(body_reader.body_state, ParseState::Complete(3));
         assert_eq!(body_reader.get_body_overread(), Some(&b"abc"[..]));
-    }
-
-    #[tokio::test]
-    async fn read_with_body_partial_head_chunk_incomplete() {
-        init_log();
-        let input1 = b"1\r";
-        let mut mock_io = Builder::new().read(&input1[..]).build();
-        let mut body_reader = BodyReader::new(false);
-        body_reader.init_chunked(b"");
-        let res = body_reader.read_body(&mut mock_io).await.unwrap().unwrap();
-        assert_eq!(res, BufRef::new(0, 0));
-        assert_eq!(body_reader.body_state, ParseState::Chunked(0, 0, 2, 2));
-        let res = body_reader.read_body(&mut mock_io).await;
-        assert!(res.is_err());
-        assert_eq!(body_reader.body_state, ParseState::Done(0));
     }
 
     #[tokio::test]
@@ -2319,7 +3303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_body_http10() {
+    async fn write_body_until_close() {
         init_log();
         let data = b"a";
         let mut mock_io = Builder::new().write(&data[..]).write(&data[..]).build();
@@ -2343,5 +3327,1116 @@ mod tests {
         let res = body_writer.finish(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, 2);
         assert_eq!(body_writer.body_mode, BodyMode::Complete(2));
+    }
+}
+
+#[cfg(test)]
+mod test_body_task_api {
+    use super::*;
+    use crate::protocols::http::v1::test_util::FlushTrackingMock;
+    use tokio_test::io::Builder;
+
+    // Cancel-safety tests use tokio::select! to race a short sleep against a mock
+    // I/O wait, simulating cancellation. We use #[tokio::test(start_paused = true)]
+    // on these tests so that tokio auto-advances time deterministically rather than
+    // relying on wall-clock timing.
+
+    fn init_log() {
+        let _ = env_logger::builder().is_test(true).try_init();
+    }
+
+    #[tokio::test]
+    async fn test_has_pending_body_task() {
+        init_log();
+        let data = b"test data";
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data.len());
+
+        // Initially should have no pending task
+        assert!(!body_writer.has_pending_body_task());
+
+        // After queuing bytes, should have pending task
+        body_writer.send_body_task(Bytes::from_static(data), None);
+        assert!(body_writer.has_pending_body_task());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_safe_content_length_write() {
+        init_log();
+        let data = b"Hello, World!";
+
+        // Create a mock stream that will block to allow cancellation
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(100))
+            .write(data)
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data.len());
+
+        // Queue the bytes to write
+        body_writer.send_body_task(Bytes::from_static(data), None);
+
+        // Use tokio::select! loop - keep looping until write completes
+        let mut cancel_count = 0;
+        let mut total_bytes_written = 0;
+
+        loop {
+            // Break if no pending writes
+            if !body_writer.has_pending_body_task() {
+                break;
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    // Timeout fires first, cancelling the write
+                    cancel_count += 1;
+                }
+                result = body_writer.write_current_body_task(&mut mock_io) => {
+                    // Write completed
+                    assert!(result.is_ok(), "Write should succeed");
+                    if let Ok(Some(n)) = result {
+                        total_bytes_written += n;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            cancel_count > 0,
+            "At least one cancellation should have occurred"
+        );
+        assert_eq!(
+            total_bytes_written,
+            data.len(),
+            "Should have written all application bytes"
+        );
+        assert_eq!(
+            body_writer.body_mode,
+            BodyMode::ContentLength(data.len(), data.len())
+        );
+
+        // Now test finish() in a select loop as well
+        let mut mock_io_finish = Builder::new().build();
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                    // Allow cancellation attempts
+                }
+                result = body_writer.finish(&mut mock_io_finish) => {
+                    assert!(result.is_ok());
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(body_writer.body_mode, BodyMode::Complete(data.len()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_safe_chunked_write() {
+        init_log();
+        let data = b"abcdefghij";
+        let expected_output = b"A\r\nabcdefghij\r\n";
+
+        // Mock stream that blocks to allow cancellation
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(100))
+            .write(expected_output)
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_chunked();
+
+        // Queue bytes
+        body_writer.send_body_task(Bytes::from_static(data), None);
+
+        // Use select loop - keep looping until write completes
+        let mut cancel_count = 0;
+        let mut total_bytes_written = 0;
+
+        loop {
+            if !body_writer.has_pending_body_task() {
+                break;
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    cancel_count += 1;
+                }
+                result = body_writer.write_current_body_task(&mut mock_io) => {
+                    assert!(result.is_ok());
+                    if let Ok(Some(n)) = result {
+                        total_bytes_written += n;
+                    }
+                }
+            }
+        }
+
+        assert!(cancel_count > 0, "Should have cancelled at least once");
+        assert_eq!(
+            total_bytes_written,
+            data.len(),
+            "Should have written all application bytes"
+        );
+        assert_eq!(body_writer.body_mode, BodyMode::ChunkedEncoding(data.len()));
+
+        // Test finish() with select loop - must write terminating chunk
+        let mut mock_io_finish = Builder::new()
+            .wait(std::time::Duration::from_millis(50))
+            .write(&LAST_CHUNK[..]) // Expect 0\r\n\r\n
+            .build();
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                result = body_writer.finish(&mut mock_io_finish) => {
+                    assert!(result.is_ok());
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(body_writer.body_mode, BodyMode::Complete(data.len()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_safe_until_close_write() {
+        init_log();
+        let data = b"test data";
+
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(100))
+            .write(data)
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_close_delimited();
+
+        body_writer.send_body_task(Bytes::from_static(data), None);
+
+        // Use select loop - keep looping until write completes
+        let mut cancel_count = 0;
+        let mut total_bytes_written = 0;
+
+        loop {
+            if !body_writer.has_pending_body_task() {
+                break;
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    cancel_count += 1;
+                }
+                result = body_writer.write_current_body_task(&mut mock_io) => {
+                    assert!(result.is_ok());
+                    if let Ok(Some(n)) = result {
+                        total_bytes_written += n;
+                    }
+                }
+            }
+        }
+
+        assert!(cancel_count > 0);
+        assert_eq!(
+            total_bytes_written,
+            data.len(),
+            "Should have written all application bytes"
+        );
+
+        // Test finish() with select loop
+        let mut mock_io_finish = Builder::new().build();
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                result = body_writer.finish(&mut mock_io_finish) => {
+                    assert!(result.is_ok());
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_safe_multiple_cancellations() {
+        init_log();
+        let data = b"Long test data that requires multiple writes";
+
+        // Create a mock that blocks multiple times
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(50))
+            .write(&data[..15])
+            .wait(std::time::Duration::from_millis(50))
+            .write(&data[15..30])
+            .wait(std::time::Duration::from_millis(50))
+            .write(&data[30..])
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data.len());
+        body_writer.send_body_task(Bytes::from_static(data), None);
+
+        // Loop until write completes, allowing cancellations
+        let mut cancel_count = 0;
+        let mut total_bytes_written = 0;
+
+        loop {
+            if !body_writer.has_pending_body_task() {
+                break;
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+                    cancel_count += 1;
+                }
+                result = body_writer.write_current_body_task(&mut mock_io) => {
+                    assert!(result.is_ok());
+                    if let Ok(Some(n)) = result {
+                        total_bytes_written += n;
+                    }
+                }
+            }
+        }
+
+        assert!(cancel_count >= 2, "Should have multiple cancellations");
+        assert_eq!(
+            total_bytes_written,
+            data.len(),
+            "Should have written all application bytes"
+        );
+
+        // Test finish with select loop
+        let mut mock_io_finish = Builder::new().build();
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                result = body_writer.finish(&mut mock_io_finish) => {
+                    assert!(result.is_ok());
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancel_safe_partial_writes() {
+        init_log();
+        let data = b"12345678901234567890"; // 20 bytes
+
+        // Simulate partial writes with blocking
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(50))
+            .write(&data[..7])
+            .wait(std::time::Duration::from_millis(50))
+            .write(&data[7..14])
+            .wait(std::time::Duration::from_millis(50))
+            .write(&data[14..])
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data.len());
+        body_writer.send_body_task(Bytes::from_static(data), None);
+
+        let mut cancel_count = 0;
+        let mut total_bytes_written = 0;
+
+        loop {
+            if !body_writer.has_pending_body_task() {
+                break;
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    cancel_count += 1;
+                }
+                result = body_writer.write_current_body_task(&mut mock_io) => {
+                    assert!(result.is_ok());
+                    if let Ok(Some(n)) = result {
+                        total_bytes_written += n;
+                    }
+                }
+            }
+        }
+
+        assert!(cancel_count > 0);
+        assert_eq!(
+            total_bytes_written,
+            data.len(),
+            "Should have written all application bytes"
+        );
+
+        // Test finish in select loop
+        let mut mock_io_finish = Builder::new()
+            .wait(std::time::Duration::from_millis(30))
+            .build();
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                result = body_writer.finish(&mut mock_io_finish) => {
+                    assert!(result.is_ok(), "Finish should succeed after cancel-safe writes");
+                    break;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_write_timeout() {
+        init_log();
+        let data = b"test data";
+
+        // Create a mock that blocks forever
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_secs(1000))
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data.len());
+
+        // Queue the task with a timeout
+        body_writer.send_body_task(
+            Bytes::from_static(data),
+            Some(std::time::Duration::from_millis(50)),
+        );
+
+        // The write should timeout
+        let result = body_writer.write_current_body_task(&mut mock_io).await;
+        assert!(result.is_err(), "Write should timeout");
+
+        // Check that it's a timeout error
+        if let Err(e) = result {
+            assert_eq!(e.etype(), &WriteTimedout);
+        }
+    }
+
+    // Even if the user's select! cancels the write, the internal timeout
+    // should continue counting across cancellations.
+    #[tokio::test]
+    async fn test_task_timeout_persists_across_cancellations() {
+        init_log();
+        let data = b"test data";
+
+        // Create a mock that blocks for a while
+        // Since timeout is 100ms and this waits 200ms, the write should never happen
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(200))
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data.len());
+
+        // Queue the task with a 100ms timeout
+        body_writer.send_body_task(
+            Bytes::from_static(data),
+            Some(std::time::Duration::from_millis(100)),
+        );
+
+        let mut attempts = 0;
+        let mut timedout = false;
+
+        // Try to write in a loop, but cancel early each time
+        // The timeout should still fire even though we're cancelling
+        loop {
+            if !body_writer.has_pending_body_task() {
+                break;
+            }
+
+            attempts += 1;
+
+            tokio::select! {
+                // Cancel after just 10ms each time
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    // Cancelled by our select, continue looping
+                    continue;
+                }
+                result = body_writer.write_current_body_task(&mut mock_io) => {
+                    match result {
+                        Ok(_) => {
+                            // Write succeeded before timeout
+                            break;
+                        }
+                        Err(e) if e.etype() == &WriteTimedout => {
+                            // Timeout fired!
+                            timedout = true;
+                            break;
+                        }
+                        Err(e) => {
+                            panic!("Unexpected error: {:?}", e);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(timedout, "Timeout should have fired despite cancellations");
+        assert!(
+            attempts >= 5,
+            "Should have had multiple attempts before timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_write_succeeds_within_timeout() {
+        init_log();
+        let data = b"Hello, World!";
+
+        // Create a mock that completes quickly
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(20))
+            .write(data)
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data.len());
+
+        // Queue with a generous timeout
+        body_writer.send_body_task(
+            Bytes::from_static(data),
+            Some(std::time::Duration::from_millis(500)),
+        );
+
+        // Write should succeed
+        let result = body_writer.write_current_body_task(&mut mock_io).await;
+        assert!(result.is_ok(), "Write should succeed: {:?}", result);
+        assert_eq!(result.unwrap(), Some(data.len()));
+    }
+
+    #[tokio::test]
+    async fn test_task_write_no_timeout() {
+        init_log();
+        let data = b"test data";
+
+        // Create a mock that takes a bit of time but eventually succeeds
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(100))
+            .write(data)
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data.len());
+
+        // Queue without timeout
+        body_writer.send_body_task(Bytes::from_static(data), None);
+
+        // Write should eventually succeed
+        let result = body_writer.write_current_body_task(&mut mock_io).await;
+        assert!(result.is_ok(), "Write should succeed without timeout");
+        assert_eq!(result.unwrap(), Some(data.len()));
+    }
+
+    #[tokio::test]
+    async fn test_task_chunked_write_timeout() {
+        init_log();
+        let data = b"chunked data";
+
+        // Create a mock that blocks
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_secs(1000))
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_chunked();
+
+        // Queue with short timeout
+        body_writer.send_body_task(
+            Bytes::from_static(data),
+            Some(std::time::Duration::from_millis(50)),
+        );
+
+        // Should timeout
+        let result = body_writer.write_current_body_task(&mut mock_io).await;
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert_eq!(e.etype(), &WriteTimedout);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_timeout_reset_on_new_task() {
+        init_log();
+        let data1 = b"first";
+        let data2 = b"second";
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data1.len() + data2.len());
+
+        // Queue first task with short timeout
+        body_writer.send_body_task(
+            Bytes::from_static(data1),
+            Some(std::time::Duration::from_millis(50)),
+        );
+
+        // Wait a bit but don't let it timeout yet
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Queue a new task with a longer timeout
+        // This should reset/replace the timeout
+        body_writer.send_body_task(
+            Bytes::from_static(data2),
+            Some(std::time::Duration::from_millis(500)),
+        );
+
+        // Create a mock that takes some time
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(100))
+            .write(data2)
+            .build();
+
+        // The second write should succeed with its own timeout
+        let result = body_writer.write_current_body_task(&mut mock_io).await;
+        assert!(
+            result.is_ok(),
+            "Second task should succeed with new timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_timeout_with_partial_writes() {
+        init_log();
+        let data1 = b"first";
+        let data2 = b"second";
+        let data3 = b"third";
+
+        // Mock that writes data1 quickly, data2 with delay, data3 blocks forever
+        let mut mock_io = Builder::new()
+            .wait(std::time::Duration::from_millis(10))
+            .write(data1)
+            .wait(std::time::Duration::from_millis(40))
+            .write(data2)
+            .wait(std::time::Duration::from_secs(1000))
+            .build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data1.len() + data2.len() + data3.len());
+
+        let mut total_written = 0;
+
+        // First write - should succeed within timeout
+        body_writer.send_body_task(
+            Bytes::from_static(data1),
+            Some(std::time::Duration::from_millis(100)),
+        );
+        let result = body_writer.write_current_body_task(&mut mock_io).await;
+        assert!(result.is_ok());
+        total_written += result.unwrap().unwrap();
+
+        // Second write - should succeed within timeout
+        body_writer.send_body_task(
+            Bytes::from_static(data2),
+            Some(std::time::Duration::from_millis(100)),
+        );
+        let result = body_writer.write_current_body_task(&mut mock_io).await;
+        assert!(result.is_ok());
+        total_written += result.unwrap().unwrap();
+
+        // Third write - should timeout
+        body_writer.send_body_task(
+            Bytes::from_static(data3),
+            Some(std::time::Duration::from_millis(50)),
+        );
+        let result = body_writer.write_current_body_task(&mut mock_io).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().etype(), &WriteTimedout);
+
+        // We should have written data1 and data2 but not data3
+        assert_eq!(total_written, data1.len() + data2.len());
+        assert!(
+            total_written < data1.len() + data2.len() + data3.len(),
+            "Should not have written all data"
+        );
+    }
+
+    // Cancel-safe finish task for chunked encoding: send_finish_task() queues
+    // the terminating chunk, write_current_finish_task() writes it and can be
+    // cancelled and resumed in a select! loop.
+    // Verifies that the finish flushes the stream exactly once.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_safe_finish_task_chunked() {
+        init_log();
+
+        let data = Bytes::from("hello");
+        let expected_chunk = b"5\r\nhello\r\n";
+
+        let mock_io = Builder::new().write(expected_chunk).build();
+        let (mut flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_chunked();
+
+        // Write body data via task API
+        body_writer.send_body_task(data, None);
+        body_writer
+            .write_current_body_task(&mut flush_mock)
+            .await
+            .unwrap();
+
+        // Chunked body writes always flush after each chunk
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            1,
+            "Chunked body data write should flush once"
+        );
+
+        // Queue the finish task
+        body_writer.send_finish_task();
+        assert!(body_writer.has_pending_finish_task());
+
+        // Write the finish in a select! loop with cancellations
+        let mock_io_finish = Builder::new()
+            .wait(std::time::Duration::from_millis(100))
+            .write(b"0\r\n\r\n")
+            .build();
+        let (mut flush_mock_finish, flush_count_finish) = FlushTrackingMock::new(mock_io_finish);
+
+        let mut cancel_count = 0;
+
+        loop {
+            if !body_writer.has_pending_finish_task() {
+                break;
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                    cancel_count += 1;
+                }
+                result = body_writer.write_current_finish_task(&mut flush_mock_finish) => {
+                    assert!(result.is_ok());
+                    break;
+                }
+            }
+        }
+
+        assert!(cancel_count > 0, "Should have cancelled at least once");
+        assert!(matches!(body_writer.body_mode, BodyMode::Complete(_)));
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count_finish),
+            1,
+            "Chunked finish should flush exactly once"
+        );
+    }
+
+    // Finish task for content-length is a no-op (no terminating chunk needed),
+    // but it should still transition body_mode to Complete.
+    // Verifies that no flush occurs (content-length finish has no I/O).
+    #[tokio::test]
+    async fn finish_task_content_length() {
+        init_log();
+
+        let data = b"hello";
+        let mock_io = Builder::new().write(data).build();
+        let (mut flush_mock, flush_count) = FlushTrackingMock::new(mock_io);
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(data.len());
+
+        body_writer.send_body_task(Bytes::from_static(data), None);
+        body_writer
+            .write_current_body_task(&mut flush_mock)
+            .await
+            .unwrap();
+
+        // Content-length body write flushes when all bytes are written
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count),
+            1,
+            "Content-length body write should flush once (all bytes written)"
+        );
+
+        body_writer.send_finish_task();
+        let mock_io_finish = Builder::new().build();
+        let (mut flush_mock_finish, flush_count_finish) = FlushTrackingMock::new(mock_io_finish);
+        let result = body_writer
+            .write_current_finish_task(&mut flush_mock_finish)
+            .await;
+        assert!(result.is_ok());
+        assert!(matches!(body_writer.body_mode, BodyMode::Complete(_)));
+        assert_eq!(
+            FlushTrackingMock::flush_count(&flush_count_finish),
+            0,
+            "Content-length finish should not flush (no I/O needed)"
+        );
+    }
+
+    // Verifies that body_mode byte tracking is correct when writing
+    // content-length body in multiple chunks. Each intermediate chunk
+    // does not trigger a flush; the body_mode must still accumulate
+    // bytes correctly so that finish_task succeeds.
+    #[tokio::test]
+    async fn content_length_body_mode_tracks_across_chunks() {
+        init_log();
+
+        let chunk1 = b"Hello";
+        let chunk2 = b", World!";
+        let total_len = chunk1.len() + chunk2.len(); // 13
+
+        // Mock expects both writes; the final write triggers a flush internally
+        let mut mock_io = Builder::new().write(chunk1).write(chunk2).build();
+
+        let mut body_writer = BodyWriter::new();
+        body_writer.init_content_length(total_len);
+
+        // Write first chunk (intermediate, no flush expected)
+        body_writer.send_body_task(Bytes::from_static(chunk1), None);
+        let result = body_writer
+            .write_current_body_task(&mut mock_io)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(chunk1.len()));
+        assert!(
+            !body_writer.finished(),
+            "Should not be finished after first chunk"
+        );
+
+        // Verify body_mode tracks the bytes from the first chunk
+        assert!(
+            matches!(body_writer.body_mode, BodyMode::ContentLength(total, written)
+                if total == total_len && written == chunk1.len()),
+            "body_mode should reflect bytes written so far, got: {:?}",
+            body_writer.body_mode
+        );
+
+        // Write second chunk (final, completes content-length)
+        body_writer.send_body_task(Bytes::from_static(chunk2), None);
+        let result = body_writer
+            .write_current_body_task(&mut mock_io)
+            .await
+            .unwrap();
+        assert_eq!(result, Some(chunk2.len()));
+        assert!(
+            body_writer.finished(),
+            "Should be finished after all bytes written"
+        );
+
+        // Finish should succeed since all content-length bytes were written
+        body_writer.send_finish_task();
+        let mut mock_io_finish = Builder::new().build();
+        let result = body_writer
+            .write_current_finish_task(&mut mock_io_finish)
+            .await;
+        assert!(
+            result.is_ok(),
+            "finish_task should succeed when all content-length bytes written"
+        );
+        assert!(matches!(body_writer.body_mode, BodyMode::Complete(_)));
+    }
+}
+
+#[cfg(test)]
+mod test_poll_body_writer {
+    //! Tests that drive the cancel-safe poll-based body writers directly
+    //! via [`futures::task::noop_waker`] and an in-memory [`AsyncWrite`]
+    //! mock — no tokio runtime required.
+    //!
+    //! These exercise the `write_all_buf` call sites in
+    //! [`BodyWriter::poll_write_current_body_task`] and
+    //! [`BodyWriter::poll_write_current_finish_task`]: re-creating tokio's
+    //! stateless future on each poll and verifying that progress carried
+    //! by the caller-owned [`Buf`](bytes::Buf) is preserved across
+    //! [`Poll::Pending`] returns.
+    use super::*;
+    use bytes::Bytes;
+    use futures::task::noop_waker;
+    use std::collections::VecDeque;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    /// Programmable in-memory [`AsyncWrite`]. Each scripted entry dictates
+    /// the outcome of one `poll_write` / `poll_write_vectored` call.
+    struct MockWriter {
+        written: Vec<u8>,
+        next: VecDeque<Poll<io::Result<usize>>>,
+        vectored: bool,
+    }
+
+    impl MockWriter {
+        fn new(vectored: bool, results: Vec<Poll<io::Result<usize>>>) -> Self {
+            Self {
+                written: Vec::new(),
+                next: results.into(),
+                vectored,
+            }
+        }
+    }
+
+    impl AsyncWrite for MockWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let r = self
+                .next
+                .pop_front()
+                .expect("MockWriter::poll_write: out of scripted results");
+            if let Poll::Ready(Ok(n)) = &r {
+                self.written.extend_from_slice(&buf[..*n]);
+            }
+            r
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let r = self
+                .next
+                .pop_front()
+                .expect("MockWriter::poll_write_vectored: out of scripted results");
+            if let Poll::Ready(Ok(n)) = &r {
+                let mut remaining = *n;
+                for slice in bufs {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let take = slice.len().min(remaining);
+                    self.written.extend_from_slice(&slice[..take]);
+                    remaining -= take;
+                }
+            }
+            r
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.vectored
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Drive a poll closure to completion under a [`noop_waker`] context.
+    ///
+    /// Panics after [`MAX_POLLS`] iterations to avoid silently hanging the
+    /// test runner when a mock is misconfigured and never returns
+    /// [`Poll::Ready`].
+    fn drive<R>(mut poll_fn: impl FnMut(&mut Context<'_>) -> Poll<R>) -> R {
+        const MAX_POLLS: usize = 1024;
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..MAX_POLLS {
+            if let Poll::Ready(v) = poll_fn(&mut cx) {
+                return v;
+            }
+        }
+        panic!("drive(): poll closure did not complete after {MAX_POLLS} iterations");
+    }
+
+    #[test]
+    fn content_length_write_completes() {
+        let data = b"hello";
+        let mut mock = MockWriter::new(false, vec![Poll::Ready(Ok(5))]);
+        let mut bw = BodyWriter::new();
+        bw.init_content_length(data.len());
+        bw.send_body_task(Bytes::from_static(data), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, data);
+        assert!(matches!(bw.body_mode, BodyMode::ContentLength(5, 5)));
+    }
+
+    #[test]
+    fn content_length_write_resumes_after_pending_and_short_write() {
+        // Pending once, then 2-byte short write, then the remaining 3 bytes.
+        // Exercises the per-poll re-creation of tokio's WriteAllBuf future
+        // with progress carried by the BodyWriter-owned buffer.
+        let data = b"hello";
+        let mut mock = MockWriter::new(
+            false,
+            vec![Poll::Pending, Poll::Ready(Ok(2)), Poll::Ready(Ok(3))],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_content_length(data.len());
+        bw.send_body_task(Bytes::from_static(data), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, data);
+    }
+
+    #[test]
+    fn chunked_write_uses_vectored_path() {
+        // Chunked body emits "5\r\nhello\r\n" = 10 bytes as a 3-piece
+        // WriteBuf::Chained (size header + payload + trailing CRLF).
+        // The `WriteBuf::chunks_vectored` override forwards to the inner
+        // chain so tokio's `write_all_buf` sees all 3 IoSlices and issues
+        // a single `poll_write_vectored` covering the whole frame.
+        let payload = b"hello";
+        let mut mock = MockWriter::new(true, vec![Poll::Ready(Ok(10))]);
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5)))); // application bytes
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+        // Exactly one vectored call — no leftover scripted results.
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn chunked_write_resumes_on_short_write() {
+        // Exercise the restart path under the vectored fast-path: first
+        // `poll_write_vectored` covers all 3 IoSlices but only reports
+        // Ok(2) (the kernel accepted "5\r"); after advancing 2 bytes the
+        // buffer still has 8 bytes ("\n" + "hello" + "\r\n") and the next
+        // call covers them in one vectored write.
+        let payload = b"hello";
+        let mut mock = MockWriter::new(
+            true,
+            vec![
+                Poll::Ready(Ok(2)), // partial "5\r"
+                Poll::Ready(Ok(8)), // remaining "\n" + "hello" + "\r\n"
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn until_close_write_completes() {
+        let data = b"abcdef";
+        let mut mock = MockWriter::new(false, vec![Poll::Ready(Ok(6))]);
+        let mut bw = BodyWriter::new();
+        bw.init_close_delimited();
+        bw.send_body_task(Bytes::from_static(data), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(6))));
+        assert_eq!(mock.written, data);
+    }
+
+    #[test]
+    fn finish_chunked_writes_terminator() {
+        // After a chunked body, finish() must emit the "0\r\n\r\n" terminator.
+        let mut mock = MockWriter::new(true, vec![Poll::Ready(Ok(5))]);
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        // Pretend we already wrote 5 application bytes.
+        bw.body_mode = BodyMode::ChunkedEncoding(5);
+        bw.send_finish_task();
+
+        let res = drive(|cx| bw.poll_write_current_finish_task(cx, Pin::new(&mut mock)));
+        assert!(res.is_ok());
+        assert_eq!(mock.written, b"0\r\n\r\n");
+        assert!(matches!(bw.body_mode, BodyMode::Complete(5)));
+    }
+
+    #[test]
+    fn chunked_write_non_vectored_writer() {
+        // When the underlying writer does not support vectored I/O,
+        // `write_all_buf` walks the buffer one `Buf::chunk()` at a time —
+        // i.e. one `poll_write` per inner piece of the 3-piece chained
+        // frame. The `chunks_vectored` override does not participate in
+        // this path; this test pins the existing non-vectored behavior so
+        // a future refactor cannot silently break it.
+        let payload = b"hello";
+        let mut mock = MockWriter::new(
+            false,
+            vec![
+                Poll::Ready(Ok(3)), // "5\r\n"
+                Poll::Ready(Ok(5)), // "hello"
+                Poll::Ready(Ok(2)), // "\r\n"
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn chunked_write_resumes_after_pending() {
+        // Vectored fast-path Pending-then-resume: an initial `Poll::Pending`
+        // must not lose buffer progress, and the next iteration must still
+        // present all 3 IoSlices in one `poll_write_vectored` call. This is
+        // the chunked counterpart to
+        // `content_length_write_resumes_after_pending_and_short_write`.
+        let payload = b"hello";
+        let mut mock = MockWriter::new(
+            true,
+            vec![
+                Poll::Pending,
+                Poll::Ready(Ok(10)), // full frame in one vectored call
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+        bw.send_body_task(Bytes::from_static(payload), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, b"5\r\nhello\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn chunked_write_two_frames_in_sequence() {
+        // Two consecutive `send_body_task` calls must each be served by
+        // their own freshly-constructed `WriteBuf::Chained`. Catches state-
+        // machine bugs where the second frame inherits stale buffer state
+        // (or where the vectored fast-path leaks slices across frames).
+        let mut mock = MockWriter::new(
+            true,
+            vec![
+                Poll::Ready(Ok(10)), // "5\r\nhello\r\n"
+                Poll::Ready(Ok(10)), // "5\r\nworld\r\n"
+            ],
+        );
+        let mut bw = BodyWriter::new();
+        bw.init_chunked();
+
+        bw.send_body_task(Bytes::from_static(b"hello"), None);
+        let res1 = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res1, Ok(Some(5))));
+
+        bw.send_body_task(Bytes::from_static(b"world"), None);
+        let res2 = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res2, Ok(Some(5))));
+
+        assert_eq!(mock.written, b"5\r\nhello\r\n5\r\nworld\r\n");
+        assert!(mock.next.is_empty());
+    }
+
+    #[test]
+    fn content_length_write_uses_vectored_path() {
+        // Content-Length writes go through `WriteBuf::Simple` (a single
+        // contiguous `Bytes`). Exercises the `Simple` arm of the
+        // `chunks_vectored` override: a single-piece buffer reports one
+        // IoSlice, so tokio issues one `poll_write_vectored` for the
+        // whole payload.
+        let data = b"hello";
+        let mut mock = MockWriter::new(true, vec![Poll::Ready(Ok(5))]);
+        let mut bw = BodyWriter::new();
+        bw.init_content_length(data.len());
+        bw.send_body_task(Bytes::from_static(data), None);
+
+        let res = drive(|cx| bw.poll_write_current_body_task(cx, Pin::new(&mut mock)));
+        assert!(matches!(res, Ok(Some(5))));
+        assert_eq!(mock.written, data);
+        assert!(mock.next.is_empty());
     }
 }

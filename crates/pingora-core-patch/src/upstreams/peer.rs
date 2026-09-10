@@ -33,6 +33,7 @@ use pingora_error::{
 };
 #[cfg(feature = "s2n")]
 use pingora_s2n::S2NPolicy;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::hash::{Hash, Hasher};
@@ -400,6 +401,95 @@ impl Scheme {
     }
 }
 
+/// Policy for forwarding request headers to HTTP upstreams.
+///
+/// This policy applies to automatically forwarded downstream request headers. Application code
+/// may deliberately alter the resulting request in its upstream request filter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HttpUpstreamRequestPolicy {
+    /// Strip standard hop-by-hop request fields inherited from the downstream request.
+    ///
+    /// Standard hop-by-hop framing fields are removed. If a non-empty request body is unframed
+    /// after application upstream request filtering, Pingora sends it chunked to an HTTP/1
+    /// upstream.
+    pub strip_hop_by_hop: bool,
+    /// Strip extension fields identified by tokens in the downstream `Connection` header field.
+    ///
+    /// Requests nominating `Host`, forwarding-origin fields, or pseudo-header-shaped fields are
+    /// rejected rather than forwarded with protected metadata removed when this behavior is
+    /// enabled.
+    pub strip_connection_nominated: bool,
+    /// Reject `Connection` nominations that are not a valid HTTP `token` (RFC 9110 §5.6.2), such
+    /// as `Connection: "X-Forwarded-For"`, instead of tolerating them as distinct literal fields.
+    ///
+    /// Defaults to `true`. Exact nominations of protected fields and pseudo-headers are rejected
+    /// either way. Only has an effect when
+    /// [`strip_connection_nominated`](Self::strip_connection_nominated) is enabled.
+    pub reject_malformed_connection_nominations: bool,
+    /// Controls forwarding of HTTP/1 protocol upgrade request fields.
+    pub h1_upgrade: H1UpgradePolicy,
+}
+
+impl HttpUpstreamRequestPolicy {
+    /// Use standards-oriented forwarding with normalized WebSocket upgrade support.
+    pub fn standard() -> Self {
+        Self::default()
+    }
+
+    /// Preserve the previous HTTP/1 upstream request-header passthrough behavior.
+    ///
+    /// This mode is RFC-non-compliant and is provided only for legacy compatibility. Use it at
+    /// your own risk: the application's upstream request filter is solely responsible for
+    /// ensuring valid hop-by-hop header handling.
+    pub fn preserve() -> Self {
+        Self {
+            strip_hop_by_hop: false,
+            strip_connection_nominated: false,
+            reject_malformed_connection_nominations: false,
+            h1_upgrade: H1UpgradePolicy::Preserve,
+        }
+    }
+
+    /// Strip hop-by-hop fields and do not forward any HTTP/1 upgrade handshake.
+    pub fn deny_upgrades() -> Self {
+        Self {
+            h1_upgrade: H1UpgradePolicy::Deny,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for HttpUpstreamRequestPolicy {
+    fn default() -> Self {
+        Self {
+            strip_hop_by_hop: true,
+            strip_connection_nominated: true,
+            reject_malformed_connection_nominations: true,
+            h1_upgrade: H1UpgradePolicy::WebSocketOnly,
+        }
+    }
+}
+
+/// Policy for forwarding HTTP/1 protocol upgrade request fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H1UpgradePolicy {
+    /// Forward normalized upgrade fields only for a valid WebSocket upgrade request.
+    WebSocketOnly,
+    /// Preserve complete request metadata for HTTP/1 requests containing an upgrade field.
+    ///
+    /// This is RFC-non-compliant and is provided only for legacy compatibility. Use it at your
+    /// own risk: the application's upstream request filter is solely responsible for ensuring
+    /// valid hop-by-hop metadata for upgraded requests.
+    ///
+    /// When this is selected, automatic hop-by-hop normalization is skipped for upgrade requests
+    /// because protocol-specific handshakes can depend on any connection-nominated field.
+    /// Protected nomination validation applies only when
+    /// [`HttpUpstreamRequestPolicy::strip_connection_nominated`] is enabled.
+    Preserve,
+    /// Do not forward HTTP/1 upgrade request fields.
+    Deny,
+}
+
 /// The preferences to connect to a remote server
 ///
 /// See [`Peer`] for the meaning of the fields
@@ -435,26 +525,39 @@ pub struct PeerOptions {
     pub s2n_security_policy: Option<S2NPolicy>,
     #[cfg(feature = "s2n")]
     pub max_blinding_delay: Option<u32>,
-    // how many concurrent h2 stream are allowed in the same connection
+    /// How many concurrent h2 streams are allowed in the same connection.
     pub max_h2_streams: usize,
-    /// Allow invalid Content-Length in HTTP/1 responses (non-RFC compliant).
+    /// Initial per-stream H2 receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub h2_stream_window_size: Option<u32>,
+    /// Initial connection-level H2 receive window size in bytes.
+    /// If `None`, the default of 8MB is used.
+    pub h2_connection_window_size: Option<u32>,
+    /// Allow a single invalid Content-Length in HTTP/1 responses (non-RFC compliant).
     ///
-    /// When enabled, invalid Content-Length responses are treated as close-delimited responses.
+    /// When enabled, a response carrying a single, otherwise-unparseable
+    /// Content-Length value is treated as a close-delimited response instead of
+    /// being rejected. Conflicting or duplicate Content-Length values (multiple
+    /// header lines, or a comma-separated list with differing values) are an
+    /// unrecoverable framing error and are always rejected, even when this is
+    /// enabled.
     ///
     /// **Note:** This field is unstable and may be removed or changed in future versions.
     /// It exists primarily for compatibility with legacy servers that send malformed headers.
     pub allow_h1_response_invalid_content_length: bool,
+    /// Controls automatically forwarded request headers sent to HTTP upstreams.
+    pub http_upstream_request_policy: HttpUpstreamRequestPolicy,
     pub extra_proxy_headers: BTreeMap<String, Vec<u8>>,
-    // The list of curve the tls connection should advertise
-    // if `None`, the default curves will be used
-    pub curves: Option<&'static str>,
-    // see ssl_use_second_key_share
+    /// The list of curves the tls connection should advertise
+    /// if `None`, the default curves will be used
+    pub curves: Option<Cow<'static, str>>,
+    /// see ssl_use_second_key_share
     pub second_keyshare: bool,
-    // whether to enable TCP fast open
+    /// whether to enable TCP fast open
     pub tcp_fast_open: bool,
-    // use Arc because Clone is required but not allowed in trait object
+    /// use Arc because Clone is required but not allowed in trait object
     pub tracer: Option<Tracer>,
-    // A custom L4 connector to use to establish new L4 connections
+    /// A custom L4 connector to use to establish new L4 connections
     pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
     #[derivative(Debug = "ignore")]
     pub upstream_tcp_sock_tweak_hook:
@@ -499,7 +602,10 @@ impl PeerOptions {
             #[cfg(feature = "s2n")]
             max_blinding_delay: None,
             max_h2_streams: 1,
+            h2_stream_window_size: None,
+            h2_connection_window_size: None,
             allow_h1_response_invalid_content_length: false,
+            http_upstream_request_policy: HttpUpstreamRequestPolicy::default(),
             extra_proxy_headers: BTreeMap::new(),
             curves: None,
             second_keyshare: true, // default true and noop when not using PQ curves
@@ -690,6 +796,21 @@ impl Hash for HttpPeer {
         self.group_key.hash(state);
         // max h2 stream settings
         self.options.max_h2_streams.hash(state);
+        // h2_stream_window_size and h2_connection_window_size are intentionally excluded
+        // from the reuse hash for now. These are per-connection settings applied at handshake
+        // time and may be revisited alongside other h2 settings that could be dynamically
+        // adjusted over the lifetime of a connection.
+        self.options.curves.hash(state);
+        self.options.second_keyshare.hash(state);
+        // BackendTLSPolicy: a pooled connection that was verified against one CA
+        // bundle / SAN set must never be reused by a peer that requires another.
+        #[cfg(feature = "rustls")]
+        if let Some(ca) = self.options.ca.as_ref() {
+            for cert in ca.iter() {
+                cert.raw_der().hash(state);
+            }
+        }
+        self.options.required_sans.hash(state);
     }
 }
 
@@ -786,5 +907,80 @@ impl Display for Proxy {
             self.host,
             self.port
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_http_upstream_request_policy_is_standards_oriented() {
+        let policy = PeerOptions::new().http_upstream_request_policy;
+        assert!(policy.strip_hop_by_hop);
+        assert!(policy.strip_connection_nominated);
+        assert!(policy.reject_malformed_connection_nominations);
+        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::WebSocketOnly);
+    }
+
+    #[test]
+    fn preserve_http_upstream_request_policy_is_a_legacy_preset() {
+        let policy = HttpUpstreamRequestPolicy::preserve();
+        assert!(!policy.strip_hop_by_hop);
+        assert!(!policy.strip_connection_nominated);
+        assert!(!policy.reject_malformed_connection_nominations);
+        assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
+    }
+
+    #[cfg(feature = "rustls")]
+    fn test_ca(pem_path: &str) -> Arc<CaType> {
+        let pem = std::fs::read(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), pem_path)).unwrap();
+        let (_, pem) = x509_parser::pem::parse_x509_pem(&pem).unwrap();
+        Arc::from(vec![crate::utils::tls::wrapped_x509_from_der(pem.contents)])
+    }
+
+    #[cfg(feature = "rustls")]
+    fn verified_peer() -> HttpPeer {
+        let mut peer = HttpPeer::new("10.0.0.1:443", true, "tls-backend.default.svc".into());
+        peer.options.verify_cert = true;
+        peer
+    }
+
+    /// Two peers to the same address and SNI that trust different CA bundles must not
+    /// share pooled connections: a connection verified against the good CA would
+    /// otherwise serve a BackendTLSPolicy whose CA does not sign the backend cert.
+    #[test]
+    #[cfg(feature = "rustls")]
+    fn reuse_hash_separates_peers_with_different_ca_bundles() {
+        let mut good = verified_peer();
+        good.options.ca = Some(test_ca("tests/keys/server.crt"));
+        let mut same = verified_peer();
+        same.options.ca = Some(test_ca("tests/keys/server.crt"));
+        let mut other = verified_peer();
+        other.options.ca = Some(test_ca("tests/keys/other-ca.crt"));
+        let none = verified_peer();
+
+        assert_eq!(good.reuse_hash(), same.reuse_hash());
+        assert_ne!(good.reuse_hash(), other.reuse_hash());
+        assert_ne!(good.reuse_hash(), none.reuse_hash());
+    }
+
+    /// Same CA, different required SAN sets: the SAN check runs at handshake time, so
+    /// the peers must not share pooled connections either.
+    #[test]
+    #[cfg(feature = "rustls")]
+    fn reuse_hash_separates_peers_with_different_required_sans() {
+        let mut a = verified_peer();
+        a.options.ca = Some(test_ca("tests/keys/server.crt"));
+        a.options.required_sans = Some(Arc::new(vec![("Hostname".into(), "abc.example.com".into())]));
+        let mut b = verified_peer();
+        b.options.ca = Some(test_ca("tests/keys/server.crt"));
+        b.options.required_sans = Some(Arc::new(vec![("Hostname".into(), "mismatch.example.com".into())]));
+        let mut c = verified_peer();
+        c.options.ca = Some(test_ca("tests/keys/server.crt"));
+        c.options.required_sans = Some(Arc::new(vec![("Hostname".into(), "abc.example.com".into())]));
+
+        assert_ne!(a.reuse_hash(), b.reuse_hash());
+        assert_eq!(a.reuse_hash(), c.reuse_hash());
     }
 }

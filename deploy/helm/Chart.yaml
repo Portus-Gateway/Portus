@@ -2,8 +2,8 @@ apiVersion: v2
 name: portus-gateway
 description: Portus Gateway - Kubernetes Gateway API implementation with Pingora
 type: application
-version: 0.2.1
-appVersion: "0.2.1"
+version: 0.2.2
+appVersion: "0.2.2"
 home: https://github.com/Portus-Gateway/Portus
 sources:
   - https://github.com/Portus-Gateway/Portus

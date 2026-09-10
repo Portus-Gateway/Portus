@@ -17,7 +17,6 @@ use pingora_core::apps::HttpServerOptions;
 use pingora_core::protocols::http::v2::server::default_h2_options;
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::server::Server;
-use pingora_core::services::listening::Service as ListeningService;
 use hashbrown::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::Arc;
@@ -418,9 +417,10 @@ fn main() {
     health_svc.add_tcp("0.0.0.0:8081");
     server.add_service(health_svc);
 
-    // Prometheus metrics on port 9090
-    let mut prom_svc = ListeningService::prometheus_http_service();
-    prom_svc.add_tcp("127.0.0.1:9090");
+    // Prometheus metrics on port 9090 (the provisioner's pods carry the scrape
+    // annotations, so this must listen on the pod address, not loopback).
+    let mut prom_svc = pingora_prometheus::prometheus_http_service();
+    prom_svc.add_tcp("0.0.0.0:9090");
     server.add_service(prom_svc);
     info!("Prometheus metrics on :9090");
 

@@ -4,6 +4,19 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.2] - Unreleased
+
+### Changed
+
+- **Pingora 0.9.0.** `pingora-core`, `pingora-proxy`, `pingora-http` and `pingora-load-balancing` move from 0.8.1 to 0.9.0 (reworked connection pooling with a sharded pool and a real global LRU, HTTP/1.1 downstream pipelining, configurable HTTP/2 windows, per-listener socket buffers, hop-by-hop header sanitisation on upstream requests, stricter request-target validation). The vendored `pingora-core` patch was rebased: upstream now honours per-peer CA bundles in the rustls connector and offers `Acceptor::from_server_config`, so those parts of the patch are gone; what remains is the hand-off listener, the per-connection `ServerConfig` chooser for frontend mTLS, the SNI in `SslDigest`, SAN-constrained upstream verification and the stricter HTTP/1.1 request parser (18 files, ~600 changed lines against pristine 0.9.0).
+- Prometheus moved out of `pingora-core`; the dataplane's `/metrics` service comes from `pingora-prometheus`.
+- Gateway API v1.6.2 conformance on the rebased build: 130/130 across all five profiles (after the connection-reuse fix below).
+
+### Fixed
+
+- **A BackendTLSPolicy cannot borrow another policy's verified connection.** Pingora keys its upstream connection pool by address, scheme, SNI, client cert and the verify flags, but not by the CA bundle or the required SANs. Two routes to the same backend pods and hostname with different `BackendTLSPolicy` CAs therefore shared pooled connections, and a request under the mismatched policy could ride a connection verified by the valid one instead of failing. Found by the rebased build on `BackendTLSPolicy` (mismatched cert) and `BackendTLSPolicySANValidation` (3 mismatched-SAN cases) returning 200; the reuse hash now covers the CA certificates and the required SANs. Tests: `reuse_hash_separates_peers_with_different_ca_bundles`, `reuse_hash_separates_peers_with_different_required_sans`.
+- The dataplane's Prometheus endpoint listened on `127.0.0.1:9090`, unreachable from a scraper despite the pods' `prometheus.io/*` annotations. It now listens on the pod address.
+
 ## [0.2.1] - 2026-09-10
 
 ### Changed
