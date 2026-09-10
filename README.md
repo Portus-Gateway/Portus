@@ -78,7 +78,7 @@ kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
 # Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.1 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.2 \
   --namespace portus --create-namespace
 ```
 
@@ -164,7 +164,7 @@ The **proto schema** (`proto/portus/v1/config.proto`) defines the contract betwe
 ### Helm Values
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.1 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.2 \
   --namespace portus --create-namespace \
   --set dataplane.replicasPerGateway=3
 ```

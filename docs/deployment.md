@@ -24,7 +24,7 @@ kubectl apply --server-side --force-conflicts \
 The chart is published to GHCR as an OCI artifact with every release, and its images (`ghcr.io/portus-gateway/controller`, `ghcr.io/portus-gateway/dataplane`, `linux/amd64` and `linux/arm64`) are tagged with the same version, which the chart pins as its `appVersion`:
 
 ```bash
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.1 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.2 \
   --namespace portus --create-namespace
 ```
 

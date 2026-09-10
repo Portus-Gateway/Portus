@@ -138,20 +138,27 @@ where
 {
     let config = &tls_ctx.config;
 
-    // Build CA cert store: use per-peer custom CA if provided (BackendTLSPolicy),
-    // otherwise fall back to the connector-level CA store (system CAs).
-    let ca_store = if let Some(peer_ca) = peer.get_ca() {
-        let mut custom_store = RootCertStore::empty();
-        for wrapped in peer_ca.iter() {
-            let der = CertificateDer::from(wrapped.raw_der().to_vec());
-            if let Err(e) = custom_store.add(der) {
-                debug!("skipping invalid CA cert from peer: {:?}", e);
-            }
+    // Build per-peer CA store if provided
+    let peer_ca_store: Option<Arc<RootCertStore>> = if let Some(ca_list) = peer.get_ca() {
+        if ca_list.is_empty() {
+            return Error::e_explain(InvalidCert, "per-peer CA list is empty");
         }
-        Arc::new(custom_store)
+        let mut ca_store = RootCertStore::empty();
+        for ca_cert in &**ca_list {
+            let cert_der = CertificateDer::from(ca_cert);
+            ca_store.add(cert_der).or_err(
+                InvalidCert,
+                "Failed to add per-peer CA certificate to root store",
+            )?;
+        }
+
+        Some(Arc::new(ca_store))
     } else {
-        Arc::clone(&tls_ctx.ca_certs)
+        None
     };
+
+    // Determine effective CA store for this connection
+    let effective_ca_store = peer_ca_store.as_ref().unwrap_or(&tls_ctx.ca_certs);
 
     let key_pair = peer.get_client_cert_key();
     let mut updated_config_opt: Option<RusTlsClientConfig> = match key_pair {
@@ -179,7 +186,7 @@ where
                 &version::TLS12,
                 &version::TLS13,
             ])
-            .with_root_certificates(Arc::clone(&ca_store));
+            .with_root_certificates(Arc::clone(effective_ca_store));
             debug!("added root ca certificates");
 
             let mut updated_config = builder.with_client_auth_cert(certs, private_key).or_err(
@@ -192,17 +199,15 @@ where
         }
     };
 
-    // When custom CA certs are provided (BackendTLSPolicy), we must create an
-    // updated config even without mTLS or ALPN override, so the custom RootCertStore
-    // is used for server certificate verification instead of the system CA store.
-    if updated_config_opt.is_none() && peer.get_ca().is_some() {
-        let builder = RusTlsClientConfig::builder_with_protocol_versions(&[
-            &version::TLS12,
-            &version::TLS13,
-        ])
-        .with_root_certificates(Arc::clone(&ca_store))
-        .with_no_client_auth();
-        updated_config_opt = Some(builder);
+    // Ensure config is updated if per-peer CA is set but no client cert
+    if peer_ca_store.is_some() && updated_config_opt.is_none() {
+        let mut updated_config =
+            RusTlsClientConfig::builder_with_protocol_versions(&[&version::TLS12, &version::TLS13])
+                .with_root_certificates(Arc::clone(effective_ca_store))
+                .with_no_client_auth();
+
+        updated_config.key_log = Arc::clone(&config.key_log);
+        updated_config_opt = Some(updated_config);
     }
 
     if let Some(alpn) = alpn_override.as_ref().or(peer.get_alpn()) {
@@ -240,7 +245,7 @@ where
 
         // Builds the custom_verifier when verification_mode is set.
         if let Some(mode) = verification_mode {
-            let delegate = WebPkiServerVerifier::builder(Arc::clone(&ca_store))
+            let delegate = WebPkiServerVerifier::builder(Arc::clone(effective_ca_store))
                 .build()
                 .or_err(InvalidCert, "Failed to build WebPkiServerVerifier")?;
 
@@ -276,7 +281,7 @@ where
                 RusTlsClientConfig::clone(&tls_ctx.config)
             });
 
-            let delegate = WebPkiServerVerifier::builder(Arc::clone(&ca_store))
+            let delegate = WebPkiServerVerifier::builder(Arc::clone(effective_ca_store))
                 .build()
                 .or_err(InvalidCert, "Failed to build WebPkiServerVerifier for SAN check")?;
 

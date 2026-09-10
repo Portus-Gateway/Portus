@@ -106,7 +106,7 @@ where
         }
         let persistent_settings = HttpPersistentSettings::for_session(&http);
         match http.finish().await {
-            Ok(c) => c.map(|s| ReusedHttpStream::new(s, Some(persistent_settings))),
+            Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings)),
             Err(e) => {
                 error!("HTTP server fails to finish the request: {e}");
                 None
@@ -225,7 +225,7 @@ where
         }
         let persistent_settings = HttpPersistentSettings::for_session(&http);
         match http.finish().await {
-            Ok(c) => c.map(|s| ReusedHttpStream::new(s, Some(persistent_settings))),
+            Ok(c) => c.map(|s| ReusedHttpStream::from_reusable_stream(s, persistent_settings)),
             Err(e) => {
                 error!("HTTP server fails to finish the request: {e}");
                 None

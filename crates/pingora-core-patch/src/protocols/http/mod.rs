@@ -14,6 +14,7 @@
 
 //! HTTP/1.x and HTTP/2 implementation APIs
 
+pub mod authority;
 pub mod body_buffer;
 pub mod bridge;
 pub mod client;
@@ -27,7 +28,7 @@ pub mod subrequest;
 pub mod v1;
 pub mod v2;
 
-pub use server::Session as ServerSession;
+pub use server::{ReusableHttpStream, Session as ServerSession};
 
 /// The Pingora server name string
 pub const SERVER_NAME: &[u8; 5] = b"proxy";

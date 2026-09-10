@@ -14,7 +14,7 @@
 
 //! HTTP response (de)compression libraries
 //!
-//! Brotli and Gzip and partially supported.
+//! Gzip, Brotli, Zstd, and dictionary-compressed Zstd (dcz, [RFC 9842](https://datatracker.ietf.org/doc/html/rfc9842)) are supported.
 
 use super::HttpTask;
 
@@ -30,6 +30,9 @@ use strum_macros::EnumCount as EnumCountMacro;
 mod brotli;
 mod gzip;
 mod zstd;
+
+/// Re-export [RFC 9842](https://datatracker.ietf.org/doc/html/rfc9842) constants for external use.
+pub use zstd::{DCZ_HEADER_SIZE, DCZ_MAGIC};
 
 /// The type of error to return when (de)compression fails
 pub const COMPRESSION_ERROR: ErrorType = ErrorType::new("CompressionError");
@@ -64,6 +67,13 @@ pub trait Encode {
 /// - Gzip compression: if the response is uncompressed, this ctx can compress it with gzip
 pub struct ResponseCompressionCtx(CtxInner);
 
+/// Dictionary data for [RFC 9842](https://datatracker.ietf.org/doc/html/rfc9842) shared dictionary compression.
+#[derive(Clone, Debug)]
+pub struct DictionaryData {
+    pub bytes: Bytes,
+    pub hash: [u8; 32],
+}
+
 enum CtxInner {
     HeaderPhase {
         // Store the preferred list to compare with content-encoding
@@ -71,6 +81,8 @@ enum CtxInner {
         encoding_levels: [u32; Algorithm::COUNT],
         decompress_enable: [bool; Algorithm::COUNT],
         preserve_etag: [bool; Algorithm::COUNT],
+        // Optional dictionary for dcz compression (RFC 9842).
+        dictionary: Option<DictionaryData>,
     },
     BodyPhase(Option<Box<dyn Encode + Send + Sync>>),
 }
@@ -87,6 +99,7 @@ impl ResponseCompressionCtx {
             encoding_levels: [compression_level; Algorithm::COUNT],
             decompress_enable: [decompress_enable; Algorithm::COUNT],
             preserve_etag: [preserve_etag; Algorithm::COUNT],
+            dictionary: None,
         })
     }
 
@@ -101,6 +114,11 @@ impl ResponseCompressionCtx {
             } => levels.iter().any(|l| *l != 0) || decompress_enable.iter().any(|d| *d),
             CtxInner::BodyPhase(c) => c.is_some(),
         }
+    }
+
+    /// Whether this ctx is in the response header phase.
+    pub fn is_header_phase(&self) -> bool {
+        matches!(self.0, CtxInner::HeaderPhase { .. })
     }
 
     /// Return the stat of this ctx:
@@ -194,6 +212,41 @@ impl ResponseCompressionCtx {
         }
     }
 
+    /// Set the dictionary for [RFC 9842](https://datatracker.ietf.org/doc/html/rfc9842) dictionary compression.
+    /// # Panic
+    /// This function will panic if it has already started encoding the response body.
+    pub fn set_dictionary(&mut self, dictionary_bytes: Bytes, dictionary_hash: [u8; 32]) {
+        match &mut self.0 {
+            CtxInner::HeaderPhase { dictionary, .. } => {
+                *dictionary = Some(DictionaryData {
+                    bytes: dictionary_bytes,
+                    hash: dictionary_hash,
+                });
+            }
+            CtxInner::BodyPhase(_) => panic!("Wrong phase: BodyPhase"),
+        }
+    }
+
+    /// Check if a dictionary has been set.
+    pub fn has_dictionary(&self) -> bool {
+        match &self.0 {
+            CtxInner::HeaderPhase { dictionary, .. } => dictionary.is_some(),
+            CtxInner::BodyPhase(_) => false,
+        }
+    }
+
+    /// Clear any previously set dictionary.
+    /// # Panic
+    /// This function will panic if it has already started encoding the response body.
+    pub fn clear_dictionary(&mut self) {
+        match &mut self.0 {
+            CtxInner::HeaderPhase { dictionary, .. } => {
+                *dictionary = None;
+            }
+            CtxInner::BodyPhase(_) => panic!("Wrong phase: BodyPhase"),
+        }
+    }
+
     /// Feed the request header into this ctx.
     pub fn request_filter(&mut self, req: &RequestHeader) {
         if !self.is_enabled() {
@@ -210,6 +263,51 @@ impl ResponseCompressionCtx {
         }
     }
 
+    /// Whether [`Self::response_header_filter`] would decompress the body of this response.
+    ///
+    /// This ctx replaces the response body in place, so a filter that runs before it cannot tell
+    /// from the response header alone what the body will look like by the time it reaches
+    /// downstream. This predicate answers that question ahead of time. For example, a caller
+    /// framing a byte range against the response body needs to know whether the body it is
+    /// measuring is about to be swapped for its decompressed form, which invalidates both the
+    /// offsets and the length it computed.
+    ///
+    /// This assumes the response has a body: unlike [`Self::response_header_filter`] it takes no
+    /// `end` flag, and a response without a body is never decompressed. Informational (`1xx`)
+    /// responses are not final, so they are reported as not decompressed; ask again with the
+    /// final response header.
+    ///
+    /// Returns `false` once this ctx has left the header phase, because by then the decision has
+    /// already been made. This is a read-only query, so unlike the `adjust_*` methods it never
+    /// panics and is safe to call in any phase.
+    pub fn will_decompress(&self, resp: &ResponseHeader) -> bool {
+        if !self.is_enabled() {
+            return false;
+        }
+        match &self.0 {
+            CtxInner::HeaderPhase {
+                decompress_enable,
+                accept_encoding,
+                ..
+            } => {
+                // an informational response is not the final one, the filter defers the decision
+                if resp.status.is_informational() {
+                    return false;
+                }
+                match decide_action(resp, accept_encoding) {
+                    Action::Decompress(algorithm) => {
+                        // mirrors `algorithm.decompressor(decompress_enable[idx]).is_some()`
+                        // in the response header filter, without building the decompressor
+                        decompress_enable[algorithm.index()] && algorithm.can_decompress()
+                    }
+                    Action::Noop | Action::Compress(_) => false,
+                }
+            }
+            // the response header was already filtered, whatever it decided is done
+            CtxInner::BodyPhase(_) => false,
+        }
+    }
+
     /// Feed the response header into this ctx
     pub fn response_header_filter(&mut self, resp: &mut ResponseHeader, end: bool) {
         if !self.is_enabled() {
@@ -221,6 +319,7 @@ impl ResponseCompressionCtx {
                 preserve_etag,
                 accept_encoding,
                 encoding_levels: levels,
+                dictionary,
             } => {
                 if resp.status.is_informational() {
                     if resp.status == http::status::StatusCode::SWITCHING_PROTOCOLS {
@@ -253,7 +352,22 @@ impl ResponseCompressionCtx {
                     Action::Noop => (None, false),
                     Action::Compress(algorithm) => {
                         let idx = algorithm.index();
-                        (algorithm.compressor(levels[idx]), preserve_etag[idx])
+                        let compressor = match algorithm {
+                            Algorithm::Dcz => {
+                                // RFC 9842: dictionary-compressed responses vary on
+                                // Available-Dictionary so caches don't serve this variant
+                                // to clients with a different or missing dictionary.
+                                let enc = dictionary.as_ref().and_then(|d| {
+                                    algorithm.maybe_compressor_with_dictionary(levels[idx], d)
+                                });
+                                if enc.is_some() {
+                                    add_vary_header(resp, &AVAILABLE_DICTIONARY);
+                                }
+                                enc
+                            }
+                            _ => algorithm.compressor(levels[idx]),
+                        };
+                        (compressor, preserve_etag[idx])
                     }
                     Action::Decompress(algorithm) => {
                         let idx = algorithm.index();
@@ -366,16 +480,68 @@ impl Algorithm {
         }
     }
 
+    pub fn maybe_compressor_with_dictionary(
+        &self,
+        level: u32,
+        dictionary: &DictionaryData,
+    ) -> Option<Box<dyn Encode + Send + Sync>> {
+        if level == 0 {
+            None
+        } else {
+            match self {
+                Self::Dcz => {
+                    match zstd::DictionaryCompressor::new(level, &dictionary.bytes, dictionary.hash)
+                    {
+                        Ok(c) => Some(Box::new(c)),
+                        Err(e) => {
+                            warn!("Failed to create DCZ compressor: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
+        }
+    }
+
+    // The single source of truth for which algorithms can be decompressed: both
+    // `decompressor` and `can_decompress` are derived from it, so the set cannot drift
+    // between the two. The match is exhaustive on purpose, so that a newly added algorithm
+    // has to state whether a decompressor exists for it.
+    fn decompressor_impl(&self) -> Option<fn() -> Box<dyn Encode + Send + Sync>> {
+        match self {
+            Self::Gzip => Some(|| Box::new(gzip::Decompressor::new())),
+            Self::Brotli => Some(|| Box::new(brotli::Decompressor::new())),
+            // not implemented
+            Self::Any | Self::Zstd | Self::Dcb | Self::Dcz | Self::Other => None,
+        }
+    }
+
     pub fn decompressor(&self, enabled: bool) -> Option<Box<dyn Encode + Send + Sync>> {
         if !enabled {
             None
         } else {
-            match self {
-                Self::Gzip => Some(Box::new(gzip::Decompressor::new())),
-                Self::Brotli => Some(Box::new(brotli::Decompressor::new())),
-                _ => None, // not implemented
-            }
+            self.decompressor_impl()
+                .map(|new_decompressor| new_decompressor())
         }
+    }
+
+    /// Whether a decompressor is implemented for this algorithm.
+    ///
+    /// This is a property of the algorithm alone: it says nothing about whether decompression is
+    /// *enabled* for it, which is configured separately with
+    /// [`ResponseCompressionCtx::adjust_algorithm_decompression`]. [`Algorithm::decompressor`]
+    /// hands out a decompressor only when both hold.
+    ///
+    /// Note that [`Algorithm::Other`] can never be decompressed: it stands for any content coding
+    /// that isn't recognized, which includes multi-coding values such as `gzip, br`.
+    ///
+    /// This lets a caller tell whether a `Content-Encoding` is one that can be undone without
+    /// paying to construct a decompressor, e.g. to predict what
+    /// [`ResponseCompressionCtx::response_header_filter`] is about to do; see
+    /// [`ResponseCompressionCtx::will_decompress`].
+    pub fn can_decompress(&self) -> bool {
+        self.decompressor_impl().is_some()
     }
 
     pub fn index(&self) -> usize {
@@ -654,6 +820,162 @@ fn test_decide_action() {
     assert_eq!(decide_action(&header, &[Dcb]), Decompress(Brotli));
 }
 
+#[test]
+fn test_can_decompress() {
+    use Algorithm::*;
+
+    // every variant spelled out, sized by Algorithm::COUNT so that adding an algorithm fails
+    // to compile here until it is considered
+    const ALL: [Algorithm; Algorithm::COUNT] = [Any, Gzip, Brotli, Zstd, Dcb, Dcz, Other];
+
+    for algorithm in ALL {
+        // only gzip and brotli have a decompressor implementation
+        assert_eq!(
+            algorithm.can_decompress(),
+            matches!(algorithm, Gzip | Brotli),
+            "unexpected can_decompress() for {}",
+            algorithm.as_str()
+        );
+        // can_decompress() must agree with what decompressor() actually hands out
+        assert_eq!(
+            algorithm.can_decompress(),
+            algorithm.decompressor(true).is_some(),
+            "can_decompress() disagrees with decompressor() for {}",
+            algorithm.as_str()
+        );
+        // and nothing is decompressed when the flag is off
+        assert!(algorithm.decompressor(false).is_none());
+    }
+}
+
+// build a ctx that has already seen a request with the given accept-encoding
+#[cfg(test)]
+fn ctx_for_test(
+    compression_level: u32,
+    decompress_enable: bool,
+    accept_encoding: Option<&str>,
+) -> ResponseCompressionCtx {
+    let mut ctx = ResponseCompressionCtx::new(compression_level, decompress_enable, false);
+    let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+    if let Some(ae) = accept_encoding {
+        req.insert_header("accept-encoding", ae).unwrap();
+    }
+    ctx.request_filter(&req);
+    ctx
+}
+
+// build a compressible response with the given status and content-encoding
+#[cfg(test)]
+fn resp_for_test(status: u16, content_encoding: Option<&str>) -> ResponseHeader {
+    let mut resp = ResponseHeader::build(status, None).unwrap();
+    resp.insert_header("content-type", "text/html").unwrap();
+    resp.insert_header("content-length", "1000").unwrap();
+    if let Some(ce) = content_encoding {
+        resp.insert_header("content-encoding", ce).unwrap();
+    }
+    resp
+}
+
+#[test]
+fn test_will_decompress() {
+    // gzip response the client cannot take: the body will be decompressed
+    let ctx = ctx_for_test(0, true, Some("br"));
+    assert!(ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+
+    // the client takes gzip, so the body is passed through as is
+    let ctx = ctx_for_test(0, true, Some("gzip"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+
+    // multi-coding content-encoding parses to Algorithm::Other, which has no decompressor,
+    // so the body is left alone even though decompression is on for every algorithm
+    let ctx = ctx_for_test(0, true, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip, br"))));
+
+    // zstd has no decompressor either
+    let ctx = ctx_for_test(0, true, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("zstd"))));
+
+    // (de)compression entirely disabled
+    let ctx = ctx_for_test(0, false, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+
+    // compression on but decompression off
+    let ctx = ctx_for_test(6, false, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+
+    // the per algorithm decompression flag is respected: gzip turned off
+    let mut ctx = ctx_for_test(0, true, Some("br"));
+    ctx.adjust_algorithm_decompression(Algorithm::Gzip, false);
+    assert!(!ctx.will_decompress(&resp_for_test(200, Some("gzip"))));
+    // ...while brotli is still on
+    let mut ctx = ctx_for_test(0, true, Some("gzip"));
+    ctx.adjust_algorithm_decompression(Algorithm::Gzip, false);
+    assert!(ctx.will_decompress(&resp_for_test(200, Some("br"))));
+
+    // informational responses are not final, no decision yet
+    let ctx = ctx_for_test(0, true, Some("br"));
+    assert!(!ctx.will_decompress(&resp_for_test(100, Some("gzip"))));
+    assert!(!ctx.will_decompress(&resp_for_test(101, Some("gzip"))));
+
+    // uncompressed response, nothing to decompress even when compression kicks in
+    let ctx = ctx_for_test(6, true, Some("gzip"));
+    assert!(!ctx.will_decompress(&resp_for_test(200, None)));
+
+    // once the response header has been filtered the decision is already made
+    let mut ctx = ctx_for_test(0, true, Some("br"));
+    let mut resp = resp_for_test(200, Some("gzip"));
+    assert!(ctx.will_decompress(&resp));
+    ctx.response_header_filter(&mut resp, false);
+    assert!(!ctx.will_decompress(&resp));
+    // also safe to ask when the body phase installed no encoder at all
+    let mut ctx = ctx_for_test(0, true, Some("gzip"));
+    let mut resp = resp_for_test(200, Some("gzip"));
+    ctx.response_header_filter(&mut resp, false);
+    assert!(!ctx.will_decompress(&resp));
+}
+
+#[test]
+fn test_will_decompress_agrees_with_response_header_filter() {
+    // will_decompress() must predict exactly what response_header_filter() does. Decompression
+    // is the only outcome that both drops content-encoding and starts streaming the body, so
+    // that pair of headers is the observable signal.
+    for (level, decompress, accept_encoding, content_encoding) in [
+        (0, true, Some("br"), Some("gzip")),
+        (0, true, Some("br"), Some("GzIp")),
+        (0, true, Some("gzip"), Some("gzip")),
+        (0, true, Some("gzip"), Some("br")),
+        (0, true, Some("br"), Some("gzip, br")),
+        (0, true, Some("br"), Some("zstd")),
+        (0, true, Some("br"), Some("dcz")),
+        (0, true, Some("br"), Some("nonsense")),
+        (0, true, None, Some("gzip")),
+        (0, true, Some("gzip"), None),
+        (0, false, Some("br"), Some("gzip")),
+        (6, false, Some("br"), Some("gzip")),
+        (6, true, Some("br"), Some("gzip")),
+        (6, true, Some("gzip"), None),
+        (6, true, None, None),
+        (0, false, None, None),
+    ] {
+        let mut ctx = ctx_for_test(level, decompress, accept_encoding);
+        let mut resp = resp_for_test(200, content_encoding);
+        let predicted = ctx.will_decompress(&resp);
+
+        ctx.response_header_filter(&mut resp, false);
+        let decompressed = resp.headers.get(http::header::CONTENT_ENCODING).is_none()
+            && resp
+                .headers
+                .get(http::header::TRANSFER_ENCODING)
+                .is_some_and(|te| te.as_bytes() == b"chunked");
+
+        assert_eq!(
+            predicted, decompressed,
+            "will_decompress() mismatch for level {level}, decompress {decompress}, \
+             accept-encoding {accept_encoding:?}, content-encoding {content_encoding:?}"
+        );
+    }
+}
+
 use once_cell::sync::Lazy;
 use regex::Regex;
 
@@ -701,6 +1023,13 @@ fn compressible(resp: &ResponseHeader) -> bool {
     }
 }
 
+/// Header name for the Available-Dictionary request header ([RFC 9842]).
+/// TODO: Replace with http::header when available.
+///
+/// [RFC 9842]: https://datatracker.ietf.org/doc/html/rfc9842
+static AVAILABLE_DICTIONARY: http::HeaderName =
+    http::HeaderName::from_static("available-dictionary");
+
 // add Vary header with the specified value or extend an existing Vary header value
 fn add_vary_header(resp: &mut ResponseHeader, value: &http::header::HeaderName) {
     use http::header::{HeaderValue, VARY};
@@ -709,24 +1038,7 @@ fn add_vary_header(resp: &mut ResponseHeader, value: &http::header::HeaderName) 
         existing
             .as_bytes()
             .split(|b| *b == b',')
-            .map(|mut v| {
-                // This is equivalent to slice.trim_ascii() which is unstable
-                while let [first, rest @ ..] = v {
-                    if first.is_ascii_whitespace() {
-                        v = rest;
-                    } else {
-                        break;
-                    }
-                }
-                while let [rest @ .., last] = v {
-                    if last.is_ascii_whitespace() {
-                        v = rest;
-                    } else {
-                        break;
-                    }
-                }
-                v
-            })
+            .map(|v| v.trim_ascii())
             .any(|v| v == b"*" || v.eq_ignore_ascii_case(value.as_ref()))
     });
 
@@ -925,4 +1237,236 @@ fn test_adjust_response_header() {
     header.insert_header("etag", "abc123").unwrap();
     adjust_response_header(&mut header, &Compress(Gzip), true);
     assert_eq!(header.headers.get("etag").unwrap().as_bytes(), b"abc123");
+}
+
+#[cfg(test)]
+mod tests_dictionary_compression {
+    use super::*;
+
+    const TEST_DICTIONARY: &[u8] = b"The quick brown fox jumps over the lazy dog. \
+        Common HTTP headers: Content-Type, Accept-Encoding, Cache-Control. \
+        JSON patterns: {\"key\": \"value\"}, [\"array\", \"items\"].";
+
+    fn test_dictionary_hash() -> [u8; 32] {
+        let mut hash = [0u8; 32];
+        for (i, byte) in TEST_DICTIONARY.iter().take(32).enumerate() {
+            hash[i] = *byte;
+        }
+        hash
+    }
+
+    #[test]
+    fn set_and_clear_dictionary() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+        assert!(!ctx.has_dictionary());
+
+        ctx.set_dictionary(Bytes::from_static(TEST_DICTIONARY), test_dictionary_hash());
+        assert!(ctx.has_dictionary());
+
+        ctx.clear_dictionary();
+        assert!(!ctx.has_dictionary());
+    }
+
+    #[test]
+    fn dcz_compression_with_dictionary() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+        let hash = test_dictionary_hash();
+        ctx.set_dictionary(Bytes::from_static(TEST_DICTIONARY), hash);
+
+        let mut req = RequestHeader::build("GET", b"/test.js", None).unwrap();
+        req.insert_header("accept-encoding", "dcz, br, gzip")
+            .unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "application/javascript")
+            .unwrap();
+        resp.insert_header("content-length", "1000").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        assert_eq!(
+            resp.headers.get("content-encoding").unwrap().as_bytes(),
+            b"dcz"
+        );
+        // RFC 9842: DCZ responses must vary on Available-Dictionary.
+        assert!(resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
+
+        let input = Bytes::from_static(b"The quick brown fox jumps over the lazy dog again.");
+        let compressed = ctx.response_body_filter(Some(&input), true).unwrap();
+
+        assert!(compressed.len() >= 40);
+        assert_eq!(&compressed[..8], &zstd::DCZ_MAGIC);
+        assert_eq!(&compressed[8..40], &hash);
+    }
+
+    #[test]
+    fn dcz_without_dictionary_no_compression() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+
+        let mut req = RequestHeader::build("GET", b"/test.js", None).unwrap();
+        req.insert_header("accept-encoding", "dcz").unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "application/javascript")
+            .unwrap();
+        resp.insert_header("content-length", "1000").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        // no dictionary set, no compression applied
+        assert!(resp.headers.get("content-encoding").is_none());
+        // No compression → no Vary: available-dictionary.
+        assert!(!resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
+    }
+
+    #[test]
+    fn dcz_no_fallback_without_dictionary() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+
+        let mut req = RequestHeader::build("GET", b"/test.js", None).unwrap();
+        req.insert_header("accept-encoding", "dcz, br, gzip")
+            .unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "application/javascript")
+            .unwrap();
+        resp.insert_header("content-length", "1000").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        // dcz first but no dictionary, no automatic fallback
+        assert!(resp.headers.get("content-encoding").is_none());
+        // No compression → no Vary: available-dictionary.
+        assert!(!resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
+    }
+
+    #[test]
+    fn maybe_compressor_with_dictionary_dcz_only() {
+        let dict_data = DictionaryData {
+            bytes: Bytes::from_static(TEST_DICTIONARY),
+            hash: test_dictionary_hash(),
+        };
+
+        // only Dcz returns a compressor
+        assert!(Algorithm::Dcz
+            .maybe_compressor_with_dictionary(3, &dict_data)
+            .is_some());
+        assert!(Algorithm::Gzip
+            .maybe_compressor_with_dictionary(3, &dict_data)
+            .is_none());
+        assert!(Algorithm::Brotli
+            .maybe_compressor_with_dictionary(3, &dict_data)
+            .is_none());
+        assert!(Algorithm::Zstd
+            .maybe_compressor_with_dictionary(3, &dict_data)
+            .is_none());
+        // level 0 disables
+        assert!(Algorithm::Dcz
+            .maybe_compressor_with_dictionary(0, &dict_data)
+            .is_none());
+    }
+
+    #[test]
+    fn dcz_full_flow() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+        let hash = test_dictionary_hash();
+        ctx.set_dictionary(Bytes::from_static(TEST_DICTIONARY), hash);
+
+        let mut req = RequestHeader::build("GET", b"/app.js", None).unwrap();
+        req.insert_header("accept-encoding", "dcz").unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "application/javascript")
+            .unwrap();
+        resp.insert_header("content-length", "500").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        assert_eq!(
+            resp.headers.get("content-encoding").unwrap().as_bytes(),
+            b"dcz"
+        );
+        assert!(resp.headers.get("content-length").is_none());
+        assert_eq!(
+            resp.headers.get("transfer-encoding").unwrap().as_bytes(),
+            b"chunked"
+        );
+        // RFC 9842: DCZ responses must vary on Available-Dictionary.
+        assert!(resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
+
+        let chunk1 = Bytes::from_static(b"First chunk. ");
+        let output1 = ctx.response_body_filter(Some(&chunk1), false);
+        assert!(output1.is_some());
+
+        let chunk2 = Bytes::from_static(b"Second chunk.");
+        let output2 = ctx.response_body_filter(Some(&chunk2), true);
+        assert!(output2.is_some());
+
+        let (name, total_in, total_out, _) = ctx.get_info().unwrap();
+        assert_eq!(name, "dcz");
+        assert_eq!(total_in, chunk1.len() + chunk2.len());
+        assert!(total_out > 0);
+    }
+
+    #[test]
+    fn regular_compression_no_available_dictionary_vary() {
+        // Gzip compression should produce Vary: Accept-Encoding but NOT
+        // Vary: available-dictionary.
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+
+        let mut req = RequestHeader::build("GET", b"/page.html", None).unwrap();
+        req.insert_header("accept-encoding", "gzip").unwrap();
+        ctx.request_filter(&req);
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "text/html").unwrap();
+        resp.insert_header("content-length", "1000").unwrap();
+        ctx.response_header_filter(&mut resp, false);
+
+        assert_eq!(
+            resp.headers.get("content-encoding").unwrap().as_bytes(),
+            b"gzip"
+        );
+        assert!(resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"accept-encoding"))));
+        assert!(!resp.headers.get_all("vary").iter().any(|v| v
+            .as_bytes()
+            .split(|b| *b == b',')
+            .any(|t| t.trim_ascii().eq_ignore_ascii_case(b"available-dictionary"))));
+    }
+
+    #[test]
+    fn is_header_phase_after_header_and_body_transition() {
+        let mut ctx = ResponseCompressionCtx::new(3, false, false);
+        assert!(ctx.is_header_phase());
+
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("accept-encoding", "gzip").unwrap();
+        ctx.request_filter(&req);
+        assert!(ctx.is_header_phase());
+
+        let mut cont = ResponseHeader::build(100, None).unwrap();
+        ctx.response_header_filter(&mut cont, false);
+        assert!(ctx.is_header_phase());
+
+        let mut resp = ResponseHeader::build(200, None).unwrap();
+        resp.insert_header("content-type", "text/plain").unwrap();
+        resp.insert_header("content-length", "0").unwrap();
+        ctx.response_header_filter(&mut resp, true);
+        assert!(!ctx.is_header_phase());
+    }
 }
