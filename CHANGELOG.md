@@ -4,12 +4,15 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.2.2] - Unreleased
+## [0.2.2] - 2026-09-10
 
 ### Changed
 
 - **Pingora 0.9.0.** `pingora-core`, `pingora-proxy`, `pingora-http` and `pingora-load-balancing` move from 0.8.1 to 0.9.0 (reworked connection pooling with a sharded pool and a real global LRU, HTTP/1.1 downstream pipelining, configurable HTTP/2 windows, per-listener socket buffers, hop-by-hop header sanitisation on upstream requests, stricter request-target validation). The vendored `pingora-core` patch was rebased: upstream now honours per-peer CA bundles in the rustls connector and offers `Acceptor::from_server_config`, so those parts of the patch are gone; what remains is the hand-off listener, the per-connection `ServerConfig` chooser for frontend mTLS, the SNI in `SslDigest`, SAN-constrained upstream verification and the stricter HTTP/1.1 request parser (18 files, ~600 changed lines against pristine 0.9.0).
 - Prometheus moved out of `pingora-core`; the dataplane's `/metrics` service comes from `pingora-prometheus`.
+- **Route propagation 23 ms, was 28 ms.** The compile loop's quiet period drops from 10 ms to 2 ms (`COMPILE_QUIET`); the 100 ms cap on a continuous burst is unchanged. Measured with the gateway-api-bench probe over 200 routes, two interleaved runs each: 28.0 / 27.6 ms mean per route on 0.2.1, 23.0 / 22.2 ms with this change.
+- **The controller no longer reconciles a Gateway API object because of its own status write.** Every status patch came straight back on the kind's watch as an update and cost a second reconcile that found nothing to do (about two Gateway reconciles per route event in the attached-routes bench). Watches on Gateway API kinds now pass an update through only when `metadata.generation`, labels, annotations or the deletion timestamp changed; status-only updates are dropped before the reconciler while the cached copy the reconcilers read still receives every event. Attached-routes bench, 100 routes added and removed: HTTPRoute reconciles 401 → 201, Gateway reconciles 513 → 308, on the same box minutes apart. Core kinds (Service, EndpointSlice, Secret, ConfigMap, Namespace) are unfiltered because the API server does not maintain `generation` for them. Tests: `spec_changes_drops_status_only_applies_and_keeps_spec_changes`, `spec_changes_keeps_metadata_changes_and_deletes`.
+- Crate versions follow the chart (0.2.2).
 - Gateway API v1.6.2 conformance on the rebased build: 130/130 across all five profiles (after the connection-reuse fix below).
 
 ### Fixed

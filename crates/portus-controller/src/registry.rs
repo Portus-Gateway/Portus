@@ -178,6 +178,80 @@ where
     Controller::for_stream(stream, reader)
 }
 
+/// The controller for a Gateway API kind: [`controller`] plus a filter that
+/// drops watch events carrying no change to what a reconcile reads.
+///
+/// Every status write the controller makes comes straight back on the kind's
+/// own watch as an `Apply`, so without the filter each route event cost a
+/// second Gateway reconcile that found nothing to do (the attached-routes bench
+/// reconciled Gateways about twice per route). The filter keys on
+/// `metadata.generation` (the API server bumps it on spec changes only, for
+/// kinds with a status subresource), labels, annotations and whether a
+/// deletion timestamp is set; a status-only or `managedFields`-only update
+/// hashes the same and is skipped. The reflector still sees every event, so
+/// the store the reconcilers read stays current. Only for kinds whose
+/// `generation` is maintained: core kinds without a status subresource
+/// (Service, EndpointSlice, Secret, ConfigMap, Namespace) never bump it, and
+/// the filter would swallow their data changes; they keep [`controller`].
+pub fn spec_controller<K>(client: &kube::Client) -> Controller<K>
+where
+    K: Resource<DynamicType = ()> + Clone + Debug + Send + Sync + DeserializeOwned + 'static,
+{
+    let (reader, writer) = reflector::store::<K>();
+    let stream = spec_changes(
+        reflector::reflector(writer, watcher(Api::<K>::all(client.clone()), watcher::Config::default()))
+            .default_backoff(),
+    )
+    .touched_objects();
+    Controller::for_stream(stream, reader)
+}
+
+/// What a reconcile can observe change on an object short of its spec:
+/// generation stands in for the spec itself.
+fn spec_change_key<K: Resource>(obj: &K) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let meta = obj.meta();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    meta.generation.hash(&mut h);
+    meta.deletion_timestamp.is_some().hash(&mut h);
+    if let Some(labels) = meta.labels.as_ref() {
+        for (k, v) in labels.iter() {
+            (k, v).hash(&mut h);
+        }
+    }
+    if let Some(annotations) = meta.annotations.as_ref() {
+        for (k, v) in annotations.iter() {
+            (k, v).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+/// Drop `Apply`/`InitApply` events whose [`spec_change_key`] matches the last
+/// one seen for the object; pass everything else (deletes, init markers,
+/// errors) through. Deletes forget the object so a recreate is a change.
+pub fn spec_changes<K, S>(stream: S) -> impl futures::Stream<Item = Result<watcher::Event<K>, watcher::Error>>
+where
+    K: Resource<DynamicType = ()> + 'static,
+    S: futures::Stream<Item = Result<watcher::Event<K>, watcher::Error>>,
+{
+    let mut seen: std::collections::HashMap<ObjectRef<K>, u64> = std::collections::HashMap::new();
+    stream.filter_map(move |item| {
+        let keep = match &item {
+            Ok(watcher::Event::Apply(obj)) | Ok(watcher::Event::InitApply(obj)) => {
+                let key = spec_change_key(obj);
+                seen.insert(ObjectRef::from_obj(obj), key) != Some(key)
+            }
+            Ok(watcher::Event::Delete(obj)) => {
+                seen.remove(&ObjectRef::from_obj(obj));
+                true
+            }
+            _ => true,
+        };
+        futures::future::ready(keep.then_some(item))
+    })
+}
+
 /// Run `ctrl` for `kind` with the shared policies and return its reflector
 /// store. `ctrl` arrives with its watches already attached; `gone` says how to
 /// evict a deleted object from the [`ConfigStore`] (None: nothing cached by
@@ -281,6 +355,83 @@ mod tests {
         assert!(evict(&store, Some("ns"), "r"));
         assert!(store.http_routes.is_empty());
         assert!(!evict(&store, Some("ns"), "r"), "second eviction is a no-op");
+    }
+
+    fn gateway(generation: i64, programmed: &str) -> crate::gateway_types::Gateway {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+        let mut gw = crate::gateway_types::Gateway::new("gw", Default::default());
+        gw.metadata = ObjectMeta {
+            name: Some("gw".into()),
+            namespace: Some("ns".into()),
+            generation: Some(generation),
+            ..Default::default()
+        };
+        gw.status = Some(serde_json::from_value(serde_json::json!({
+            "conditions": [{"type": "Programmed", "status": programmed, "reason": "x", "message": "", "lastTransitionTime": "2026-09-10T00:00:00Z"}]
+        }))
+        .expect("status"));
+        gw
+    }
+
+    fn passed(events: Vec<watcher::Event<crate::gateway_types::Gateway>>) -> Vec<String> {
+        futures::executor::block_on(async {
+            spec_changes(futures::stream::iter(events.into_iter().map(Ok)))
+                .map(|e| match e.expect("no errors") {
+                    watcher::Event::Apply(o) => format!("apply gen={}", o.metadata.generation.unwrap_or(0)),
+                    watcher::Event::InitApply(o) => format!("init-apply gen={}", o.metadata.generation.unwrap_or(0)),
+                    watcher::Event::Delete(_) => "delete".to_string(),
+                    watcher::Event::Init => "init".to_string(),
+                    watcher::Event::InitDone => "init-done".to_string(),
+                })
+                .collect()
+                .await
+        })
+    }
+
+    /// The controller's own status write comes back on the watch as an Apply
+    /// with the same generation: it must not cost a reconcile. A spec change
+    /// (generation bump) must.
+    #[test]
+    fn spec_changes_drops_status_only_applies_and_keeps_spec_changes() {
+        use watcher::Event::*;
+        let got = passed(vec![
+            Init,
+            InitApply(gateway(1, "False")),
+            InitDone,
+            Apply(gateway(1, "True")),  // our Programmed write echoed back
+            Apply(gateway(1, "True")),  // attachedRoutes bump, still generation 1
+            Apply(gateway(2, "True")),  // user edited the spec
+            Apply(gateway(2, "False")), // status only again
+        ]);
+        assert_eq!(got, vec!["init", "init-apply gen=1", "init-done", "apply gen=2"]);
+    }
+
+    /// Labels and annotations are read by reconcilers, so a change to either
+    /// passes even at the same generation; a delete always passes and forgets
+    /// the object so that a recreate at the same generation is seen.
+    #[test]
+    fn spec_changes_keeps_metadata_changes_and_deletes() {
+        use watcher::Event::*;
+        let mut relabelled = gateway(1, "True");
+        relabelled.metadata.labels = Some([("team".to_string(), "a".to_string())].into_iter().collect());
+        let mut annotated = gateway(1, "True");
+        annotated.metadata.annotations = Some([("note".to_string(), "b".to_string())].into_iter().collect());
+        let mut deleting = gateway(1, "True");
+        deleting.metadata.deletion_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::now(),
+        ));
+        let got = passed(vec![
+            Apply(gateway(1, "True")),
+            Apply(relabelled),
+            Apply(annotated),
+            Apply(deleting),
+            Delete(gateway(1, "True")),
+            Apply(gateway(1, "True")), // recreated at generation 1
+        ]);
+        assert_eq!(
+            got,
+            vec!["apply gen=1", "apply gen=1", "apply gen=1", "apply gen=1", "delete", "apply gen=1"]
+        );
     }
 
     #[test]
