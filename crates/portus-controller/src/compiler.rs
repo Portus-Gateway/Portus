@@ -1933,7 +1933,7 @@ pub(crate) fn config_fingerprint(config: &CompiledConfig) -> u64 {
 /// Quiet period: after a write the loop waits this long for more writes before
 /// compiling, so a burst arriving a few milliseconds apart compiles once while a
 /// single change still propagates in about this time.
-pub const COMPILE_QUIET: Duration = Duration::from_millis(10);
+pub const COMPILE_QUIET: Duration = Duration::from_millis(2);
 /// Cap on how long writes can keep extending the quiet period: under
 /// continuous churn the loop compiles at least this often.
 pub const COMPILE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -3527,10 +3527,11 @@ mod tests {
             let store = Arc::clone(&store);
             let gw_key = gw_key.clone();
             async move {
-                for i in 0u16..120 {
+                // Writes closer together than COMPILE_QUIET, for ~360 ms.
+                for i in 0u16..360 {
                     let ports: Vec<u16> = (0..=i % 7).map(|p| 80 + p).collect();
                     store.insert_and_notify(&store.gateways, gw_key.clone(), bench_gateway(&ports));
-                    tokio::time::sleep(Duration::from_millis(3)).await;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             }
         });
@@ -3540,7 +3541,7 @@ mod tests {
             compiles += 1;
         }
         churn.await.unwrap();
-        // ~360 ms of writes 3 ms apart: at least one compile per cap window, far fewer than writes.
+        // ~360 ms of writes 1 ms apart: at least one compile per cap window, far fewer than writes.
         assert!(compiles >= 3, "loop starved under churn: {compiles} compiles");
         assert!(compiles <= 12, "quiet period not coalescing: {compiles} compiles");
         handle.abort();

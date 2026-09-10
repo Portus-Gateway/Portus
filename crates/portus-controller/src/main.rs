@@ -56,7 +56,7 @@ use crate::reconcilers::timeout_policy::reconcile_timeout_policy;
 use crate::reconcilers::tls_route::reconcile_tls_route;
 use crate::reconcilers::ReconcileContext;
 use crate::reconcilers::endpointslice::reconcile_endpointslice_inner;
-use crate::registry::{cache_then, controller, gone_map, spawn};
+use crate::registry::{cache_then, controller, gone_map, spawn, spec_controller};
 use crate::store::{ConfigStore, Event, RouteKind};
 use crate::triggers::{backend_tls_policies_for, gateways_for, listener_sets_for, on_events, policies_for, routes_for, PolicyRefs, RouteRefs};
 
@@ -124,7 +124,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `cache_then` so the cache is written before the dependent runs.
     let gc_reader = spawn(
         "GatewayClass",
-        controller::<GatewayClass>(&client),
+        spec_controller::<GatewayClass>(&client),
         reconcile_gateway_class,
         ctx.clone(),
         Some(Arc::new(|store: &ConfigStore, _ns: Option<&str>, name: &str| reconcilers::gateway_class::forget(store, name))),
@@ -135,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // dataplane Service (address publication); everything else (class, routes,
     // ListenerSets, Programmed acks, ReferenceGrants, Namespace labels) arrives
     // as store events.
-    let gw_ctrl = controller::<Gateway>(&client)
+    let gw_ctrl = spec_controller::<Gateway>(&client)
         .owns(Api::<Service>::all(client.clone()), Default::default())
         .owns(Api::<k8s_openapi::api::apps::v1::Deployment>::all(client.clone()), Default::default());
     let gw_reader_for_cm = gw_ctrl.store();
@@ -197,7 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })),
     );
 
-    let ls_ctrl = controller::<ListenerSet>(&client);
+    let ls_ctrl = spec_controller::<ListenerSet>(&client);
     let ls_event_reader = ls_ctrl.store();
     let ls_ctrl = ls_ctrl.reconcile_on(on_events(&ctx.store, ls_event_reader, |event, reader| listener_sets_for(event, &reader.state())));
     let ls_reader = spawn(
@@ -234,7 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let rg_reader = spawn(
         "ReferenceGrant",
-        controller::<ReferenceGrant>(&client),
+        spec_controller::<ReferenceGrant>(&client),
         reconcile_reference_grant,
         ctx.clone(),
         Some(Arc::new(|store: &ConfigStore, ns: Option<&str>, name: &str| {
@@ -283,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // BackendTLSPolicy: re-run when the ConfigMap holding its CA changes, and
     // (as store events) on acks, siblings, and routes using its target Service
     // (ancestors).
-    let btls_ctrl = controller::<BackendTLSPolicy>(&client);
+    let btls_ctrl = spec_controller::<BackendTLSPolicy>(&client);
     let btls_cm_reader = btls_ctrl.store();
     let btls_event_reader = btls_ctrl.store();
     let btls_ctrl = btls_ctrl
@@ -688,7 +688,7 @@ fn route_controller<K>(client: &kube::Client, store: &Arc<ConfigStore>) -> Contr
 where
     K: RouteRefs + std::fmt::Debug + serde::de::DeserializeOwned,
 {
-    let ctrl = controller::<K>(client);
+    let ctrl = spec_controller::<K>(client);
     let reader = ctrl.store();
     ctrl.reconcile_on(on_events(store, reader, |event, reader| routes_for(event, &reader.state())))
 }
@@ -699,7 +699,7 @@ fn policy_controller<K>(client: &kube::Client, store: &Arc<ConfigStore>) -> Cont
 where
     K: PolicyRefs + std::fmt::Debug + serde::de::DeserializeOwned,
 {
-    let ctrl = controller::<K>(client);
+    let ctrl = spec_controller::<K>(client);
     let reader = ctrl.store();
     ctrl.reconcile_on(on_events(store, reader, |event, reader| policies_for(event, &reader.state())))
 }

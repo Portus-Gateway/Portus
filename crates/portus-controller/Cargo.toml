@@ -1,6 +1,6 @@
 [package]
 name = "portus-controller"
-version = "0.1.0"
+version = "0.2.2"
 edition = "2024"
 rust-version.workspace = true
 description = "Kubernetes Gateway API controller for Portus"
