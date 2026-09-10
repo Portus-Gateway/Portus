@@ -1,5 +1,7 @@
 # Portus 0.2.1 vs agentgateway v1.5.0, clean box (2026-09-10)
 
+> Superseded for the README by `head-to-head-0.2.2-2026-09-10-k3d.md` (Portus 0.2.2, same day, quieter box).
+
 Both implementations on the same fresh k3d cluster in one session, one implementation at a time,
 same backend pods, `kubectl top` sampled every 5 s. Docker Desktop 4.83 (Apple silicon, 10 CPUs,
 VM 12 GiB, Resource Saver off), no other cluster or heavy process on the host. Portus **0.2.1 as

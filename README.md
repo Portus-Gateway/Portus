@@ -30,43 +30,47 @@ See the full [conformance report](tests/conformance/conformance-report.yaml).
 ## Performance
 
 Measured with the [howardjohn/gateway-api-bench](https://github.com/howardjohn/gateway-api-bench) method on
-one 10-CPU k3d node (Docker Desktop, Apple silicon) with nothing else running: **Portus 0.2.1 as released** and
+one 10-CPU k3d node (Docker Desktop, Apple silicon) with nothing else running: **Portus 0.2.2 as released** and
 agentgateway v1.5.0 back to back in one session against the same backend pods, load generator in-cluster,
-`kubectl top` sampled every 5 s. Numbers from one machine are only comparable with each other; method, every
-table and the raw-log conventions are in [`benchmarks/`](benchmarks/README.md).
+`kubectl top` sampled every 5 s, host load checked before every ladder. Numbers from one machine are only
+comparable with each other; method, every table and the raw-log conventions are in [`benchmarks/`](benchmarks/README.md).
 
 **Traffic** (empty responses; 3 proxy pods each, Portus limited to 2 Pingora worker threads per pod, agentgateway
 unlimited):
 
-| | Peak QPS | p99 at peak | p99 at fixed 30k QPS | Proxy CPU at 30k QPS |
-|---|---|---|---|---|
-| **Portus** | **125,535** (256 conns) | **7.2 ms** | **1.9 ms** | **2.9 cores** |
-| agentgateway | 94,730 (128 conns) | 6.3 ms | 2.6 ms | 3.1 cores |
+| | Peak QPS | p99 at peak | p99 at fixed 30k QPS | Proxy CPU at 30k QPS | Two generators, 2 × 256 conns |
+|---|---|---|---|---|---|
+| **Portus** | **132,997** (256 conns) | **6.3 ms** | **0.58 ms** | **2.7 cores** | **124,810** |
+| agentgateway | 117,529 (256 conns) | 7.4 ms | 0.70 ms | 3.1 cores | 104,911 |
 
 **Payloads** (fortio echo backend, 64 connections, 10 s per rung, all requests `200`, every connection kept alive;
 QPS, Portus / agentgateway):
 
 | Response size | Download | Upload (POST, echoed) | HTTPS download | HTTP/2 download |
 |---|---|---|---|---|
-| 1 KB | **79,526** / 63,455 | **66,422** / 44,787 | **73,694** / 56,696 | **53,979** / 46,045 |
-| 16 KB | **56,378** / 47,467 | **28,840** / 24,237 | **48,957** / 43,960 | **39,953** / 29,980 |
-| 128 KB | **29,462** / 23,375 | 8,657 / 8,356 | **24,454** / 18,329 | **20,056** / 13,656 |
-| 1 MiB | **5,496** (5.8 GB/s) / 4,597 | 4,650 / 4,484 | **4,506** / 3,237 | **4,051** / 2,082 |
+| 1 KB | **80,293** / 74,666 | 68,510 / 69,993 | **76,524** / 71,293 | 60,749 / 59,199 |
+| 16 KB | 58,138 / 58,509 | 29,220 / **33,119** | 52,487 / 53,138 | 39,813 / **45,186** |
+| 128 KB | 33,717 / 33,973 | 9,270 / **10,000** | 23,461 / **26,043** | 19,210 / **22,224** |
+| 1 MiB | 5,565 (5.8 GB/s) / **6,985** | 5,199 / 5,343 | 3,848 / **5,318** | 3,465 / **4,031** |
+
+Portus leads on small payloads and the two are level through 128 KB on plain HTTP; agentgateway leads on the
+1 MiB rungs and the mid-size TLS/h2 rungs while using 15–25 % more CPU and about twice the memory. Portus's pods
+are capped by their 2-thread worker pools; agentgateway's are not.
 
 **Control plane and availability** (the rest of the gateway-api-bench suite; the bench catch-all route removed
 before the attached-routes and propagation tests):
 
 | Test | Portus | agentgateway |
 |---|---|---|
-| Route propagation, 200 routes | 29 ms per route, controller 112 m CPU / 12 Mi | **14 ms per route**, controller 38 m / 57 Mi |
-| Route changes, 60 flips under load | 0 errors in 86,583 requests | 0 errors in 76,682 requests |
-| Route scale, 500 pods + routes over 10 min | controller 43 m mean, **21 Mi** | controller **18 m** mean, 88 Mi |
-| Backend failover, 1 of 4 endpoints blackholed, no policy | **0.03 % errors** (passive outlier ejection) | 2.1 % errors |
+| Route propagation, 200 routes | 23 ms per route, controller 107 m CPU / 12 Mi | **14 ms per route**, controller 34 m / 136 Mi |
+| Route changes, 60 flips under load | 0 errors in 85,218 requests | 0 errors in 78,562 requests |
+| Route scale, 500 pods + routes over 10 min | controller 44 m mean, **21 Mi** | controller **16 m** mean, 172 Mi |
+| Backend failover, 1 of 4 endpoints blackholed, no policy | **0.025 % errors** (passive outlier ejection) | 2.0 % errors |
 | Backend failover with a Gateway `RetryPolicy` | **0 errors** | not applicable |
 
-Details: [`benchmarks/head-to-head-2026-09-10-k3d.md`](benchmarks/head-to-head-2026-09-10-k3d.md). Reproduce with
-`make bench-backend bench-portus bench-traffic bench-latency bench-download bench-upload bench-https bench-h2` and the
-`bench-*` control-plane targets.
+Details: [`benchmarks/head-to-head-0.2.2-2026-09-10-k3d.md`](benchmarks/head-to-head-0.2.2-2026-09-10-k3d.md).
+Reproduce with `make bench-backend bench-portus bench-traffic bench-latency bench-download bench-upload bench-https
+bench-h2` and the `bench-*` control-plane targets.
 
 ## Quick Start
 
