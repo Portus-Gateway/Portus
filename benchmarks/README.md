@@ -56,9 +56,11 @@ before it starts; `backendfailover` applies Istio and Envoy Gateway policies wha
 implementation (stub CRDs in `deploy/bench/stub-crds.yaml`, namespace `envoy`) and only reports
 per-request results at debug level; `routechange` reuses the `app=backend` selector and must not
 see the failover test's single-port pods (the target deletes them). ListenerSet scale is not
-wired: the tool drives `XListenerSet`, Portus implements `ListenerSet` v1. Results:
-`gateway-api-bench-v2-2026-09-06.md`; the clean-box Portus 0.2.0 run with the payload ladders is
-`portus-0.2.0-clean-box-2026-09-09.md`.
+wired: the tool drives `XListenerSet`, Portus implements `ListenerSet` v1. Results: the
+current head-to-head is `head-to-head-2026-09-10-k3d.md` (Portus 0.2.1 vs agentgateway v1.5.0 on a
+clean box, every table above). Older files: `portus-0.2.0-clean-box-2026-09-09.md` (Portus only),
+`gateway-comparison-2026-09-06-k3d.md` and `gateway-api-bench-v2-2026-09-06.md` (superseded; their
+propagation figures were measured with the catch-all route attached).
 
 Rules that keep the comparison honest:
 
