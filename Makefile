@@ -171,13 +171,13 @@ bench-portus: bench-backend
 	$(MAKE) bench-wait GATEWAYS=bench/portus
 
 # agentgateway (its own chart since kgateway 2.2 stopped bundling it; class `agentgateway`).
+# Replicas and Service type come from the AgentgatewayParameters in agentgateway.yaml.
 AGENTGATEWAY_VERSION ?= v1.5.0
 bench-agentgateway: bench-backend
 	$(MISE) helm upgrade -i --create-namespace --namespace agentgateway-system --version $(AGENTGATEWAY_VERSION) agentgateway-crds oci://cr.agentgateway.dev/charts/agentgateway-crds
 	$(MISE) helm upgrade -i --namespace agentgateway-system --version $(AGENTGATEWAY_VERSION) agentgateway oci://cr.agentgateway.dev/charts/agentgateway --wait
 	$(MISE) kubectl apply -f deploy/bench/agentgateway.yaml
 	$(MAKE) bench-wait GATEWAYS=bench/agentgateway
-	$(MISE) kubectl -n bench scale deploy agentgateway --replicas=$(BENCH_REPLICAS)
 	$(MISE) kubectl -n bench rollout status deploy/agentgateway --timeout=120s
 
 bench-envoy-gateway: bench-backend
@@ -200,21 +200,30 @@ bench-wait:
 	    [ -n "$$addr" ] && [ "$$prog" = "True" ] && { echo "$$gw ready at $$addr"; break; }; sleep 2; \
 	  done; done
 
-# Resolve GATEWAYS to benchtool targets and run the Job, streaming its log to BENCH_RESULTS.
+# Resolve GATEWAYS to benchtool targets and run BENCH_GENERATORS identical Jobs
+# at once, then combine their logs (QPS summed per rung, worst percentiles).
+# On the 10-CPU k3d node one generator is not the ceiling (two gave the same
+# aggregate for Portus, 2026-09-10); two are useful to see how an implementation
+# degrades as client count grows. Check the pods' start times: a generator that
+# cannot be scheduled runs after the first and the sum is meaningless.
+BENCH_GENERATORS ?= 1
 define bench_run
 	@targets=""; for gw in $(GATEWAYS); do ns=$${gw%/*}; name=$${gw#*/}; \
 	  addr=$$($(MISE) kubectl get gateway -n $$ns $$name -o jsonpath='{.status.addresses[0].value}'); \
 	  [ -n "$$addr" ] || { echo "$$gw has no address"; exit 1; }; \
 	  targets="$$targets$${targets:+,}http://$$addr#$$name"; done; \
-	echo "==> targets: $$targets"; \
-	$(MISE) kubectl delete job benchtool -n bench --ignore-not-found --wait=true >/dev/null 2>&1; \
-	BENCH_TARGETS="$$targets" BENCH_ARGS="$(1)" python3 deploy/bench/render-job.py | $(MISE) kubectl apply -f - >/dev/null; \
-	for i in $$(seq 1 60); do phase=$$($(MISE) kubectl get pod -l app.kubernetes.io/name=benchtool -n bench -o jsonpath='{.items[0].status.phase}' 2>/dev/null); \
-	  [ "$$phase" = "Running" ] || [ "$$phase" = "Succeeded" ] || [ "$$phase" = "Failed" ] && break; sleep 1; done; \
+	echo "==> targets: $$targets ($(BENCH_GENERATORS) generators)"; \
+	$(MISE) kubectl delete job -n bench -l app.kubernetes.io/part-of=benchtool --ignore-not-found --wait=true >/dev/null 2>&1; \
 	mkdir -p $(BENCH_RESULTS); out=$(BENCH_RESULTS)/$$(date +%Y%m%d-%H%M%S)-$(2)-$$(echo "$(GATEWAYS)" | tr ' /' '_-').txt; \
 	KUBECTL="$(MISE) kubectl" python3 deploy/bench/sample-top.py $$out.top.tsv 5 & sampler=$$!; \
-	$(MISE) kubectl logs -f job/benchtool -n bench | tee $$out; \
+	for g in $$(seq 1 $(BENCH_GENERATORS)); do \
+	  BENCH_JOB_NAME=benchtool-$$g BENCH_TARGETS="$$targets" BENCH_ARGS="$(1)" python3 deploy/bench/render-job.py | $(MISE) kubectl apply -f - >/dev/null; done; \
+	for g in $$(seq 1 $(BENCH_GENERATORS)); do \
+	  $(MISE) kubectl wait --for=condition=complete job/benchtool-$$g -n bench --timeout=30m >/dev/null 2>&1 || echo "benchtool-$$g did not complete" | tee -a $$out; \
+	  $(MISE) kubectl logs job/benchtool-$$g -n bench > $$out.gen-$$g.txt 2>&1; done; \
 	kill $$sampler 2>/dev/null; wait $$sampler 2>/dev/null; \
+	echo "==> $(BENCH_GENERATORS) generators combined (QPS summed, worst percentiles); per-generator logs in $$out.gen-*.txt" | tee -a $$out; \
+	python3 deploy/bench/sum-generators.py $$out.gen-*.txt | tee -a $$out; \
 	echo "==> resource usage while running (kubectl top, 5 s samples):" | tee -a $$out; \
 	python3 deploy/bench/sample-top.py --summarise $$out.top.tsv | tee -a $$out; echo "==> saved $$out"
 endef
