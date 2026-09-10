@@ -5,6 +5,23 @@ metadata:
 spec:
   controllerName: agentgateway.dev/agentgateway
 ---
+# Per-Gateway proxy shape: 3 replicas (matching the Portus bench template) and a
+# ClusterIP Service, so the load generator reaches the proxy pods directly like
+# it does for every other implementation instead of through the cluster's
+# LoadBalancer hop.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayParameters
+metadata:
+  name: bench
+  namespace: bench
+spec:
+  deployment:
+    spec:
+      replicas: 3
+  service:
+    spec:
+      type: ClusterIP
+---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
@@ -12,6 +29,11 @@ metadata:
   namespace: bench
 spec:
   gatewayClassName: agentgateway
+  infrastructure:
+    parametersRef:
+      group: agentgateway.dev
+      kind: AgentgatewayParameters
+      name: bench
   listeners:
     - name: http
       protocol: HTTP

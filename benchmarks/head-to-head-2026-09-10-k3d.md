@@ -36,6 +36,20 @@ ladder: Portus 1,710 m mean / 3,225 m peak (3 pods), agentgateway 1,848 m / 4,06
 (Portus measured 0.62 ms p99 at 30k the night before on the same box; daytime runs are noisier.
 Compare within this file only.)
 
+### Two load generators at once (same day, fresh cluster, 20 s, both pods verified to run concurrently)
+
+| Load | Portus 0.2.1 QPS | Portus p99 | agentgateway QPS | agentgateway p99 |
+|---|---|---|---|---|
+| 2 × 128 connections | **115,981** | 8.8 ms | 81,039 | 17.4 ms |
+| 2 × 256 connections | **99,214** | 20.0 ms | 60,240 | 35.7 ms |
+
+A second generator does not raise Portus's aggregate above the single-generator ladder (the 10-CPU
+node is saturated by clients, proxies and backends together; Portus pods sat at 3.4 of their 6
+cores), but it shows the shape under more clients: Portus keeps its throughput, agentgateway loses a
+quarter of it. Method trap: with the generator Job requesting 2 CPUs the second one could not be
+scheduled next to Portus's three 2-CPU pods and ran *after* the first, which summed to a bogus 211k;
+the request is now 1 CPU and the run records pod start/end times.
+
 ## Payloads (fortio echo backend, `/echo`, 64 connections, 10 s per rung)
 
 One fortio pod per rung (`make bench-download|upload|https|h2`, `-httpbufferkb 2048`). Every rung
