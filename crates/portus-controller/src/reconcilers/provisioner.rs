@@ -66,6 +66,11 @@ pub struct DataplaneTemplate {
     /// plaintext (`GRPC_TLS_INSECURE=true`, dev only).
     pub grpc_tls_secret: Option<String>,
     pub log_level: String,
+    /// Emit one access-log line per request (`PORTUS_ACCESS_LOG` on the pods).
+    pub access_log: bool,
+    /// Pingora worker threads per pod (`DATAPLANE_THREADS`). None lets the
+    /// dataplane size itself from its cgroup CPU limit or the node's CPU count.
+    pub threads: Option<usize>,
     /// ServiceAccount for dataplane pods. Must exist in every Gateway's
     /// namespace, so it is normally unset (default SA, token automount off).
     pub service_account: Option<String>,
@@ -104,6 +109,8 @@ impl DataplaneTemplate {
             controller_namespace: var("PORTUS_NAMESPACE").unwrap_or_else(|| "portus".into()),
             grpc_tls_secret: var("PORTUS_GRPC_TLS_SECRET"),
             log_level: var("PORTUS_DATAPLANE_LOG_LEVEL").unwrap_or_else(|| "info".into()),
+            access_log: var("PORTUS_DATAPLANE_ACCESS_LOG").is_some_and(|v| parse_bool(&v)),
+            threads: var("PORTUS_DATAPLANE_THREADS").and_then(|v| v.trim().parse().ok()).filter(|n: &usize| *n > 0),
             service_account: var("PORTUS_DATAPLANE_SERVICE_ACCOUNT"),
             cpu_request: var("PORTUS_DATAPLANE_CPU_REQUEST").unwrap_or_else(|| "250m".into()),
             memory_request: var("PORTUS_DATAPLANE_MEMORY_REQUEST").unwrap_or_else(|| "256Mi".into()),
@@ -316,18 +323,9 @@ pub fn desired_service(gw: &GatewayRef, tpl: &DataplaneTemplate) -> Service {
     }
 }
 
-/// Worker threads implied by a Kubernetes CPU quantity (`"250m"`, `"2"`),
-/// rounded up, at least 2 so a blocked task cannot stall the proxy.
-pub fn worker_threads_for(cpu_request: &str) -> usize {
-    let millis: u64 = match cpu_request.strip_suffix('m') {
-        Some(m) => m.trim().parse().unwrap_or(1000),
-        None => cpu_request
-            .trim()
-            .parse::<f64>()
-            .map(|c| (c * 1000.0).round() as u64)
-            .unwrap_or(1000),
-    };
-    (millis.div_ceil(1000) as usize).max(2)
+/// Kubernetes-style boolean from the chart (`"true"`, `"1"`, `"yes"`, `"on"`).
+pub fn parse_bool(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
 }
 
 fn env(name: &str, value: &str) -> EnvVar {
@@ -360,14 +358,14 @@ pub fn desired_deployment(gw: &GatewayRef, tpl: &DataplaneTemplate) -> Deploymen
 
     let mut envs = vec![
         env("RUST_LOG", &tpl.log_level),
-        // Size the proxy's worker pool to the pod's CPU request rather than the
-        // node's CPU count, so many per-Gateway dataplanes on one node do not
-        // oversubscribe it.
-        env("DATAPLANE_THREADS", &worker_threads_for(&tpl.cpu_request).to_string()),
+        env("PORTUS_ACCESS_LOG", if tpl.access_log { "true" } else { "false" }),
         env("CONTROLLER_ADDR", &tpl.controller_addr),
         env("GATEWAY_NAMESPACE", &gw.namespace),
         env("GATEWAY_NAME", &gw.name),
     ];
+    if let Some(threads) = tpl.threads {
+        envs.push(env("DATAPLANE_THREADS", &threads.to_string()));
+    }
     let mut volumes = Vec::new();
     let mut mounts = Vec::new();
     if tpl.grpc_tls_secret.is_some() {
@@ -690,6 +688,8 @@ mod tests {
             controller_namespace: "portus".into(),
             grpc_tls_secret: Some("portus-grpc-tls".into()),
             log_level: "info".into(),
+            access_log: false,
+            threads: None,
             service_account: Some("portus-dataplane".into()),
             cpu_request: "250m".into(),
             memory_request: "256Mi".into(),
@@ -827,7 +827,8 @@ mod tests {
         assert_eq!(envs["GATEWAY_NAME"], "same-namespace");
         assert_eq!(envs["CONTROLLER_ADDR"], "portus-controller.portus:50051");
         assert!(!envs.contains_key("BOUND_PORTS"), "listener ports come from the config stream, not env");
-        assert_eq!(envs["DATAPLANE_THREADS"], "2", "sized from the 250m CPU request, floor 2");
+        assert!(!envs.contains_key("DATAPLANE_THREADS"), "threads are sized by the dataplane unless the chart sets them");
+        assert_eq!(envs["PORTUS_ACCESS_LOG"], "false", "access log off by default");
         assert_eq!(envs["GRPC_TLS_CA"], "/etc/grpc-tls/ca.crt");
         assert!(!envs.contains_key("GRPC_TLS_INSECURE"));
         assert_eq!(
@@ -919,12 +920,30 @@ mod tests {
     }
 
     #[test]
-    fn worker_threads_follow_the_cpu_request() {
-        assert_eq!(worker_threads_for("250m"), 2, "floor of 2");
-        assert_eq!(worker_threads_for("1"), 2);
-        assert_eq!(worker_threads_for("2500m"), 3);
-        assert_eq!(worker_threads_for("4"), 4);
-        assert_eq!(worker_threads_for("nonsense"), 2);
+    fn explicit_threads_and_access_log_reach_the_pod_env() {
+        let mut t = tpl();
+        t.threads = Some(8);
+        t.access_log = true;
+        let dep = desired_deployment(&gw(), &t);
+        let envs: BTreeMap<String, String> = dep.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.value.unwrap_or_default()))
+            .collect();
+        assert_eq!(envs["DATAPLANE_THREADS"], "8");
+        assert_eq!(envs["PORTUS_ACCESS_LOG"], "true");
+    }
+
+    #[test]
+    fn chart_booleans_parse_like_kubernetes() {
+        for v in ["true", "True", "1", "yes", "on", " true "] {
+            assert!(parse_bool(v), "{v}");
+        }
+        for v in ["false", "0", "no", "off", "", "nonsense"] {
+            assert!(!parse_bool(v), "{v}");
+        }
     }
 
     #[test]

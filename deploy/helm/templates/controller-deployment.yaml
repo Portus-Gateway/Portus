@@ -73,6 +73,12 @@ spec:
             {{- end }}
             - name: PORTUS_DATAPLANE_LOG_LEVEL
               value: {{ .Values.dataplane.logLevel | quote }}
+            - name: PORTUS_DATAPLANE_ACCESS_LOG
+              value: {{ .Values.dataplane.accessLog | default false | quote }}
+            {{- if .Values.dataplane.threads }}
+            - name: PORTUS_DATAPLANE_THREADS
+              value: {{ .Values.dataplane.threads | quote }}
+            {{- end }}
             # Per-Gateway dataplane pods run under their namespace's default
             # ServiceAccount with token automount disabled; they need no API access.
             - name: PORTUS_DATAPLANE_CPU_REQUEST

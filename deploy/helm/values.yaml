@@ -46,6 +46,13 @@ dataplane:
     limits:
       memory: 512Mi
   logLevel: info
+  # Per-request access log (one line per request on stderr). Off by default:
+  # at 100k+ requests/s it costs measurable CPU and floods the log pipeline.
+  accessLog: false
+  # Pingora worker threads per dataplane pod. Empty: sized from the pod's cgroup
+  # CPU limit if one is set, else the node's CPU count (the pods have no CPU
+  # limit by default, so they can use spare cores under load).
+  threads: ""
   controllerUrl: ""  # gRPC config stream; auto-generated from the controller Service if empty
   service:
     type: LoadBalancer

@@ -29,36 +29,38 @@ See the full [conformance report](tests/conformance/conformance-report.yaml).
 
 ## Performance
 
-Measured with the [howardjohn/gateway-api-bench](https://github.com/howardjohn/gateway-api-bench) method on
-one 10-CPU k3d node (Docker Desktop, Apple silicon) with nothing else running: **Portus 0.2.2 as released** and
-agentgateway v1.5.0 back to back in one session against the same backend pods, load generator in-cluster,
-`kubectl top` sampled every 5 s, host load checked before every ladder. Numbers from one machine are only
-comparable with each other; method, every table and the raw-log conventions are in [`benchmarks/`](benchmarks/README.md).
+Measured with the [howardjohn/gateway-api-bench](https://github.com/howardjohn/gateway-api-bench) method on a
+10-vCPU Linux VM on an Apple M4 (apple/container machine, k3s, pods at MTU 65485; see
+[`deploy/machine/`](deploy/machine/README.md)): **Portus 0.2.3** and agentgateway v1.5.0, the fastest gateway in that
+benchmark's own ranking, three interleaved rounds each against the same backend pods, fortio in-cluster with one pod
+per rung, `kubectl top` sampled every 5 s. Medians of the three rounds; per-round values, spread and method are in
+[`benchmarks/`](benchmarks/README.md). Numbers from one machine are only comparable with each other.
 
-**Traffic** (empty responses; 3 proxy pods each, Portus limited to 2 Pingora worker threads per pod, agentgateway
-unlimited):
+**Traffic** (bare `GET /`; 3 proxy pods each, agentgateway unlimited):
 
-| | Peak QPS | p99 at peak | p99 at fixed 30k QPS | Proxy CPU at 30k QPS | Two generators, 2 × 256 conns |
-|---|---|---|---|---|---|
-| **Portus** | **132,997** (256 conns) | **6.3 ms** | **0.58 ms** | **2.7 cores** | **124,810** |
-| agentgateway | 117,529 (256 conns) | 7.4 ms | 0.70 ms | 3.1 cores | 104,911 |
+| Connections | Portus QPS | agentgateway QPS | |
+|---|---|---|---|
+| 64 | **116,429** | 96,003 | +21 % |
+| 128 | **123,105** | 101,067 | +22 % |
+| 256 | **126,070** | 89,827 | +40 % |
 
-**Payloads** (fortio echo backend, 64 connections, 10 s per rung, all requests `200`, every connection kept alive;
-QPS, Portus / agentgateway):
+p99 at a fixed 30,000 QPS (benchtool, same machine, same day): **Portus 0.35 ms**, agentgateway 0.82 ms.
+
+**Payloads** (fortio echo backend, 64 connections, 10 s per rung, all requests `200`; QPS, Portus / agentgateway):
 
 | Response size | Download | Upload (POST, echoed) | HTTPS download | HTTP/2 download |
 |---|---|---|---|---|
-| 1 KB | **80,293** / 74,666 | 68,510 / 69,993 | **76,524** / 71,293 | 60,749 / 59,199 |
-| 16 KB | 58,138 / 58,509 | 29,220 / **33,119** | 52,487 / 53,138 | 39,813 / **45,186** |
-| 128 KB | 33,717 / 33,973 | 9,270 / **10,000** | 23,461 / **26,043** | 19,210 / **22,224** |
-| 1 MiB | 5,565 (5.8 GB/s) / **6,985** | 5,199 / 5,343 | 3,848 / **5,318** | 3,465 / **4,031** |
+| 1 KB | **87,722** / 67,598 | **66,089** / 58,495 | **76,997** / 60,088 | **64,172** / 49,453 |
+| 16 KB | **59,257** / 51,562 | **29,578** / 27,940 | **56,831** / 48,295 | **49,448** / 40,279 |
+| 128 KB | **29,954** / 27,136 | 8,160 / 7,922 | **25,357** / 22,294 | **22,431** / 19,641 |
+| 1 MiB | 5,206 / 5,633 | 4,380 / 4,249 | 4,200 / 4,110 | **4,173** / 3,538 |
 
-Portus leads on small payloads and the two are level through 128 KB on plain HTTP; agentgateway leads on the
-1 MiB rungs and the mid-size TLS/h2 rungs while using 15–25 % more CPU and about twice the memory. Portus's pods
-are capped by their 2-thread worker pools; agentgateway's are not.
+Portus leads on 18 of 19 rungs, by 20–40 % on the request path and 13–30 % at 1 KB; the two are level at 1 MiB over
+plain HTTP and TLS, where the shared 10 vCPUs are the limit. Proxy CPU on the payload ladders: Portus 2.0–2.3 cores at
+131 Mi peak, agentgateway 2.3–2.6 cores at 383–456 Mi peak.
 
-**Control plane and availability** (the rest of the gateway-api-bench suite; the bench catch-all route removed
-before the attached-routes and propagation tests):
+**Control plane and availability** (gateway-api-bench suite, Portus 0.2.2 vs agentgateway on Docker Desktop, 2026-09-10;
+the bench catch-all route removed before the attached-routes and propagation tests):
 
 | Test | Portus | agentgateway |
 |---|---|---|
@@ -68,9 +70,10 @@ before the attached-routes and propagation tests):
 | Backend failover, 1 of 4 endpoints blackholed, no policy | **0.025 % errors** (passive outlier ejection) | 2.0 % errors |
 | Backend failover with a Gateway `RetryPolicy` | **0 errors** | not applicable |
 
-Details: [`benchmarks/head-to-head-0.2.2-2026-09-10-k3d.md`](benchmarks/head-to-head-0.2.2-2026-09-10-k3d.md).
-Reproduce with `make bench-backend bench-portus bench-traffic bench-latency bench-download bench-upload bench-https
-bench-h2` and the `bench-*` control-plane targets.
+Details: [`benchmarks/head-to-head-machine-2026-09-11.md`](benchmarks/head-to-head-machine-2026-09-11.md) and
+[`benchmarks/head-to-head-0.2.2-2026-09-10-k3d.md`](benchmarks/head-to-head-0.2.2-2026-09-10-k3d.md). Reproduce with
+`make bench-backend bench-portus bench-traffic-fortio bench-latency bench-download bench-upload bench-https bench-h2` and
+the `bench-*` control-plane targets.
 
 ## Quick Start
 
@@ -82,7 +85,7 @@ kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
 # Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.2 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.3 \
   --namespace portus --create-namespace
 ```
 
@@ -168,7 +171,7 @@ The **proto schema** (`proto/portus/v1/config.proto`) defines the contract betwe
 ### Helm Values
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.2 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.3 \
   --namespace portus --create-namespace \
   --set dataplane.replicasPerGateway=3
 ```
@@ -184,7 +187,9 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `controller.resources` | 100m / 256Mi requests, 512Mi limit | No CPU limit |
 | `dataplane.image.repository` / `.tag` | `ghcr.io/portus-gateway/dataplane` / chart `appVersion` | Dataplane image (the controller provisions the Deployments) |
 | `dataplane.replicasPerGateway` | `2` | Pods per Gateway |
-| `dataplane.resources` | 250m / 256Mi requests, 512Mi limit | The CPU request also sizes the Pingora worker pool |
+| `dataplane.resources` | 250m / 256Mi requests, 512Mi limit | No CPU limit |
+| `dataplane.threads` | `""` | Pingora worker threads per pod; empty sizes from the cgroup CPU limit, else the node's CPU count |
+| `dataplane.accessLog` | `false` | One log line per request (`portus_dataplane::access`) |
 | `dataplane.service.type` | `LoadBalancer` | Per-Gateway Service type; use `ClusterIP` on k3d |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
 | `grpcTls.enabled` | `true` | mTLS on the config stream. The chart generates a CA and controller certificate on first install and keeps them across upgrades; the controller copies the Secret into each Gateway's namespace |

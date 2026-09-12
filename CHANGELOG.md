@@ -4,6 +4,16 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.3] - 2026-09-12
+
+### Changed
+
+- **Dataplane worker threads are no longer capped by the CPU request.** The provisioner used to set `DATAPLANE_THREADS` from `dataplane.resources.requests.cpu` (2 threads for the 2-CPU bench pods), so under load a pod could not use spare cores even though it has no CPU limit. The dataplane now sizes its worker pool from the cgroup CPU limit if one is set, else the node's CPU count; `dataplane.threads` sets it explicitly. The health and metrics services run one thread each instead of a full pool.
+- **Access log off by default.** Every request was logged at `info` on the chart's default log level, one formatted line per request per pod. It is now behind `dataplane.accessLog` (`PORTUS_ACCESS_LOG`) on its own `portus_dataplane::access` target, default off.
+- The upstream keepalive pool cap no longer grows with the thread count: Pingora multiplies the per-thread size by the threads, so the per-thread value is now `2048 / threads` (floor 64) and a pod keeps about 2,048 idle upstream connections whatever its thread count.
+- **Local benchmarking moved off Docker Desktop** to an apple/container machine (`deploy/machine/`): a Kata guest kernel rebuilt with the Kubernetes networking options, an Ubuntu + systemd + k3s rootfs, images built with nerdctl straight into the cluster, a stable node identity, and pods at MTU 65485. `make … PLATFORM=machine` (also `PLATFORM=colima`; `k3d` stays the default). New fortio-driven `bench-traffic-fortio` / `bench-latency-fortio` targets. README performance tables are now the three-round interleaved run on that machine (`benchmarks/head-to-head-machine-2026-09-11.md`); the Docker Desktop 0.2.2 head-to-head stays as the previous record.
+- **HTTP/2 flow-control windows: 1 MiB per stream, 4 MiB per connection**, downstream (h2c and TLS listeners) and upstream (gRPC and h2c backends), instead of the h2 crate's 64 KiB, which made large responses window-bound.
+
 ## [0.2.2] - 2026-09-10
 
 ### Changed

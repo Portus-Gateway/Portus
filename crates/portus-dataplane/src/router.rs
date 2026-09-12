@@ -7,6 +7,7 @@ use pingora_load_balancing::selection::RoundRobin;
 use pingora_load_balancing::LoadBalancer;
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 use hashbrown::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,34 @@ use crate::rate_limiter::AtomicTokenBucket;
 // ---------------------------------------------------------------------------
 
 const HTTPS_DEFAULT_PORT: u16 = 443;
+
+// ---------------------------------------------------------------------------
+// Access log
+// ---------------------------------------------------------------------------
+
+/// One line per request on the `portus_dataplane::access` log target. Off unless
+/// `PORTUS_ACCESS_LOG` says otherwise: at 100k+ requests/s the formatting and the
+/// container log pipeline cost measurable CPU on every worker thread.
+static ACCESS_LOG: AtomicBool = AtomicBool::new(false);
+
+pub fn set_access_log(enabled: bool) {
+    ACCESS_LOG.store(enabled, Ordering::Relaxed);
+}
+
+#[inline]
+pub fn access_log_enabled() -> bool {
+    ACCESS_LOG.load(Ordering::Relaxed)
+}
+
+/// `PORTUS_ACCESS_LOG` value → flag (`true`, `1`, `yes`, `on`; anything else off).
+pub fn access_log_from_env_value(value: Option<&str>) -> bool {
+    value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
+}
+
+/// HTTP/2 flow-control windows for upstream connections (gRPC and h2c
+/// backends): the h2 crate's 64 KiB defaults throttle large responses.
+pub const UPSTREAM_H2_STREAM_WINDOW: u32 = 1 << 20;
+pub const UPSTREAM_H2_CONNECTION_WINDOW: u32 = 4 << 20;
 
 /// Scheme and listener port for a request from the socket it arrived on.
 /// HTTPS connections reach Pingora on the original `:443` socket (handed off by
@@ -1981,6 +2010,10 @@ impl ProxyHttp for Router {
             // silently drop idle connections.
             peer.options.h2_ping_interval = Some(Duration::from_secs(30));
         }
+        if ctx.protocol == BackendProtocol::Grpc || ctx.protocol == BackendProtocol::H2c {
+            peer.options.h2_stream_window_size = Some(UPSTREAM_H2_STREAM_WINDOW);
+            peer.options.h2_connection_window_size = Some(UPSTREAM_H2_CONNECTION_WINDOW);
+        }
 
         // H2C (HTTP/2 cleartext) for backends with appProtocol: kubernetes.io/h2c.
         // Uses HTTP/2 prior knowledge (no upgrade), matching the conformance test
@@ -2118,9 +2151,9 @@ impl ProxyHttp for Router {
                 cl.release();
             }
 
-        // Structured access log — gated to avoid overhead at high RPS.
-        // Use RUST_LOG=portus_dataplane::router=info to enable.
-        if log::log_enabled!(log::Level::Info) {
+        // Access log: off by default, `PORTUS_ACCESS_LOG=true` turns it on
+        // (`dataplane.accessLog` in the chart).
+        if access_log_enabled() {
             let method = session.req_header().method.as_str();
             let path = session.req_header().uri.path();
             let client = session
@@ -2133,6 +2166,7 @@ impl ProxyHttp for Router {
                 })
                 .unwrap_or_else(|| "-".to_string());
             info!(
+                target: "portus_dataplane::access",
                 "{} {} {} {} {} {:.3}s",
                 client, method, path, host, status, duration
             );
@@ -2365,6 +2399,17 @@ pub(crate) fn build_route_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_log_flag_parses_like_the_chart_boolean() {
+        for v in ["true", "True", "1", "yes", "on", " on "] {
+            assert!(access_log_from_env_value(Some(v)), "{v}");
+        }
+        for v in ["false", "0", "off", "", "nonsense"] {
+            assert!(!access_log_from_env_value(Some(v)), "{v}");
+        }
+        assert!(!access_log_from_env_value(None), "unset means off");
+    }
     use crate::types::{BackendProtocol, PathMatchType, PathRule, ProxyRouteSpec};
     use hashbrown::HashMap;
 

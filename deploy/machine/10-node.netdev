@@ -1,0 +1,8 @@
+# Stable node identity: the machine's DHCP address can change between boots,
+# k3s must not advertise it. Flannel also runs on this interface: on a single
+# node the overlay carries nothing, and the pod bridge inherits this MTU instead
+# of the 1280 the vz NIC has (which would make pods run at 1230).
+[NetDev]
+Name=node0
+Kind=dummy
+MTUBytes=65535

@@ -1,0 +1,13 @@
+[Unit]
+Description=BuildKit on k3s containerd (k8s.io namespace)
+After=k3s.service
+Requires=k3s.service
+
+[Service]
+ExecStartPre=/bin/sh -c 'until [ -S /run/k3s/containerd/containerd.sock ]; do sleep 1; done'
+ExecStart=/usr/local/bin/buildkitd --oci-worker=false --containerd-worker=true \
+  --containerd-worker-addr /run/k3s/containerd/containerd.sock --containerd-worker-namespace k8s.io
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

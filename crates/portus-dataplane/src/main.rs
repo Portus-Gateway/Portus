@@ -14,7 +14,7 @@ mod udp_proxy;
 
 use log::{error, info};
 use pingora_core::apps::HttpServerOptions;
-use pingora_core::protocols::http::v2::server::default_h2_options;
+use pingora_core::protocols::http::v2::server::{default_h2_options, H2Options};
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::server::Server;
 use hashbrown::HashMap;
@@ -44,9 +44,10 @@ const HTTPS_HANDOFF_QUEUE: usize = 4096;
 /// container with a CPU limit: several dataplanes on one node would each spawn
 /// node-many threads and oversubscribe it (twelve per-Gateway dataplanes on a
 /// 10-CPU node asked for 120 worker threads, and the resulting scheduling
-/// delays showed up as multi-second stalls). `DATAPLANE_THREADS` (set by the
-/// provisioner from the pod's CPU request) wins; otherwise fall back to the
-/// cgroup v2 CPU quota, then to the node's CPU count.
+/// delays showed up as multi-second stalls). `DATAPLANE_THREADS` (the chart's
+/// `dataplane.threads`, passed through by the provisioner) wins; otherwise the
+/// cgroup v2 CPU quota (a CPU limit), then the node's CPU count. Pods have no
+/// CPU limit by default, so they size like any uncapped proxy on the node.
 fn worker_threads() -> usize {
     let host = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     if let Ok(v) = std::env::var("DATAPLANE_THREADS")
@@ -59,6 +60,28 @@ fn worker_threads() -> usize {
         return n.clamp(1, host);
     }
     host
+}
+
+/// HTTP/2 flow-control windows advertised to downstream clients.
+/// The h2 crate's 64 KiB defaults make large responses window-bound; 1 MiB per
+/// stream and 4 MiB per connection match what hyper-based proxies advertise.
+pub const H2_STREAM_WINDOW: u32 = 1 << 20;
+pub const H2_CONNECTION_WINDOW: u32 = 4 << 20;
+
+/// Pingora's bounded HTTP/2 SETTINGS (max concurrent streams, header-list size)
+/// with the flow-control windows above.
+fn h2_server_options() -> H2Options {
+    let mut options = default_h2_options();
+    options.initial_window_size(H2_STREAM_WINDOW);
+    options.initial_connection_window_size(H2_CONNECTION_WINDOW);
+    options
+}
+
+/// Idle upstream connections to keep per worker thread. Pingora's pool cap is
+/// this times the thread count, so it shrinks as threads grow and the total
+/// stays at about 2,048 idle connections per pod whatever the thread count.
+pub fn keepalive_pool_size_for(threads: usize) -> usize {
+    (2048 / threads.max(1)).max(64)
 }
 
 /// CPU count implied by the cgroup v2 quota (`/sys/fs/cgroup/cpu.max`), rounded
@@ -105,6 +128,9 @@ fn main() {
 
         tracing_log::LogTracer::init().ok();
     }
+    router::set_access_log(router::access_log_from_env_value(
+        std::env::var("PORTUS_ACCESS_LOG").ok().as_deref(),
+    ));
 
     let controller_addr =
         std::env::var("CONTROLLER_ADDR").unwrap_or_else(|_| "portus-controller:50051".to_string());
@@ -270,15 +296,16 @@ fn main() {
     };
 
     let opt = Opt::parse_args();
+    let threads = worker_threads();
     let conf = ServerConf {
-        threads: worker_threads(),
+        threads,
         work_stealing: true,
-        upstream_keepalive_pool_size: 1024,
+        upstream_keepalive_pool_size: keepalive_pool_size_for(threads),
         ..ServerConf::default()
     };
     info!(
-        "server config: {} worker threads, work_stealing=true",
-        conf.threads
+        "server config: {} worker threads, work_stealing=true, keepalive pool {} per thread",
+        conf.threads, conf.upstream_keepalive_pool_size
     );
 
     let mut server = Server::new_with_opt_and_conf(opt, conf);
@@ -294,7 +321,7 @@ fn main() {
         // Bound HTTP/2 SETTINGS advertised to clients (max concurrent streams,
         // decoded header-list size). h2c on a public port must never run with
         // the h2 crate's unbounded defaults — that is a memory-exhaustion vector.
-        app.h2_options = Some(default_h2_options());
+        app.h2_options = Some(h2_server_options());
     }
     // No socket of its own: HTTP listener ports are bound by the listener
     // manager from the Gateway config and handed over here.
@@ -386,7 +413,7 @@ fn main() {
         let mut https_proxy =
             pingora_proxy::http_proxy_service(&server.configuration, https_router);
         if let Some(app) = https_proxy.app_logic_mut() {
-            app.h2_options = Some(default_h2_options());
+            app.h2_options = Some(h2_server_options());
         }
         https_proxy.add_tls_handoff(
             "handoff:https",
@@ -414,15 +441,30 @@ fn main() {
         last_config_time: last_config_time.clone(),
     };
     let mut health_svc = pingora_proxy::http_proxy_service(&server.configuration, health);
+    // Health and metrics answer a few requests a second: one thread each keeps
+    // the worker pools for the proxies.
+    health_svc.threads = Some(1);
     health_svc.add_tcp("0.0.0.0:8081");
     server.add_service(health_svc);
 
     // Prometheus metrics on port 9090 (the provisioner's pods carry the scrape
     // annotations, so this must listen on the pod address, not loopback).
     let mut prom_svc = pingora_prometheus::prometheus_http_service();
+    prom_svc.threads = Some(1);
     prom_svc.add_tcp("0.0.0.0:9090");
     server.add_service(prom_svc);
     info!("Prometheus metrics on :9090");
 
     server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn keepalive_pool_cap_stays_near_2048_per_pod() {
+        assert_eq!(super::keepalive_pool_size_for(2), 1024);
+        assert_eq!(super::keepalive_pool_size_for(10), 204);
+        assert_eq!(super::keepalive_pool_size_for(64), 64, "floor");
+        assert_eq!(super::keepalive_pool_size_for(0), 2048, "no division by zero");
+    }
 }
