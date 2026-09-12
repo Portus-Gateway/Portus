@@ -1,4 +1,26 @@
 MISE        := mise exec --
+# Where the cluster runs. `k3d`: Docker Desktop + k3d (default). `colima`: a
+# Colima vz VM running containerd + k3s (`colima start --vm-type vz --runtime
+# containerd --kubernetes`); images are built with nerdctl straight into the
+# cluster's containerd namespace, so there is no import step, and KUBECONFIG
+# must point at the Colima context (`kubectl config view --minify --flatten
+# --context colima`). Everything else (helm, bench, conformance) is unchanged.
+# `machine`: an apple/container machine built from deploy/machine/Dockerfile
+# (systemd + k3s + nerdctl on k3s's containerd) running a custom guest kernel
+# with the Kubernetes networking options (deploy/machine/README.md). Commands
+# run inside the machine with the repo at the same path (home is shared).
+PLATFORM    ?= k3d
+MACHINE     ?= portus
+ifeq ($(PLATFORM),colima)
+DOCKER      := colima nerdctl -- --namespace k8s.io
+IMPORT_IMAGE = @echo "$(1): built into the cluster's containerd, no import needed"
+else ifeq ($(PLATFORM),machine)
+DOCKER      := container machine run -n $(MACHINE) -w $(CURDIR) --user root docker
+IMPORT_IMAGE = @echo "$(1): built into the cluster's containerd, no import needed"
+else
+DOCKER      := docker
+IMPORT_IMAGE = $(MISE) k3d image import $(1) -c $(K3D_CLUSTER)
+endif
 K3D_CLUSTER ?= portus-local
 # k3s (Kubernetes) version for the local cluster. Gateway API v1.6 CRDs need
 # Kubernetes >= 1.32 (CEL format helpers); track the latest stable k3s.
@@ -21,6 +43,7 @@ DURATION    ?= 30s
 WORKERS     ?= 64
 
 
+.PHONY: bench-traffic-fortio bench-latency-fortio
 .PHONY: all k3d-up k3d-down build-controller build-dataplane build-proxy build deploy conformance-image conformance-run conformance-clean \
        gateway-api-crds clean disk-check disk-report disk-prune \
        bench-backend bench-portus bench-agentgateway bench-envoy-gateway bench-nginx bench-wait bench-traffic bench-latency bench-download bench-upload bench-https bench-h2 bench-teardown \
@@ -87,13 +110,13 @@ k3d-down:
 build: build-controller build-dataplane
 
 build-controller: disk-check
-	docker build -t $(CONTROLLER_IMAGE) -f deploy/docker/Dockerfile.controller .
+	$(DOCKER) build -t $(CONTROLLER_IMAGE) -f deploy/docker/Dockerfile.controller .
 
 build-dataplane: disk-check
-	docker build -t $(DATAPLANE_IMAGE) -f deploy/docker/Dockerfile.dataplane .
+	$(DOCKER) build -t $(DATAPLANE_IMAGE) -f deploy/docker/Dockerfile.dataplane .
 
 build-proxy: disk-check
-	docker build -t $(PROXY_IMAGE) -f deploy/docker/Dockerfile.proxy .
+	$(DOCKER) build -t $(PROXY_IMAGE) -f deploy/docker/Dockerfile.proxy .
 
 build-proxy-linux:
 	docker buildx build --platform linux/amd64 -t $(PROXY_IMAGE)-linux -f deploy/docker/Dockerfile.proxy .
@@ -115,8 +138,8 @@ gateway-api-crds:
 # Dev deploy: one dataplane Deployment + Service per Gateway. Gateway addresses
 # are ClusterIPs, so the conformance suite runs in-cluster (`make conformance-run`).
 deploy: gateway-api-crds disk-check
-	$(MISE) k3d image import $(CONTROLLER_IMAGE) -c $(K3D_CLUSTER)
-	$(MISE) k3d image import $(DATAPLANE_IMAGE) -c $(K3D_CLUSTER)
+	$(call IMPORT_IMAGE,$(CONTROLLER_IMAGE))
+	$(call IMPORT_IMAGE,$(DATAPLANE_IMAGE))
 	$(MISE) helm upgrade --install $(HELM_RELEASE) $(HELM_CHART) \
 		--namespace $(NAMESPACE) \
 		--create-namespace \
@@ -253,6 +276,37 @@ bench-https:
 bench-h2:
 	$(call bench_fortio,h2,http,/echo?size=SIZE,-h2)
 
+# Fortio-driven versions of the benchtool traffic and latency runs: bare
+# `GET /` on the hyper-server backend, one fortio pod per connection rung
+# (BENCH_LADDER) at unlimited QPS, and one fixed-QPS run for the tail. Fortio's
+# per-rung pod gets a fresh scheduling slot each time, which is what makes it
+# steadier than benchtool's single long-running generator on a saturated node.
+bench-traffic-fortio:
+	$(call bench_fortio_conns,traffic-fortio,$(BENCH_LADDER),0,$(BENCH_DURATION))
+bench-latency-fortio:
+	$(call bench_fortio_conns,latency-fortio,$(BENCH_LATENCY_CONNS),$(BENCH_QPS),30)
+
+# $(1) result name, $(2) comma-separated connection counts, $(3) qps (0 = max), $(4) seconds per rung.
+define bench_fortio_conns
+	@mkdir -p $(BENCH_RESULTS); out=$(BENCH_RESULTS)/$$(date +%Y%m%d-%H%M%S)-$(1)-$$(echo "$(GATEWAYS)" | tr ' /' '_-').txt; \
+	echo "# fortio load -c CONNS -qps $(3) -t $(4)s -nocatchup -uniform http://<gateway>/ conns=$(2)" | tee $$out; \
+	KUBECTL="$(MISE) kubectl" python3 deploy/bench/sample-top.py $$out.top.tsv 5 & sampler=$$!; \
+	for gw in $(GATEWAYS); do ns=$${gw%/*}; name=$${gw#*/}; \
+	  addr=$$($(MISE) kubectl get gateway -n $$ns $$name -o jsonpath='{.status.addresses[0].value}'); \
+	  [ -n "$$addr" ] || { echo "$$gw has no address"; exit 1; }; \
+	  for conns in $$(echo "$(2)" | tr ',' ' '); do \
+	    echo "==> $$name conns=$$conns qps=$(3) http://$$addr/" | tee -a $$out; \
+	    $(MISE) kubectl delete pod fortio -n bench --ignore-not-found --wait=true >/dev/null 2>&1; \
+	    $(MISE) kubectl run fortio -n bench --restart=Never --image=$(FORTIO_IMAGE) --overrides='{"spec":{"containers":[{"name":"fortio","image":"$(FORTIO_IMAGE)","args":["load","-quiet","-c","'"$$conns"'","-qps","$(3)","-t","$(4)s","-nocatchup","-uniform","'"http://$$addr/"'"],"resources":{"requests":{"cpu":"2","memory":"256Mi"}}}]}}' >/dev/null; \
+	    $(MISE) kubectl wait pod/fortio -n bench --for=jsonpath='{.status.phase}'=Succeeded --timeout=$$(( $(4) + 90 ))s >/dev/null 2>&1 || echo "fortio pod did not finish" | tee -a $$out; \
+	    $(MISE) kubectl logs fortio -n bench 2>&1 | grep -E 'target 50%|target 90%|target 99%|All done|Sockets used|Code |Aborting|error' | tee -a $$out; \
+	  done; done; \
+	$(MISE) kubectl delete pod fortio -n bench --ignore-not-found --wait=false >/dev/null 2>&1; \
+	kill $$sampler 2>/dev/null; wait $$sampler 2>/dev/null; \
+	echo "==> resource usage while running (kubectl top, 5 s samples):" | tee -a $$out; \
+	python3 deploy/bench/sample-top.py --summarise $$out.top.tsv | tee -a $$out; echo "==> saved $$out"
+endef
+
 # $(1) result name, $(2) scheme, $(3) path, $(4) extra fortio flags; SIZE in
 # the path or flags is replaced by each BENCH_SIZES value. One fortio pod per
 # rung, output appended to one result file per run with a kubectl top summary.
@@ -293,8 +347,8 @@ BENCH_SCALE_ROUTES     ?= 100
 BENCH_SCALE_SECONDS    ?= 300
 
 bench-tools-image: disk-check
-	docker build -t $(BENCH_TOOLS_IMAGE) -f deploy/bench/Dockerfile.tools .
-	$(MISE) k3d image import $(BENCH_TOOLS_IMAGE) -c $(K3D_CLUSTER)
+	$(DOCKER) build -t $(BENCH_TOOLS_IMAGE) -f deploy/bench/Dockerfile.tools .
+	$(call IMPORT_IMAGE,$(BENCH_TOOLS_IMAGE))
 
 # $(1) = tool command line (space separated), $(2) = result name.
 define bench_tool
@@ -377,8 +431,8 @@ CONFORMANCE_RUN   ?= TestConformance
 CONFORMANCE_TIMEOUT ?= 40m
 
 conformance-image: disk-check
-	docker build -t $(CONFORMANCE_IMAGE) -f deploy/conformance/Dockerfile.runner .
-	$(MISE) k3d image import $(CONFORMANCE_IMAGE) -c $(K3D_CLUSTER)
+	$(DOCKER) build -t $(CONFORMANCE_IMAGE) -f deploy/conformance/Dockerfile.runner .
+	$(call IMPORT_IMAGE,$(CONFORMANCE_IMAGE))
 
 conformance-run:
 	-$(MISE) kubectl delete job conformance -n portus-conformance --ignore-not-found --wait=true >/dev/null 2>&1

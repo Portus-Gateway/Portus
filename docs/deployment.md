@@ -24,7 +24,7 @@ kubectl apply --server-side --force-conflicts \
 The chart is published to GHCR as an OCI artifact with every release, and its images (`ghcr.io/portus-gateway/controller`, `ghcr.io/portus-gateway/dataplane`, `linux/amd64` and `linux/arm64`) are tagged with the same version, which the chart pins as its `appVersion`:
 
 ```bash
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.2 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.3 \
   --namespace portus --create-namespace
 ```
 
@@ -69,8 +69,10 @@ The stream between controller and dataplanes carries the compiled routing config
 | `dataplane.image.tag` | `""` (the chart's `appVersion`) | Image tag |
 | `dataplane.image.pullPolicy` | `IfNotPresent` | Image pull policy |
 | `dataplane.replicasPerGateway` | `2` | Pods per Gateway; the PDB keeps one available |
-| `dataplane.resources` | 250m / 256Mi requests, 512Mi memory limit | The CPU request also sizes the Pingora worker pool (`DATAPLANE_THREADS`, at least 2) |
+| `dataplane.resources` | 250m / 256Mi requests, 512Mi memory limit | No CPU limit |
+| `dataplane.threads` | `""` | Pingora worker threads per pod (`DATAPLANE_THREADS`); empty sizes from the cgroup CPU limit if one is set, else the node's CPU count |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
+| `dataplane.accessLog` | `false` | One line per request on the `portus_dataplane::access` target (`PORTUS_ACCESS_LOG`) |
 | `dataplane.controllerUrl` | `""` | `host:port` the dataplanes dial; empty means the controller Service (`<release>-portus-gateway-controller.<namespace>:<grpcPort>`) |
 | `dataplane.service.type` | `LoadBalancer` | Type of every per-Gateway Service; `ClusterIP` on k3d and for in-cluster clients |
 | `dataplane.service.annotations` | `{}` | Annotations on every per-Gateway Service |
