@@ -15,6 +15,7 @@ use log::{info, warn};
 use rama::error::BoxError;
 use rama::extensions::ExtensionsRef;
 use rama::http::body::util::{BodyExt, Full};
+use rama::http::io::upgrade::handle_upgrade;
 use rama::http::{Body, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, StreamingBody, Version};
 use rama::net::address::Host;
 use rama::net::client::{ConnectionError, ConnectionErrorDomain};
@@ -183,8 +184,15 @@ impl ProxyService {
         drop(snap);
         let target = target.into_owned();
         let logged = if access_log_enabled() { Some((req.method().as_str().to_string(), path.into_owned())) } else { None };
+        // HTTP/2 carries the authority in `:authority`, not a `Host` header;
+        // the backend must still see the client's authority, not ours.
+        let authority = if req.headers().contains_key("host") {
+            None
+        } else {
+            req.uri().authority().map(|a| a.to_string())
+        };
 
-        let response = self.forward(req, &plan, peer_ip, target).await;
+        let response = self.forward(req, &plan, peer_ip, target, authority).await;
 
         let status = response.status().as_u16();
         let host_label = plan.service_name.as_ref();
@@ -207,15 +215,41 @@ impl ProxyService {
         response
     }
 
-    async fn forward(&self, req: Request, plan: &Forward, peer_ip: Option<IpAddr>, target: String) -> Response {
+    async fn forward(
+        &self,
+        req: Request,
+        plan: &Forward,
+        peer_ip: Option<IpAddr>,
+        target: String,
+        authority: Option<String>,
+    ) -> Response {
         let Some(pool) = plan.pool.as_ref() else {
             return status_response(StatusCode::INTERNAL_SERVER_ERROR);
         };
+
+        // An HTTP/1 upgrade (WebSocket): once the backend answers 101 the two
+        // upgraded byte streams are joined. The downstream half is only
+        // available after the 101 has been written, so it is taken as a future
+        // now and awaited in a spawned task.
+        let is_upgrade = req.version() <= Version::HTTP_11
+            && req
+                .headers()
+                .get("connection")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
+            && req.headers().contains_key("upgrade");
+        let downstream_upgrade = is_upgrade.then(|| handle_upgrade(&req));
 
         let (parts, body) = req.into_parts();
         let method = parts.method;
         let version = parts.version;
         let mut headers = parts.headers;
+        if let Some(authority) = authority
+            && !headers.contains_key("host")
+            && let Ok(v) = HeaderValue::from_str(&authority)
+        {
+            headers.insert("host", v);
+        }
 
         // Headers the backend sees: forwarded-for, host rewrite and the
         // route's mutations, applied once; retries reuse the result.
@@ -313,6 +347,28 @@ impl ProxyService {
                 }
             }
         };
+
+        if response.status() == StatusCode::SWITCHING_PROTOCOLS
+            && let Some(downstream) = downstream_upgrade
+        {
+            let upstream = handle_upgrade(&response);
+            let service = plan.service_name.clone();
+            tokio::spawn(async move {
+                match tokio::join!(downstream, upstream) {
+                    (Ok(mut down), Ok(mut up)) => {
+                        if let Err(e) = tokio::io::copy_bidirectional(&mut down, &mut up).await {
+                            log::debug!("upgraded connection to {service} ended: {e}");
+                        }
+                    }
+                    (d, u) => warn!(
+                        "upgrade to {service} not completed: downstream {:?}, upstream {:?}",
+                        d.err().map(|e| e.to_string()),
+                        u.err().map(|e| e.to_string())
+                    ),
+                }
+            });
+            return response;
+        }
 
         let mut sink = HeadersMut(response.headers_mut());
         plan.response_headers.apply(&mut sink);
