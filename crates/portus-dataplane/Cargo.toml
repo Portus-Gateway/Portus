@@ -20,7 +20,7 @@ pingora = [
     "dep:async-trait",
 ]
 # The Rama network stack (experimental; compared against pingora).
-rama = ["dep:rama", "dep:x509-parser"]
+rama = ["dep:rama", "dep:x509-parser", "dep:dashmap"]
 
 [dependencies]
 portus-dataplane-core = { path = "../portus-dataplane-core" }
@@ -31,6 +31,7 @@ pingora-prometheus = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 rama = { version = "0.4.0", features = ["http-full", "rustls", "ring"], optional = true }
 x509-parser = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
 tokio = { workspace = true }
 prometheus = { workspace = true }
 log = { workspace = true }

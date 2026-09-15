@@ -66,8 +66,7 @@ pub fn run(boot: Bootstrap) -> ! {
             server
         };
 
-        let client = client::build(exec.clone()).unwrap_or_else(|e| fatal(&format!("rama: upstream client: {e}")));
-        let proxy = Arc::new(ProxyService::new(snapshot, metrics, outliers, client));
+        let proxy = Arc::new(ProxyService::new(snapshot, metrics, outliers, client::Upstream::new(exec.clone())));
 
         let http = http_server(exec.clone()).service(proxy.clone());
         let https = PortTlsAcceptor::new(Arc::new(tls), http_server(exec.clone()).service(proxy));

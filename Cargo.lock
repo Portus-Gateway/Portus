@@ -5074,6 +5074,7 @@ dependencies = [
  "arrayvec",
  "async-trait",
  "bytes",
+ "dashmap 6.2.1",
  "hashbrown 0.17.1",
  "http 1.5.0",
  "log",

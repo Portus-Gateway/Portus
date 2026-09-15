@@ -17,16 +17,16 @@ use rama::extensions::ExtensionsRef;
 use rama::http::body::util::{BodyExt, Full};
 use rama::http::io::upgrade::handle_upgrade;
 use rama::http::{Body, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, StreamingBody, Version};
-use rama::net::address::Host;
+use rama::net::address::{Authority, Host};
+use rama::net::Protocol;
+use rama::net::uri::Uri;
 use rama::net::client::{ConnectionError, ConnectionErrorDomain};
-use rama::net::http::TargetHttpVersion;
 use rama::net::stream::SocketInfo;
 use rama::tls::client::{ServerVerifyMode, TlsClientAuth, TlsServerName, TlsServerVerify};
 use rama::tls::rustls::client::RustlsServerCertVerifier;
 use rama::tls::SecureTransport;
 use rama::Service;
 
-use portus_dataplane_core::h2::{UPSTREAM_H2_CONNECTION_WINDOW, UPSTREAM_H2_STREAM_WINDOW};
 use portus_dataplane_core::metrics::ProxyMetrics;
 use portus_dataplane_core::outlier::Outliers;
 use portus_dataplane_core::plan::{
@@ -36,7 +36,7 @@ use portus_dataplane_core::plan::{
 use portus_dataplane_core::router::{access_log_enabled, should_retry_status, RequestHeaders, SnapshotSlot};
 use portus_dataplane_core::types::BackendProtocol;
 
-use super::client::{Client, UpstreamTlsKey};
+use super::client::{Upstream, UpstreamTarget};
 use super::tls::{client_auth_for, upstream_tls_for};
 
 /// Request bodies up to this size are buffered when the route allows retries,
@@ -92,11 +92,11 @@ pub struct ProxyService {
     snapshot: SnapshotSlot,
     metrics: Arc<ProxyMetrics>,
     outliers: Arc<Outliers>,
-    client: Client,
+    client: Upstream,
 }
 
 impl ProxyService {
-    pub fn new(snapshot: SnapshotSlot, metrics: Arc<ProxyMetrics>, outliers: Arc<Outliers>, client: Client) -> Self {
+    pub fn new(snapshot: SnapshotSlot, metrics: Arc<ProxyMetrics>, outliers: Arc<Outliers>, client: Upstream) -> Self {
         Self { snapshot, metrics, outliers, client }
     }
 }
@@ -114,8 +114,8 @@ impl Service<Request> for ProxyService {
 struct Incoming {
     method: Method,
     version: Version,
-    /// Path plus query as it appeared on the request line.
-    target: String,
+    /// The downstream URI; each attempt takes it with the backend as authority.
+    uri: Uri,
 }
 
 enum AttemptError {
@@ -182,7 +182,6 @@ impl ProxyService {
             Plan::Forward(plan) => plan,
         };
         drop(snap);
-        let target = target.into_owned();
         let logged = if access_log_enabled() { Some((req.method().as_str().to_string(), path.into_owned())) } else { None };
         // HTTP/2 carries the authority in `:authority`, not a `Host` header;
         // the backend must still see the client's authority, not ours.
@@ -192,7 +191,7 @@ impl ProxyService {
             req.uri().authority().map(|a| a.to_string())
         };
 
-        let response = self.forward(req, &plan, peer_ip, target, authority).await;
+        let response = self.forward(req, &plan, peer_ip, authority).await;
 
         let status = response.status().as_u16();
         let host_label = plan.service_name.as_ref();
@@ -220,7 +219,6 @@ impl ProxyService {
         req: Request,
         plan: &Forward,
         peer_ip: Option<IpAddr>,
-        target: String,
         authority: Option<String>,
     ) -> Response {
         let Some(pool) = plan.pool.as_ref() else {
@@ -243,6 +241,7 @@ impl ProxyService {
         let (parts, body) = req.into_parts();
         let method = parts.method;
         let version = parts.version;
+        let uri = parts.uri;
         let mut headers = parts.headers;
         if let Some(authority) = authority
             && !headers.contains_key("host")
@@ -290,7 +289,7 @@ impl ProxyService {
         }
         let retrying = buffered.is_some();
         let mut retries_left = if retrying { plan.max_retries } else { 0 };
-        let incoming = Incoming { method, version, target };
+        let incoming = Incoming { method, version, uri };
 
         let mut response = loop {
             let Some(backend) = pool.select() else {
@@ -402,9 +401,15 @@ impl ProxyService {
         body: Body,
     ) -> Request {
         let use_tls = plan.backend_tls.is_some() || plan.upstream_tls;
-        let scheme = if use_tls { "https" } else { "http" };
-        let target = plan.rewrite_path.as_deref().unwrap_or(&incoming.target);
-        let uri = format!("{scheme}://{backend}{target}");
+        // The downstream URI with the backend as authority: path and query
+        // pass through untouched, no string round-trip. A URL rewrite is the
+        // one case that re-parses.
+        let mut uri = match &plan.rewrite_path {
+            Some(path) => format!("http://{backend}{path}").parse().unwrap_or_else(|_| incoming.uri.clone()),
+            None => incoming.uri.clone(),
+        };
+        uri.set_scheme(if use_tls { Protocol::HTTPS } else { Protocol::HTTP });
+        uri.set_authority(Authority::from(backend));
         let h2 = matches!(plan.protocol, BackendProtocol::Grpc | BackendProtocol::H2c);
         let version = if h2 {
             Version::HTTP_2
@@ -414,29 +419,15 @@ impl ProxyService {
             incoming.version
         };
 
-        let mut req = Request::builder()
-            .method(incoming.method.clone())
-            .uri(uri.as_str())
-            .version(version)
-            .body(body)
-            .unwrap_or_else(|_| Request::new(Body::empty()));
+        let mut req = Request::new(body);
+        *req.method_mut() = incoming.method.clone();
+        *req.uri_mut() = uri;
+        *req.version_mut() = version;
         *req.headers_mut() = headers;
 
         let ext = req.extensions();
-        if h2 {
-            ext.insert(TargetHttpVersion(Version::HTTP_2));
-            ext.insert(rama::http::conn::H2ClientContextParams {
-                init_stream_window_size: Some(UPSTREAM_H2_STREAM_WINDOW),
-                init_connection_window_size: Some(UPSTREAM_H2_CONNECTION_WINDOW),
-                keep_alive_interval: (plan.protocol == BackendProtocol::Grpc).then(|| Duration::from_secs(30)),
-                max_concurrent_streams: (plan.protocol == BackendProtocol::Grpc).then_some(200),
-                ..Default::default()
-            });
-        } else {
-            ext.insert(TargetHttpVersion(Version::HTTP_11));
-        }
+        let mut tls_key: u64 = 0;
         if use_tls {
-            let mut key: u64 = 0;
             let sni = plan.backend_tls.as_ref().map(|b| b.hostname.as_ref()).unwrap_or(plan.upstream_sni.as_ref());
             if !sni.is_empty()
                 && let Ok(host) = Host::try_from(sni)
@@ -450,11 +441,11 @@ impl ProxyService {
                     if let Some(verifier) = &view.verifier {
                         ext.insert(RustlsServerCertVerifier(Arc::clone(verifier)));
                     }
-                    key ^= view.key;
+                    tls_key ^= view.key;
                 }
                 None if !plan.upstream_verify => {
                     ext.insert(TlsServerVerify(ServerVerifyMode::Disable));
-                    key ^= 1;
+                    tls_key ^= 1;
                 }
                 None => {}
             }
@@ -462,10 +453,12 @@ impl ProxyService {
                 if let Some(auth) = client_auth_for(identity).as_ref() {
                     ext.insert(TlsClientAuth(auth.clone()));
                 }
-                key ^= (Arc::as_ptr(identity) as usize as u64).rotate_left(17);
+                tls_key ^= (Arc::as_ptr(identity) as usize as u64).rotate_left(17);
             }
-            ext.insert(UpstreamTlsKey(key));
+            // Plaintext and TLS never share a key even when nothing else differs.
+            tls_key |= 1 << 63;
         }
+        ext.insert(UpstreamTarget { addr: backend, tls: use_tls, tls_key, h2 });
         req
     }
 
