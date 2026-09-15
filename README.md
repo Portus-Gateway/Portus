@@ -166,6 +166,29 @@ The **dataplane** receives the compiled config, builds route maps keyed by `list
 
 The **proto schema** (`proto/portus/v1/config.proto`) defines the contract between controller and dataplane. It carries listeners, route configs, backend refs, filters, TLS certificates, and all the routing metadata needed to reconstruct full Gateway API semantics on the dataplane side.
 
+### Network stacks
+
+Everything the data plane decides — routing, policies, TLS material, endpoint pools, the SNI mux, the L4 and UDP proxies — lives in `portus-dataplane-core` and knows nothing about the proxy framework underneath. The framework is an adapter that extracts a request's facts, asks the core for a plan, and carries it out. Two adapters exist:
+
+| Stack | Status | Select with |
+|---|---|---|
+| [Pingora](https://github.com/cloudflare/pingora) 0.9 | The release stack; every published image and every number above | `dataplane.networkStack: pingora` (default) |
+| [Rama](https://github.com/plabayo/rama) 0.4 | Experimental. Passes the full conformance suite (130/130). Not in release images: build with `DATAPLANE_FEATURES=rama make build-dataplane` | `dataplane.networkStack: rama` |
+
+Rama is there to be compared with Pingora on the same core, benchmarks and conformance suite; a value the image was not built with fails the pod at start with a log line naming it.
+
+Preliminary Rama numbers, one pass on the same 10 vCPU machine as the tables above (3 pods, fortio, 10 s per rung, all requests 200). Not interleaved with a Pingora run, so not a comparison; a single pass on this box carries about ±10 %.
+
+| | 64 / 1 KB | 128 / 16 KB | 256 / 128 KB | 1 MiB |
+|---|---|---|---|---|
+| Traffic (bare `GET /`, by connections) | 133,426 | 151,407 | 151,065 | – |
+| Download (by response size) | 91,887 | 75,911 | 40,908 | 7,969 |
+| Upload (POST, echoed) | 84,287 | 38,009 | 10,430 | 5,673 |
+| HTTPS download | 86,643 | 64,758 | 27,736 | 4,678 |
+| HTTP/2 download | 59,677 | 49,359 | 22,367 | 3,828 |
+
+On that pass the Rama pods used fewer cores than Pingora on bare traffic and about twice as many on the body ladders, with 3 to 8× the memory; that body-path cost is the open item.
+
 ## Configuration
 
 ### Helm Values
@@ -227,7 +250,7 @@ The workspace contains four crates plus the patched `pingora-core`:
 |-------|------|-------------|
 | `portus-controller` | `crates/portus-controller` | Kubernetes controller — reconcilers, config store, compiler, gRPC server |
 | `portus-dataplane-core` | `crates/portus-dataplane-core` | Network-stack-independent data plane — config receiver, route matching, policies, endpoint pools, TLS material, SNI mux, L4/UDP proxies, metrics |
-| `portus-dataplane` | `crates/portus-dataplane` | The data plane binary: network-stack adapters over the core (Pingora today), selected with `PORTUS_NETWORK_STACK` |
+| `portus-dataplane` | `crates/portus-dataplane` | The data plane binary: network-stack adapters over the core (Pingora; Rama behind the `rama` feature), selected with `PORTUS_NETWORK_STACK` |
 | `portus-types` | `crates/portus-types` | Protobuf-generated types shared between controller and dataplane |
 
 Release builds use `opt-level = 3`, fat LTO, single codegen unit, and `panic = abort` for minimal binary size.
