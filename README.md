@@ -177,17 +177,17 @@ Everything the data plane decides — routing, policies, TLS material, endpoint 
 
 Rama is there to be compared with Pingora on the same core, benchmarks and conformance suite; a value the image was not built with fails the pod at start with a log line naming it.
 
-Preliminary Rama numbers, one pass on the same 10 vCPU machine as the tables above (3 pods, fortio, 10 s per rung, all requests 200). Not interleaved with a Pingora run, so not a comparison; a single pass on this box carries about ±10 %.
+Preliminary Rama numbers: medians of two rounds on the same 10 vCPU machine as the tables above, each round interleaved with a Pingora round (3 pods each, fortio, 10 s per rung, all requests 200). The box was not quiet for the whole second round, so treat differences under 10 % as noise.
 
 | | 64 / 1 KB | 128 / 16 KB | 256 / 128 KB | 1 MiB |
 |---|---|---|---|---|
-| Traffic (bare `GET /`, by connections) | 133,426 | 151,407 | 151,065 | – |
-| Download (by response size) | 91,887 | 75,911 | 40,908 | 7,969 |
-| Upload (POST, echoed) | 84,287 | 38,009 | 10,430 | 5,673 |
-| HTTPS download | 86,643 | 64,758 | 27,736 | 4,678 |
-| HTTP/2 download | 59,677 | 49,359 | 22,367 | 3,828 |
+| Traffic (bare `GET /`, by connections) | 134,257 | 148,565 | 147,858 | – |
+| Download (by response size) | 91,000 | 74,174 | 40,925 | 7,540 |
+| Upload (POST, echoed) | 81,593 | 37,317 | 10,032 | 5,508 |
+| HTTPS download | 84,723 | 66,064 | 30,026 | 5,623 |
+| HTTP/2 download | 67,038 | 53,590 | 24,754 | 4,618 |
 
-On that pass the Rama pods used fewer cores than Pingora on bare traffic and about twice as many on the body ladders, with 3 to 8× the memory; that body-path cost is the open item.
+Against Pingora in the same rounds: level on bare traffic and HTTP/2, 7 to 18 % ahead on the download, upload and HTTPS body rungs. CPU was level on every ladder (within ±10 %); memory means were similar, with Rama's peaks higher on upload and HTTPS (450 to 530 Mi against 320 to 360 Mi) and lower on HTTP/2.
 
 ## Configuration
 
