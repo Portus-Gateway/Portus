@@ -70,7 +70,8 @@ The stream between controller and dataplanes carries the compiled routing config
 | `dataplane.image.pullPolicy` | `IfNotPresent` | Image pull policy |
 | `dataplane.replicasPerGateway` | `2` | Pods per Gateway; the PDB keeps one available |
 | `dataplane.resources` | 250m / 256Mi requests, 512Mi memory limit | No CPU limit |
-| `dataplane.threads` | `""` | Pingora worker threads per pod (`DATAPLANE_THREADS`); empty sizes from the cgroup CPU limit if one is set, else the node's CPU count |
+| `dataplane.threads` | `""` | Proxy worker threads per pod (`DATAPLANE_THREADS`); empty sizes from the cgroup CPU limit if one is set, else the node's CPU count |
+| `dataplane.networkStack` | `pingora` | Network stack the dataplane pods serve on (`PORTUS_NETWORK_STACK`). `pingora` is the release stack; any other value selects an experimental stack built into the image and exists for side-by-side comparison, not production. A value the image does not carry fails the pod at start with a log line naming it |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
 | `dataplane.accessLog` | `false` | One line per request on the `portus_dataplane::access` target (`PORTUS_ACCESS_LOG`) |
 | `dataplane.controllerUrl` | `""` | `host:port` the dataplanes dial; empty means the controller Service (`<release>-portus-gateway-controller.<namespace>:<grpcPort>`) |

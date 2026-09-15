@@ -1,0 +1,37 @@
+[package]
+name = "portus-dataplane-core"
+version = "0.2.3"
+edition = "2024"
+rust-version.workspace = true
+description = "Network-stack-independent core of the Portus data plane: config stream, route matching, policies, TLS material, L4/UDP proxies"
+license = "Apache-2.0"
+repository = "https://github.com/Portus-Gateway/Portus"
+keywords = ["proxy", "gateway-api", "networking"]
+categories = ["network-programming"]
+
+[dependencies]
+portus-types = { path = "../portus-types" }
+arc-swap = { workspace = true }
+tonic = { workspace = true }
+tokio = { workspace = true }
+prometheus = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+x509-parser = { workspace = true }
+notify = { workspace = true }
+regex = { workspace = true }
+hashbrown = { workspace = true }
+dashmap = "6"
+bcrypt = "0.19"
+subtle = "2"
+ipnet = "2"
+rcgen = "0.14"
+zeroize = { version = "1", features = ["derive"] }

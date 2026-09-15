@@ -23,14 +23,14 @@ use crate::config_receiver::{apply_config, validate_config, ProxyState};
 
 /// Top-level standalone configuration.
 #[derive(Debug, Deserialize)]
-pub(crate) struct StandaloneConfig {
+pub struct StandaloneConfig {
     #[serde(default)]
     pub listeners: Vec<YamlListener>,
 }
 
 /// A listener defines a port, protocol, optional TLS, and a set of routes.
 #[derive(Debug, Deserialize)]
-pub(crate) struct YamlListener {
+pub struct YamlListener {
     pub port: u32,
     #[serde(default = "default_protocol")]
     pub protocol: String,
@@ -49,14 +49,14 @@ fn default_protocol() -> String {
 
 /// TLS configuration for an HTTPS listener.
 #[derive(Debug, Deserialize)]
-pub(crate) struct YamlListenerTls {
+pub struct YamlListenerTls {
     pub cert_file: String,
     pub key_file: String,
 }
 
 /// A route matches requests by host/path/headers and forwards to backends.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlRoute {
+pub struct YamlRoute {
     #[serde(default)]
     pub hosts: Vec<String>,
     #[serde(default)]
@@ -104,7 +104,7 @@ pub(crate) struct YamlRoute {
 
 /// Path matching rule.
 #[derive(Debug, Deserialize)]
-pub(crate) struct YamlPathRule {
+pub struct YamlPathRule {
     pub path: String,
     #[serde(default = "default_path_type", rename = "type")]
     pub match_type: String,
@@ -116,7 +116,7 @@ fn default_path_type() -> String {
 
 /// A backend endpoint with optional weight.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct YamlBackend {
+pub struct YamlBackend {
     pub address: String,
     #[serde(default = "default_weight")]
     pub weight: u32,
@@ -128,7 +128,7 @@ fn default_weight() -> u32 {
 
 /// Header match rule for request routing.
 #[derive(Debug, Deserialize)]
-pub(crate) struct YamlHeaderMatch {
+pub struct YamlHeaderMatch {
     pub name: String,
     #[serde(default)]
     pub value: String,
@@ -142,7 +142,7 @@ fn default_match_type() -> String {
 
 /// Query parameter match rule.
 #[derive(Debug, Deserialize)]
-pub(crate) struct YamlQueryParamMatch {
+pub struct YamlQueryParamMatch {
     pub name: String,
     #[serde(default)]
     pub value: String,
@@ -152,7 +152,7 @@ pub(crate) struct YamlQueryParamMatch {
 
 /// Redirect configuration.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlRedirect {
+pub struct YamlRedirect {
     #[serde(default)]
     pub scheme: Option<String>,
     #[serde(default)]
@@ -173,7 +173,7 @@ fn default_redirect_status() -> u32 {
 
 /// URL rewrite configuration.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlRewrite {
+pub struct YamlRewrite {
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
@@ -184,7 +184,7 @@ pub(crate) struct YamlRewrite {
 
 /// Timeout configuration.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlTimeouts {
+pub struct YamlTimeouts {
     #[serde(default)]
     pub request_ms: Option<u64>,
     #[serde(default)]
@@ -195,7 +195,7 @@ pub(crate) struct YamlTimeouts {
 
 /// Retry configuration.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlRetries {
+pub struct YamlRetries {
     #[serde(default)]
     pub max: Option<u32>,
     /// Connection-time conditions: `connect-failure`, `gateway-error`.
@@ -209,7 +209,7 @@ pub(crate) struct YamlRetries {
 
 /// Rate limiting configuration.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlRateLimit {
+pub struct YamlRateLimit {
     #[serde(default)]
     pub requests_per_second: u32,
     #[serde(default)]
@@ -218,7 +218,7 @@ pub(crate) struct YamlRateLimit {
 
 /// Circuit breaker configuration.
 #[derive(Debug, Deserialize)]
-pub(crate) struct YamlCircuitBreaker {
+pub struct YamlCircuitBreaker {
     #[serde(default = "default_failure_threshold")]
     pub failure_threshold: u32,
     #[serde(default = "default_success_threshold")]
@@ -239,7 +239,7 @@ fn default_cb_timeout() -> u32 {
 
 /// Authentication configuration.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlAuth {
+pub struct YamlAuth {
     #[serde(default)]
     pub basic: Option<YamlBasicAuth>,
     #[serde(default)]
@@ -248,7 +248,7 @@ pub(crate) struct YamlAuth {
 
 /// HTTP Basic authentication.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlBasicAuth {
+pub struct YamlBasicAuth {
     #[serde(default = "default_realm")]
     pub realm: String,
     #[serde(default)]
@@ -261,7 +261,7 @@ fn default_realm() -> String {
 
 /// API key authentication.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlApiKeyAuth {
+pub struct YamlApiKeyAuth {
     #[serde(default = "default_api_key_header")]
     pub header: String,
     #[serde(default)]
@@ -274,7 +274,7 @@ fn default_api_key_header() -> String {
 
 /// CORS configuration.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlCors {
+pub struct YamlCors {
     #[serde(default)]
     pub allow_origins: Vec<String>,
     #[serde(default)]
@@ -291,7 +291,7 @@ pub(crate) struct YamlCors {
 
 /// IP allowlist/denylist configuration.
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlIpAllowlist {
+pub struct YamlIpAllowlist {
     #[serde(default)]
     pub allow: Vec<String>,
     #[serde(default)]
@@ -302,7 +302,7 @@ pub(crate) struct YamlIpAllowlist {
 
 /// Header mutation (add/set/remove).
 #[derive(Debug, Default, Deserialize)]
-pub(crate) struct YamlHeaderMutation {
+pub struct YamlHeaderMutation {
     #[serde(default)]
     pub add: HashMap<String, String>,
     #[serde(default)]
@@ -313,7 +313,7 @@ pub(crate) struct YamlHeaderMutation {
 
 /// Request mirroring configuration.
 #[derive(Debug, Deserialize)]
-pub(crate) struct YamlMirror {
+pub struct YamlMirror {
     pub address: String,
     #[serde(default = "default_mirror_percent")]
     pub percent: u32,
@@ -367,7 +367,7 @@ fn parse_backend_address(addr: &str) -> Result<(String, u16), String> {
 
 /// Convert a `StandaloneConfig` into a `portus_types::CompiledConfig`.
 #[allow(deprecated)] // mirror_backend (field 21) must be explicitly None in the struct literal
-pub(crate) fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::CompiledConfig, String> {
+pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::CompiledConfig, String> {
     let mut proto = portus_types::CompiledConfig {
         schema_version: "1.0.0".to_string(),
         version: 1,
@@ -709,7 +709,7 @@ fn build_header_mutation(mutation: &Option<YamlHeaderMutation>) -> Option<portus
 // ---------------------------------------------------------------------------
 
 /// Parse a YAML config file, convert to `CompiledConfig`, validate, and apply.
-pub(crate) fn load_and_apply(path: &str, state: &ProxyState) -> Result<(), String> {
+pub fn load_and_apply(path: &str, state: &ProxyState) -> Result<(), String> {
     let yaml_str = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read config file '{}': {}", path, e))?;
 
@@ -739,7 +739,7 @@ pub(crate) fn load_and_apply(path: &str, state: &ProxyState) -> Result<(), Strin
 ///
 /// Uses the `notify` crate to watch the parent directory (handles atomic
 /// renames). Debounces events by 500ms to avoid rapid reloads.
-pub(crate) fn watch_config_file(path: &str, state: std::sync::Arc<ProxyState>) {
+pub fn watch_config_file(path: &str, state: std::sync::Arc<ProxyState>) {
     use notify::{RecursiveMode, Watcher};
     use std::sync::mpsc;
     use std::time::{Duration, Instant};

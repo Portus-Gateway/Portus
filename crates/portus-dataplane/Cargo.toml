@@ -3,51 +3,44 @@ name = "portus-dataplane"
 version = "0.2.3"
 edition = "2024"
 rust-version.workspace = true
-description = "Pingora-based data plane for Portus Kubernetes Gateway API proxy"
+description = "Portus data plane: the network-stack adapters (Pingora) over portus-dataplane-core"
 license = "Apache-2.0"
 repository = "https://github.com/Portus-Gateway/Portus"
 keywords = ["proxy", "gateway-api", "pingora", "networking"]
 categories = ["network-programming"]
 
+[features]
+default = ["pingora"]
+# The Pingora network stack (the release stack).
+pingora = [
+    "dep:pingora-core",
+    "dep:pingora-proxy",
+    "dep:pingora-http",
+    "dep:pingora-prometheus",
+    "dep:async-trait",
+]
+
 [dependencies]
-portus-types = { path = "../portus-types" }
-pingora-core = { workspace = true }
-pingora-proxy = { workspace = true }
-pingora-http = { workspace = true }
-pingora-load-balancing = { workspace = true }
-pingora-prometheus = { workspace = true }
-arc-swap = { workspace = true }
-tonic = { workspace = true }
+portus-dataplane-core = { path = "../portus-dataplane-core" }
+pingora-core = { workspace = true, optional = true }
+pingora-proxy = { workspace = true, optional = true }
+pingora-http = { workspace = true, optional = true }
+pingora-prometheus = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
-prost = { workspace = true }
-prost-types = { workspace = true }
 prometheus = { workspace = true }
-async-trait = { workspace = true }
 log = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-log = { workspace = true }
 mimalloc = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-serde_yaml_ng = { workspace = true }
-futures = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 rustls = { workspace = true }
+hashbrown = { workspace = true }
+arrayvec = "0.7"
+rand = "0.10"
+
+[dev-dependencies]
 tokio-rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rustls-pki-types = { workspace = true }
-x509-parser = { workspace = true }
-notify = { workspace = true }
-regex = { workspace = true }
-hashbrown = { workspace = true }
-arcstr = { workspace = true }
-arrayvec = "0.7"
-dashmap = "6"
-bcrypt = "0.19"
-subtle = "2"
-ipnet = "2"
-rcgen = "0.14"
-rand = "0.10"
-zeroize = { version = "1", features = ["derive"] }

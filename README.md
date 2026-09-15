@@ -188,7 +188,8 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `dataplane.image.repository` / `.tag` | `ghcr.io/portus-gateway/dataplane` / chart `appVersion` | Dataplane image (the controller provisions the Deployments) |
 | `dataplane.replicasPerGateway` | `2` | Pods per Gateway |
 | `dataplane.resources` | 250m / 256Mi requests, 512Mi limit | No CPU limit |
-| `dataplane.threads` | `""` | Pingora worker threads per pod; empty sizes from the cgroup CPU limit, else the node's CPU count |
+| `dataplane.threads` | `""` | Proxy worker threads per pod; empty sizes from the cgroup CPU limit, else the node's CPU count |
+| `dataplane.networkStack` | `pingora` | Network stack the dataplane pods serve on; other values select an experimental stack built into the image, for comparison only |
 | `dataplane.accessLog` | `false` | One log line per request (`portus_dataplane::access`) |
 | `dataplane.service.type` | `LoadBalancer` | Per-Gateway Service type; use `ClusterIP` on k3d |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
@@ -220,12 +221,13 @@ make build      # controller + dataplane images
 make deploy     # Gateway API CRDs, image import, helm install (ClusterIP Services, one pod per Gateway)
 ```
 
-The workspace contains three crates:
+The workspace contains four crates plus the patched `pingora-core`:
 
 | Crate | Path | Description |
 |-------|------|-------------|
 | `portus-controller` | `crates/portus-controller` | Kubernetes controller — reconcilers, config store, compiler, gRPC server |
-| `portus-dataplane` | `crates/portus-dataplane` | Pingora-based proxy — config receiver, router, TLS, health/metrics |
+| `portus-dataplane-core` | `crates/portus-dataplane-core` | Network-stack-independent data plane — config receiver, route matching, policies, endpoint pools, TLS material, SNI mux, L4/UDP proxies, metrics |
+| `portus-dataplane` | `crates/portus-dataplane` | The data plane binary: network-stack adapters over the core (Pingora today), selected with `PORTUS_NETWORK_STACK` |
 | `portus-types` | `crates/portus-types` | Protobuf-generated types shared between controller and dataplane |
 
 Release builds use `opt-level = 3`, fat LTO, single codegen unit, and `panic = abort` for minimal binary size.

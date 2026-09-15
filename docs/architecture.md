@@ -39,7 +39,7 @@ Portus is a Kubernetes Gateway API implementation built on Cloudflare's Pingora 
                                  |
                                  v
   +----------------------------------------------------------+
-  |                      portus-dataplane                      |
+  |        portus-dataplane (core + network-stack adapter)     |
   |                                                          |
   |  +----------------------------+                          |
   |  | Config Receiver Thread     |                          |

@@ -169,12 +169,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "arcstr"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
-
-[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4519,37 +4513,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pingora-ketama"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21e1baa2fffc859944e0c42d1955412858ac80f1e6ad175c6c3d93693c990d60"
-dependencies = [
- "crc32fast",
-]
-
-[[package]]
-name = "pingora-load-balancing"
-version = "0.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "377e653ba80b73c1f35c16ade085eb5bc5a58cdd92f8e4ff1f967750f6faa654"
-dependencies = [
- "arc-swap",
- "async-trait",
- "derivative",
- "fnv",
- "futures",
- "http 1.5.0",
- "log",
- "pingora-core",
- "pingora-error",
- "pingora-http",
- "pingora-ketama",
- "pingora-runtime",
- "rand 0.8.8",
- "tokio",
-]
-
-[[package]]
 name = "pingora-lru"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4790,30 +4753,44 @@ dependencies = [
 name = "portus-dataplane"
 version = "0.2.3"
 dependencies = [
- "arc-swap",
- "arcstr",
  "arrayvec",
  "async-trait",
+ "bytes",
+ "hashbrown 0.17.1",
+ "http 1.5.0",
+ "log",
+ "mimalloc",
+ "pingora-core",
+ "pingora-http",
+ "pingora-prometheus",
+ "pingora-proxy",
+ "portus-dataplane-core",
+ "prometheus",
+ "rand 0.10.2",
+ "rustls 0.23.43",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls 0.26.5",
+ "tracing-log",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "portus-dataplane-core"
+version = "0.2.3"
+dependencies = [
+ "arc-swap",
  "bcrypt",
  "bytes",
  "dashmap 6.2.1",
- "futures",
  "hashbrown 0.17.1",
  "http 1.5.0",
  "ipnet",
  "log",
- "mimalloc",
  "notify",
- "pingora-core",
- "pingora-http",
- "pingora-load-balancing",
- "pingora-prometheus",
- "pingora-proxy",
  "portus-types",
  "prometheus",
- "prost",
- "prost-types",
- "rand 0.10.2",
  "rcgen",
  "regex",
  "rustls 0.23.43",
@@ -4825,10 +4802,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-rustls 0.26.5",
- "tokio-stream",
  "tonic",
- "tracing-log",
- "tracing-subscriber",
  "x509-parser 0.18.1",
  "zeroize",
 ]

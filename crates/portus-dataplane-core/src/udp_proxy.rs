@@ -1,6 +1,6 @@
 //! UDP proxy (UDPRoute).
 //!
-//! Pingora has no UDP path, so UDP listeners are served here. The listener
+//! UDP listeners are served here, outside the HTTP network stack. The listener
 //! manager binds one `UdpSocket` per UDP listener port in the config (and
 //! releases it when the listener goes away) and runs [`udp_listener_loop`] on
 //! it. Every client, identified by its source address, gets a session: a
@@ -30,7 +30,7 @@ const DEFAULT_UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Upper bound on live sessions per listener port; new clients beyond it are
 /// dropped until sessions expire.
-pub(crate) const MAX_UDP_SESSIONS: usize = 65_536;
+pub const MAX_UDP_SESSIONS: usize = 65_536;
 
 /// Largest UDP payload.
 const DATAGRAM_MAX: usize = 65_535;
@@ -75,7 +75,7 @@ impl Drop for Session {
 }
 
 /// The sessions of one UDP listener port.
-pub(crate) struct Sessions {
+pub struct Sessions {
     start: Instant,
     idle: Duration,
     max: usize,
@@ -83,7 +83,7 @@ pub(crate) struct Sessions {
 }
 
 impl Sessions {
-    pub(crate) fn new(idle: Duration, max: usize) -> Self {
+    pub fn new(idle: Duration, max: usize) -> Self {
         Self {
             start: Instant::now(),
             idle,
@@ -92,7 +92,11 @@ impl Sessions {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> usize {
         self.table.len()
     }
 
@@ -103,7 +107,7 @@ impl Sessions {
     /// Forward one client datagram to its session's backend, opening the
     /// session (weighted backend choice, connected upstream socket, reply pump)
     /// for a peer that has none.
-    pub(crate) async fn forward(
+    pub async fn forward(
         &mut self,
         listener: &Arc<UdpSocket>,
         port: u16,
@@ -179,7 +183,7 @@ impl Sessions {
 
     /// Drop sessions that are dead or idle for longer than the timeout.
     /// Returns how many were removed.
-    pub(crate) fn reap(&mut self) -> usize {
+    pub fn reap(&mut self) -> usize {
         let now = self.now_ms();
         let idle_ms = u64::try_from(self.idle.as_millis()).unwrap_or(u64::MAX);
         let before = self.table.len();
@@ -225,7 +229,7 @@ async fn reply_pump(
 /// its client's session to the backends of the UDPRoute programmed for `port`,
 /// reaping idle sessions once a second. Datagrams arriving before a route is
 /// programmed are dropped.
-pub(crate) async fn udp_listener_loop(
+pub async fn udp_listener_loop(
     socket: Arc<UdpSocket>,
     port: u16,
     l4_config: L4ConfigSlot,
@@ -267,8 +271,7 @@ mod tests {
     use super::*;
     use crate::l4_proxy::{L4Backend, L4Config};
     use arc_swap::ArcSwap;
-    use pingora_load_balancing::selection::RoundRobin;
-    use pingora_load_balancing::{Backend, LoadBalancer};
+    use crate::pool::Pool;
 
     /// A UDP echo server that prefixes replies with its name so tests can tell
     /// backends apart.
@@ -291,9 +294,7 @@ mod tests {
     fn lbs_for(services: &[(&str, u16, SocketAddr)]) -> ServiceLbMap {
         let mut map = HashMap::new();
         for (svc, port, addr) in services {
-            let lb = LoadBalancer::<RoundRobin>::try_from_iter([Backend::new(&addr.to_string()).unwrap()])
-                .unwrap();
-            map.insert((Arc::from(*svc), *port), Arc::new(lb));
+            map.insert((Arc::from(*svc), *port), Arc::new(Pool::new([*addr], None)));
         }
         Arc::new(ArcSwap::from_pointee(map))
     }

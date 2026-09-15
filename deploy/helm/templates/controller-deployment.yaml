@@ -79,6 +79,8 @@ spec:
             - name: PORTUS_DATAPLANE_THREADS
               value: {{ .Values.dataplane.threads | quote }}
             {{- end }}
+            - name: PORTUS_DATAPLANE_NETWORK_STACK
+              value: {{ .Values.dataplane.networkStack | default "pingora" | quote }}
             # Per-Gateway dataplane pods run under their namespace's default
             # ServiceAccount with token automount disabled; they need no API access.
             - name: PORTUS_DATAPLANE_CPU_REQUEST

@@ -4,17 +4,17 @@ use std::time::Instant;
 /// Circuit breaker states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum CircuitState {
+pub enum CircuitState {
     Closed = 0,
     Open = 1,
     HalfOpen = 2,
 }
 
 /// Runtime configuration for a circuit breaker instance.
-pub(crate) struct CircuitBreakerConfig {
-    pub(crate) failure_threshold: u16,
-    pub(crate) success_threshold: u16,
-    pub(crate) timeout_secs: u32,
+pub struct CircuitBreakerConfig {
+    pub failure_threshold: u16,
+    pub success_threshold: u16,
+    pub timeout_secs: u32,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -71,15 +71,15 @@ fn extract_successes(packed: u64) -> u16 {
 /// Follows the standard Closed -> Open -> HalfOpen -> Closed pattern.
 /// State, counters, and timestamps are packed into one atomic word to avoid
 /// locks on the request hot path.
-pub(crate) struct CircuitBreaker {
-    pub(crate) config: CircuitBreakerConfig,
+pub struct CircuitBreaker {
+    pub config: CircuitBreakerConfig,
     state: AtomicU64,
     epoch: Instant,
 }
 
 impl CircuitBreaker {
     /// Create a new circuit breaker in the Closed state with all counters zeroed.
-    pub(crate) fn new(config: CircuitBreakerConfig) -> Self {
+    pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
             state: AtomicU64::new(pack(CircuitState::Closed, 0, 0, 0)),
             config,
@@ -98,7 +98,7 @@ impl CircuitBreaker {
     /// - **Open:** if timeout has elapsed, transitions to HalfOpen and allows
     ///   one probe request; otherwise rejects.
     /// - **HalfOpen:** rejects (only one probe at a time).
-    pub(crate) fn allow_request(&self) -> bool {
+    pub fn allow_request(&self) -> bool {
         // PERF-15: Relaxed load for the Closed fast-path — no synchronization needed
         // when the breaker is closed (the common case). Only re-read with Acquire
         // on the slow path where CAS consistency matters.
@@ -139,7 +139,7 @@ impl CircuitBreaker {
 
     /// Record a successful response. Resets failure count in Closed state,
     /// and transitions HalfOpen -> Closed when success_threshold is met.
-    pub(crate) fn record_success(&self) {
+    pub fn record_success(&self) {
         loop {
             let current = self.state.load(Ordering::Acquire);
             let st = extract_state(current);
@@ -197,7 +197,7 @@ impl CircuitBreaker {
     /// Record a failed response. Increments failure count in Closed state
     /// and transitions to Open when threshold is reached. In HalfOpen state,
     /// immediately transitions back to Open.
-    pub(crate) fn record_failure(&self) {
+    pub fn record_failure(&self) {
         loop {
             let current = self.state.load(Ordering::Acquire);
             let st = extract_state(current);
@@ -252,7 +252,7 @@ impl CircuitBreaker {
     }
 
     /// Read the current circuit state.
-    pub(crate) fn current_state(&self) -> CircuitState {
+    pub fn current_state(&self) -> CircuitState {
         extract_state(self.state.load(Ordering::Acquire))
     }
 }
@@ -261,13 +261,13 @@ impl CircuitBreaker {
 ///
 /// Each call to `try_acquire` atomically increments the counter if below `max`;
 /// `release` decrements it. Used to cap active connections per service.
-pub(crate) struct ConnectionLimiter {
+pub struct ConnectionLimiter {
     active: AtomicU32,
-    pub(crate) max: u32,
+    pub max: u32,
 }
 
 impl ConnectionLimiter {
-    pub(crate) fn new(max: u32) -> Self {
+    pub fn new(max: u32) -> Self {
         Self {
             active: AtomicU32::new(0),
             max,
@@ -275,7 +275,7 @@ impl ConnectionLimiter {
     }
 
     /// Try to acquire a connection slot. Returns true if under the limit.
-    pub(crate) fn try_acquire(&self) -> bool {
+    pub fn try_acquire(&self) -> bool {
         loop {
             let current = self.active.load(Ordering::Acquire);
             if current >= self.max {
@@ -297,7 +297,7 @@ impl ConnectionLimiter {
     ///
     /// Uses a CAS loop to saturate at zero, preventing underflow if `release`
     /// is called without a matching `try_acquire`.
-    pub(crate) fn release(&self) {
+    pub fn release(&self) {
         loop {
             let current = self.active.load(Ordering::Acquire);
             if current == 0 {

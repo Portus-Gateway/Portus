@@ -1,9 +1,6 @@
 use arc_swap::ArcSwap;
 use http::{HeaderName, HeaderValue};
 use log::{info, warn};
-use pingora_load_balancing::health_check::HttpHealthCheck;
-use pingora_load_balancing::selection::RoundRobin;
-use pingora_load_balancing::{Backend, LoadBalancer};
 use hashbrown::HashMap;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
@@ -12,7 +9,11 @@ use std::time::Duration;
 use crate::circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig as InternalCbConfig, ConnectionLimiter,
 };
+use crate::pool::{HealthCheck, Pool};
 use crate::rate_limiter::{AtomicTokenBucket, PerIpRateLimiter};
+use crate::readiness::Readiness;
+use crate::router::ClientIdentity;
+use crate::stack::StackCache;
 use crate::router::{
     listener_specificity, CorsConfig, HeaderMatchEntry, HeaderMatchType, HostRoutes,
     ListenerBucket, PathRoute, ProxySnapshot, QueryParamMatchEntry, QueryParamMatchType,
@@ -24,11 +25,11 @@ use crate::l4_proxy::{L4Config, L4ConfigSlot};
 
 /// A single TLS certificate entry with its associated listener hostname.
 #[derive(Debug, Clone)]
-pub(crate) struct TlsCertEntry {
+pub struct TlsCertEntry {
     /// Listener hostname (e.g., "*.example.com"). Empty = default/catch-all cert.
-    pub(crate) hostname: String,
-    pub(crate) cert_pem: String,
-    pub(crate) key_pem: String,
+    pub hostname: String,
+    pub cert_pem: String,
+    pub key_pem: String,
 }
 
 impl Drop for TlsCertEntry {
@@ -42,15 +43,15 @@ impl Drop for TlsCertEntry {
 /// Frontend client certificate validation for one HTTPS listener port
 /// (Gateway `spec.tls.frontend`, default or per-port override).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PortClientValidation {
-    pub(crate) port: u16,
+pub struct PortClientValidation {
+    pub port: u16,
     /// PEM bundles, one per caCertificateRef.
-    pub(crate) ca_cert_pems: Vec<String>,
-    pub(crate) mode: ClientValidationMode,
+    pub ca_cert_pems: Vec<String>,
+    pub mode: ClientValidationMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum ClientValidationMode {
+pub enum ClientValidationMode {
     /// Reject handshakes without a certificate that chains to a configured CA.
     AllowValidOnly,
     /// Request a certificate but accept the connection without one, or with
@@ -61,7 +62,7 @@ pub(crate) enum ClientValidationMode {
 impl ClientValidationMode {
     /// Parse the Gateway API mode string; anything unknown is treated as the
     /// strict default so a typo never silently disables validation.
-    pub(crate) fn parse(mode: &str) -> Self {
+    pub fn parse(mode: &str) -> Self {
         match mode {
             "AllowInsecureFallback" => Self::AllowInsecureFallback,
             "" | "AllowValidOnly" => Self::AllowValidOnly,
@@ -77,42 +78,42 @@ impl ClientValidationMode {
 /// Contains all HTTPS listener certs for SNI-based selection, plus the
 /// per-port client certificate validation policy.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct TlsCertData {
-    pub(crate) entries: Vec<TlsCertEntry>,
-    pub(crate) client_validation: Vec<PortClientValidation>,
+pub struct TlsCertData {
+    pub entries: Vec<TlsCertEntry>,
+    pub client_validation: Vec<PortClientValidation>,
 }
 
 /// Type alias for the TLS cert data slot.
-pub(crate) type TlsCertSlot = Arc<ArcSwap<Option<TlsCertData>>>;
+pub type TlsCertSlot = Arc<ArcSwap<Option<TlsCertData>>>;
 
 /// Per-(service, port) keyed maps built from the proto config.
-pub(crate) type BackendKey = (Arc<str>, u16);
-pub(crate) type LbMap = HashMap<BackendKey, Arc<LoadBalancer<RoundRobin>>>;
-pub(crate) type LbSignatures = HashMap<BackendKey, u64>;
-pub(crate) type CircuitBreakerMap = HashMap<BackendKey, Arc<CircuitBreaker>>;
-pub(crate) type ConnectionLimiterMap = HashMap<BackendKey, Arc<ConnectionLimiter>>;
+pub type BackendKey = (Arc<str>, u16);
+pub type LbMap = HashMap<BackendKey, Arc<Pool>>;
+pub type LbSignatures = HashMap<BackendKey, u64>;
+pub type CircuitBreakerMap = HashMap<BackendKey, Arc<CircuitBreaker>>;
+pub type ConnectionLimiterMap = HashMap<BackendKey, Arc<ConnectionLimiter>>;
 /// (add, set, remove) header mutations shared across routes.
-pub(crate) type SharedHeaderMutations = (
+pub type SharedHeaderMutations = (
     Arc<Vec<(HeaderName, HeaderValue)>>,
     Arc<Vec<(HeaderName, HeaderValue)>>,
     Arc<Vec<HeaderName>>,
 );
 
 /// Holds all ArcSwap state maps for atomic config application.
-pub(crate) struct ProxyState {
+pub struct ProxyState {
     /// PERF-9: Bundled per-request config snapshot (routes, wildcards, LBs, CB/CL).
-    pub(crate) snapshot: SnapshotSlot,
+    pub snapshot: SnapshotSlot,
     /// Separate LB map for L4 proxy and health check threads.
-    pub(crate) lbs: ServiceLbMap,
-    pub(crate) l4_config: L4ConfigSlot,
+    pub lbs: ServiceLbMap,
+    pub l4_config: L4ConfigSlot,
     /// TLS certificate data from HTTPS listeners. Updated when config changes.
-    pub(crate) tls_cert: TlsCertSlot,
+    pub tls_cert: TlsCertSlot,
     /// Woken after `tls_cert` is replaced so the cert hot-reload thread can
     /// re-parse immediately instead of polling.
-    pub(crate) tls_cert_notify: Arc<tokio::sync::Notify>,
+    pub tls_cert_notify: Arc<tokio::sync::Notify>,
     /// Minimum health check interval (seconds) across all configured backends.
     /// Updated on each config apply; defaults to 10 if no health checks are configured.
-    pub(crate) health_check_min_interval: Arc<AtomicU32>,
+    pub health_check_min_interval: Arc<AtomicU32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +202,7 @@ fn parse_header_mutations_from_proto(
 /// Rate limiter state is preserved from `existing_by_port` / `existing_any_port`
 /// when a matching (port, listener_hostname, route_host) entry exists.
 #[allow(deprecated)] // reads mirror_backend (field 21) from older controllers
-pub(crate) fn build_listener_buckets_from_proto(
+pub fn build_listener_buckets_from_proto(
     routes: &[portus_types::RouteConfig],
     existing_by_port: &HashMap<u16, Vec<ListenerBucket>>,
     existing_any_port: &[ListenerBucket],
@@ -697,7 +698,7 @@ pub(crate) fn build_listener_buckets_from_proto(
 /// Build load balancer map from proto BackendGroup messages.
 /// Fingerprint of everything a `LoadBalancer` is built from: the sorted endpoint
 /// set and the health-check configuration. Order-independent over endpoints.
-pub(crate) fn lb_signature(group: &portus_types::BackendGroup) -> u64 {
+pub fn lb_signature(group: &portus_types::BackendGroup) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut addrs: Vec<(&str, u32)> = group
         .endpoints
@@ -726,7 +727,7 @@ pub(crate) fn lb_signature(group: &portus_types::BackendGroup) -> u64 {
 /// since the previous snapshot is reused rather than rebuilt, so round-robin
 /// position and — more importantly — health-check state survive unrelated
 /// config changes. Returns the new map and its signatures.
-pub(crate) fn build_lb_map_from_proto(
+pub fn build_lb_map_from_proto(
     backends: &[portus_types::BackendGroup],
     existing: &LbMap,
     existing_signatures: &LbSignatures,
@@ -747,66 +748,35 @@ pub(crate) fn build_lb_map_from_proto(
                 continue;
             }
 
-        let ping_backends: Vec<Backend> = group
+        let addrs: Vec<std::net::SocketAddr> = group
             .endpoints
             .iter()
-            .filter_map(|ep| {
-                let addr = format!("{}:{}", ep.address, ep.port);
-                Backend::new(&addr).ok()
-            })
+            .filter_map(|ep| format!("{}:{}", ep.address, ep.port).parse().ok())
             .collect();
-
-        if ping_backends.is_empty() {
+        if addrs.is_empty() {
             continue;
         }
 
-        match LoadBalancer::try_from_iter(ping_backends) {
-            Ok(mut lb) => {
-                // Configure health checking from HealthCheckPolicy if present
-                if let Some(ref hc) = group.health_check {
-                    // TODO: Health checks always use plain HTTP. Backends requiring TLS
-                    // will be probed without encryption. Supporting TLS health checks
-                    // requires adding a `tls` field to HealthCheckConfig in the proto
-                    // and HealthCheckSpec in the CRD, then passing it here.
-                    // Health checks always use plain HTTP (TLS not yet supported).
-                    // Logged at debug level to avoid flooding on every config apply.
-                    let mut check = HttpHealthCheck::new(
-                        &group.service_name,
-                        false, // TLS health checks not yet supported
-                    );
-                    check.consecutive_success = hc.healthy_threshold.max(1) as usize;
-                    check.consecutive_failure = hc.unhealthy_threshold.max(1) as usize;
-                    // Set the path on the request
-                    let path = if hc.path.is_empty() { "/" } else { &hc.path };
-                    if let Ok(req) = http::request::Builder::new()
-                        .method("GET")
-                        .uri(path)
-                        .header("Host", &group.service_name)
-                        .body(())
-                    {
-                        let (parts, _) = req.into_parts();
-                        check.req = pingora_http::RequestHeader::from(parts);
-                    }
-                    check.peer_template.options.connection_timeout =
-                        Some(Duration::from_secs(hc.timeout_secs.max(1) as u64));
-                    check.peer_template.options.read_timeout =
-                        Some(Duration::from_secs(hc.timeout_secs.max(1) as u64));
-                    lb.set_health_check(Box::new(check));
-                    info!(
-                        "configured health check for {}:{} path={} interval={}s",
-                        group.service_name, group.port, path, hc.interval_secs
-                    );
-                }
-                signatures.insert(key.clone(), sig);
-                lb_map.insert(key, Arc::new(lb));
+        // TODO: Health checks always use plain HTTP. Backends requiring TLS
+        // will be probed without encryption. Supporting TLS health checks
+        // requires adding a `tls` field to HealthCheckConfig in the proto
+        // and HealthCheckSpec in the CRD, then passing it here.
+        let health_check = group.health_check.as_ref().map(|hc| {
+            let path = if hc.path.is_empty() { "/".to_string() } else { hc.path.clone() };
+            info!(
+                "configured health check for {}:{} path={} interval={}s",
+                group.service_name, group.port, path, hc.interval_secs
+            );
+            HealthCheck {
+                host: group.service_name.clone(),
+                path,
+                timeout: Duration::from_secs(hc.timeout_secs.max(1) as u64),
+                consecutive_success: hc.healthy_threshold.max(1) as usize,
+                consecutive_failure: hc.unhealthy_threshold.max(1) as usize,
             }
-            Err(e) => {
-                warn!(
-                    "failed to create load balancer for {}:{}: {}",
-                    group.service_name, group.port, e
-                );
-            }
-        }
+        });
+        signatures.insert(key.clone(), sig);
+        lb_map.insert(key, Arc::new(Pool::new(addrs, health_check)));
     }
 
     (lb_map, signatures)
@@ -814,8 +784,8 @@ pub(crate) fn build_lb_map_from_proto(
 
 /// Build backend TLS map from proto BackendGroup messages.
 /// Maps (service_name, port) → BackendTlsInfo for backends with BackendTLSPolicy.
-/// Parses CA PEM certificates into WrappedX509 at config-build time (not per-request).
-pub(crate) fn build_backend_tls_map_from_proto(
+/// Parses CA PEM certificates to DER at config-build time (not per-request).
+pub fn build_backend_tls_map_from_proto(
     backends: &[portus_types::BackendGroup],
 ) -> HashMap<(Arc<str>, u16), Arc<crate::router::BackendTlsInfo>> {
     let mut tls_map = HashMap::new();
@@ -837,12 +807,6 @@ pub(crate) fn build_backend_tls_map_from_proto(
                     continue;
                 }
 
-                // Build WrappedX509 slice from DER certs using the public helper
-                let wrapped: Vec<pingora_core::utils::tls::WrappedX509> = der_certs
-                    .into_iter()
-                    .map(pingora_core::utils::tls::wrapped_x509_from_der)
-                    .collect();
-
                 let key = (
                     Arc::from(group.service_name.as_str()) as Arc<str>,
                     group.port as u16,
@@ -853,7 +817,8 @@ pub(crate) fn build_backend_tls_map_from_proto(
                 tls_map.insert(
                     key,
                     Arc::new(crate::router::BackendTlsInfo {
-                        ca_certs: Arc::from(wrapped.into_boxed_slice()),
+                        ca_certs_der: Arc::new(der_certs),
+                        stack: StackCache::default(),
                         hostname: Arc::from(tls.hostname.as_str()),
                         subject_alt_names: Arc::new(sans),
                     }),
@@ -866,7 +831,7 @@ pub(crate) fn build_backend_tls_map_from_proto(
 /// Frontend client validation per HTTPS listener port. All HTTPS listeners on
 /// a port share one policy (the Gateway API keys it by port); if two disagree
 /// the first wins and the conflict is logged.
-pub(crate) fn client_validation_from_listeners(
+pub fn client_validation_from_listeners(
     listeners: &[portus_types::Listener],
 ) -> Vec<PortClientValidation> {
     let mut out: Vec<PortClientValidation> = Vec::new();
@@ -912,10 +877,10 @@ pub(crate) fn client_validation_from_listeners(
 /// exactly one Gateway, so its slice carries at most one entry; anything else
 /// is a controller bug and is logged and ignored. Parsed once here (PEM → DER)
 /// so `upstream_peer` only clones an `Arc`.
-pub(crate) fn build_backend_client_cert_from_proto(
+pub fn build_backend_client_cert_from_proto(
     config: &portus_types::CompiledConfig,
     gateway: (&str, &str),
-) -> Option<Arc<pingora_core::utils::tls::CertKey>> {
+) -> Option<Arc<ClientIdentity>> {
     let mine: Vec<&portus_types::GatewayBackendTls> = config
         .gateway_backend_tls
         .iter()
@@ -945,12 +910,12 @@ pub(crate) fn build_backend_client_cert_from_proto(
     }
 }
 
-/// Parse a PEM certificate chain and private key into Pingora's `CertKey`
-/// (DER chain + DER key), the shape `HttpPeer.client_cert_key` expects.
-pub(crate) fn parse_client_cert_key(
+/// Parse a PEM certificate chain and private key into a [`ClientIdentity`]
+/// (DER chain + DER key).
+pub fn parse_client_cert_key(
     cert_pem: &str,
     key_pem: &str,
-) -> Result<pingora_core::utils::tls::CertKey, String> {
+) -> Result<ClientIdentity, String> {
     let certs: Vec<Vec<u8>> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("invalid certificate PEM: {e}"))?
@@ -963,12 +928,12 @@ pub(crate) fn parse_client_cert_key(
     let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
         .map_err(|e| format!("invalid private key PEM: {e}"))?
         .ok_or_else(|| "no private key in PEM".to_string())?;
-    Ok(pingora_core::utils::tls::CertKey::new(certs, key.secret_der().to_vec()))
+    Ok(ClientIdentity::new(certs, key.secret_der().to_vec()))
 }
 
 /// Build circuit breaker and connection limiter maps from proto RouteConfig messages.
 /// Reuses existing instances when config is unchanged to preserve state.
-pub(crate) fn build_cb_cl_maps_from_proto(
+pub fn build_cb_cl_maps_from_proto(
     routes: &[portus_types::RouteConfig],
     existing_cbs: &HashMap<(Arc<str>, u16), Arc<CircuitBreaker>>,
     existing_cls: &ConnectionLimiterMap,
@@ -1028,7 +993,7 @@ pub(crate) fn build_cb_cl_maps_from_proto(
 /// SNI scoping. Each listener gets its own route table so the SNI mux can
 /// find the most specific matching listener and route within it.
 /// Supports both Passthrough and Terminate TLS modes.
-pub(crate) fn build_l4_config_from_proto(config: &portus_types::CompiledConfig) -> L4Config {
+pub fn build_l4_config_from_proto(config: &portus_types::CompiledConfig) -> L4Config {
     use crate::l4_proxy::{TlsPassthroughListener, TlsMode};
     use crate::tls::load_certified_key_from_pem;
 
@@ -1116,7 +1081,7 @@ pub(crate) fn build_l4_config_from_proto(config: &portus_types::CompiledConfig) 
     l4.udp_proxy = l4_targets(&config.udp_proxy_routes);
 
     // Every HTTP/HTTPS Gateway listener port is bound by the listener manager
-    // and handed to the matching Pingora service.
+    // and handed to the matching stack service.
     for listener in &config.listeners {
         let Ok(port) = u16::try_from(listener.port) else { continue };
         if port == 0 {
@@ -1230,7 +1195,7 @@ fn collect_per_ip_limiters(
 /// Returns `Ok(warnings)` when the config is safe to apply (warnings are
 /// informational only), or `Err(reason)` when critical invariants are
 /// violated and the config must be rejected.
-pub(crate) fn validate_config(config: &portus_types::CompiledConfig) -> Result<Vec<String>, String> {
+pub fn validate_config(config: &portus_types::CompiledConfig) -> Result<Vec<String>, String> {
     let mut warnings: Vec<String> = Vec::new();
 
     // --- Hard rejections (route-level) ---
@@ -1378,7 +1343,7 @@ pub(crate) fn validate_config(config: &portus_types::CompiledConfig) -> Result<V
 /// Apply a received CompiledConfig using the shadow-build pattern.
 /// Preserves rate limiter and circuit breaker state from the current config.
 /// Takes ownership so credential fields can be zeroized before drop (SEC F-11).
-pub(crate) fn apply_config(mut config: portus_types::CompiledConfig, state: &ProxyState) {
+pub fn apply_config(mut config: portus_types::CompiledConfig, state: &ProxyState) {
     let current_snap = state.snapshot.load();
 
     // PERF-8: Build CB/CL maps first so they can be embedded in PathRoute
@@ -1524,7 +1489,7 @@ pub(crate) fn apply_config(mut config: portus_types::CompiledConfig, state: &Pro
 /// (set on the pod by the provisioner). Empty in standalone YAML mode, which has
 /// no Gateway objects; on the gRPC path the controller refuses a stream that
 /// names no Gateway (`config_stream_loop` logs that once).
-pub(crate) fn gateway_identity() -> (String, String) {
+pub fn gateway_identity() -> (String, String) {
     (
         std::env::var("GATEWAY_NAMESPACE").unwrap_or_default(),
         std::env::var("GATEWAY_NAME").unwrap_or_default(),
@@ -1532,12 +1497,12 @@ pub(crate) fn gateway_identity() -> (String, String) {
 }
 
 /// Calculate next backoff duration, doubling current and capping at 5s.
-pub(crate) fn next_backoff(current_ms: u64) -> u64 {
+pub fn next_backoff(current_ms: u64) -> u64 {
     (current_ms * 2).min(5_000)
 }
 
 /// Check if a schema version is compatible (major version must be 1).
-pub(crate) fn is_schema_compatible(schema_version: &str) -> bool {
+pub fn is_schema_compatible(schema_version: &str) -> bool {
     schema_version
         .split('.')
         .next() == Some("1")
@@ -1546,13 +1511,13 @@ pub(crate) fn is_schema_compatible(schema_version: &str) -> bool {
 /// Legacy helper kept for the generation-only rule (controllers without
 /// fingerprints): same non-zero generation means heartbeat.
 #[cfg(test)]
-pub(crate) fn is_heartbeat(config_version: u64, last_version: u64) -> bool {
+pub fn is_heartbeat(config_version: u64, last_version: u64) -> bool {
     apply_decision(0, config_version, 0, last_version) == ApplyDecision::Heartbeat
 }
 
 /// What to do with a config message given what is currently applied.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ApplyDecision {
+pub enum ApplyDecision {
     /// New content: apply it.
     Apply,
     /// Same content as what is running (heartbeat / redundant push): skip.
@@ -1567,7 +1532,7 @@ pub(crate) enum ApplyDecision {
 /// second controller instance never wedges the data plane. Only a controller
 /// that predates fingerprints (`fingerprint == 0`) falls back to the old
 /// monotonic generation rule.
-pub(crate) fn apply_decision(
+pub fn apply_decision(
     config_fingerprint: u64,
     config_version: u64,
     applied_fingerprint: u64,
@@ -1594,9 +1559,7 @@ pub(crate) fn apply_decision(
 pub async fn config_stream_loop(
     controller_addr: String,
     state: Arc<ProxyState>,
-    grpc_connected: Arc<std::sync::atomic::AtomicBool>,
-    config_received: Arc<std::sync::atomic::AtomicBool>,
-    last_config_time: Arc<std::sync::atomic::AtomicU64>,
+    readiness: Arc<Readiness>,
     metrics: Arc<crate::metrics::ProxyMetrics>,
 ) {
     use std::sync::atomic::Ordering;
@@ -1627,15 +1590,13 @@ pub async fn config_stream_loop(
     let mut applied = AppliedConfig::default();
 
     loop {
-        grpc_connected.store(false, Ordering::Release);
+        readiness.grpc_connected.store(false, Ordering::Release);
         metrics.grpc_stream_connected.set(0.0);
 
         match connect_and_stream(
             &controller_addr,
             &state,
-            &grpc_connected,
-            &config_received,
-            &last_config_time,
+            &readiness,
             &metrics,
             &mut applied,
         )
@@ -1660,7 +1621,7 @@ pub async fn config_stream_loop(
 
 /// Identity of the config currently applied by this data plane.
 #[derive(Debug, Default, Clone, Copy)]
-pub(crate) struct AppliedConfig {
+pub struct AppliedConfig {
     pub fingerprint: u64,
     pub version: u64,
 }
@@ -1668,9 +1629,7 @@ pub(crate) struct AppliedConfig {
 async fn connect_and_stream(
     controller_addr: &str,
     state: &Arc<ProxyState>,
-    grpc_connected: &Arc<std::sync::atomic::AtomicBool>,
-    config_received: &Arc<std::sync::atomic::AtomicBool>,
-    last_config_time: &Arc<std::sync::atomic::AtomicU64>,
+    readiness: &Readiness,
     metrics: &Arc<crate::metrics::ProxyMetrics>,
     applied: &mut AppliedConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1764,7 +1723,7 @@ async fn connect_and_stream(
 
     let mut stream = client.stream_config(request).await?.into_inner();
 
-    grpc_connected.store(true, Ordering::Release);
+    readiness.grpc_connected.store(true, Ordering::Release);
     metrics.grpc_stream_connected.set(1.0);
     log::info!("gRPC config stream connected to {}", controller_addr);
 
@@ -1796,7 +1755,7 @@ async fn connect_and_stream(
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_secs();
-                last_config_time.store(now, Ordering::Release);
+                readiness.last_config_time.store(now, Ordering::Release);
                 metrics.config_last_update_timestamp.set(now as f64);
                 continue;
             }
@@ -1870,12 +1829,12 @@ async fn connect_and_stream(
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        last_config_time.store(now, Ordering::Release);
+        readiness.last_config_time.store(now, Ordering::Release);
         metrics.config_last_update_timestamp.set(now as f64);
-        config_received.store(true, Ordering::Release);
+        readiness.config_received.store(true, Ordering::Release);
     }
 
-    grpc_connected.store(false, Ordering::Release);
+    readiness.grpc_connected.store(false, Ordering::Release);
     metrics.grpc_stream_connected.set(0.0);
     Ok(())
 }
@@ -2043,7 +2002,7 @@ mod tests {
         assert!(result.contains_key(&key));
         assert!(sigs.contains_key(&key));
         let lb = result.get(&key).unwrap();
-        assert_eq!(lb.backends().get_backend().len(), 2);
+        assert_eq!(lb.endpoints().len(), 2);
     }
 
     fn backend_group(addrs: &[&str], hc: Option<portus_types::HealthCheckConfig>) -> BackendGroup {
@@ -2082,7 +2041,7 @@ mod tests {
         let (lbs2, _) = build_lb_map_from_proto(&second, &lbs1, &sigs1);
         let key = (Arc::from("svc") as Arc<str>, 80u16);
         assert!(!Arc::ptr_eq(lbs1.get(&key).unwrap(), lbs2.get(&key).unwrap()));
-        assert_eq!(lbs2.get(&key).unwrap().backends().get_backend().len(), 2);
+        assert_eq!(lbs2.get(&key).unwrap().endpoints().len(), 2);
     }
 
     #[test]
@@ -6300,8 +6259,8 @@ mod tests {
         };
         let mine = build_backend_client_cert_from_proto(&config, ("ns", "gw")).expect("gw's certificate");
         let expected = parse_client_cert_key(&cert_pem, &key_pem).unwrap();
-        assert_eq!(mine.leaf().raw_der(), expected.leaf().raw_der());
-        assert!(!mine.key().is_empty());
+        assert_eq!(mine.cert_chain_der, expected.cert_chain_der);
+        assert!(!mine.key_der.is_empty());
         assert!(build_backend_client_cert_from_proto(&config, ("ns", "none")).is_none());
         assert!(build_backend_client_cert_from_proto(&CompiledConfig::default(), ("ns", "gw")).is_none());
     }

@@ -3,23 +3,29 @@ use prometheus::{
     register_int_gauge_vec, Gauge, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
 };
 
-pub(crate) struct ProxyMetrics {
-    pub(crate) request_total: IntCounterVec,
-    pub(crate) request_duration: HistogramVec,
-    pub(crate) routes_loaded: IntGauge,
-    pub(crate) endpoints_loaded: IntGaugeVec,
-    pub(crate) watcher_errors_total: IntCounterVec,
-    pub(crate) tls_cert_expiry_seconds: Gauge,
-    pub(crate) upstream_connect_errors_total: IntCounterVec,
-    pub(crate) upstream_ejections_total: IntCounterVec,
-    pub(crate) rate_limit_rejected_total: IntCounterVec,
-    pub(crate) circuit_breaker_state: IntGaugeVec,
-    pub(crate) config_last_update_timestamp: Gauge,
-    pub(crate) grpc_stream_connected: Gauge,
+pub struct ProxyMetrics {
+    pub request_total: IntCounterVec,
+    pub request_duration: HistogramVec,
+    pub routes_loaded: IntGauge,
+    pub endpoints_loaded: IntGaugeVec,
+    pub watcher_errors_total: IntCounterVec,
+    pub tls_cert_expiry_seconds: Gauge,
+    pub upstream_connect_errors_total: IntCounterVec,
+    pub upstream_ejections_total: IntCounterVec,
+    pub rate_limit_rejected_total: IntCounterVec,
+    pub circuit_breaker_state: IntGaugeVec,
+    pub config_last_update_timestamp: Gauge,
+    pub grpc_stream_connected: Gauge,
+}
+
+impl Default for ProxyMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProxyMetrics {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             request_total: register_int_counter_vec!(
                 "proxy_requests_total",

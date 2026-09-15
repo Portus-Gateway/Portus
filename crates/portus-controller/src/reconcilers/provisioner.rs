@@ -68,9 +68,13 @@ pub struct DataplaneTemplate {
     pub log_level: String,
     /// Emit one access-log line per request (`PORTUS_ACCESS_LOG` on the pods).
     pub access_log: bool,
-    /// Pingora worker threads per pod (`DATAPLANE_THREADS`). None lets the
+    /// Proxy worker threads per pod (`DATAPLANE_THREADS`). None lets the
     /// dataplane size itself from its cgroup CPU limit or the node's CPU count.
     pub threads: Option<usize>,
+    /// Network stack the pods serve traffic on (`PORTUS_NETWORK_STACK`):
+    /// `pingora` (the release stack) or an experimental alternative built into
+    /// the dataplane image. Passed through verbatim; the dataplane validates it.
+    pub network_stack: String,
     /// ServiceAccount for dataplane pods. Must exist in every Gateway's
     /// namespace, so it is normally unset (default SA, token automount off).
     pub service_account: Option<String>,
@@ -111,6 +115,7 @@ impl DataplaneTemplate {
             log_level: var("PORTUS_DATAPLANE_LOG_LEVEL").unwrap_or_else(|| "info".into()),
             access_log: var("PORTUS_DATAPLANE_ACCESS_LOG").is_some_and(|v| parse_bool(&v)),
             threads: var("PORTUS_DATAPLANE_THREADS").and_then(|v| v.trim().parse().ok()).filter(|n: &usize| *n > 0),
+            network_stack: network_stack_value(var("PORTUS_DATAPLANE_NETWORK_STACK").as_deref()),
             service_account: var("PORTUS_DATAPLANE_SERVICE_ACCOUNT"),
             cpu_request: var("PORTUS_DATAPLANE_CPU_REQUEST").unwrap_or_else(|| "250m".into()),
             memory_request: var("PORTUS_DATAPLANE_MEMORY_REQUEST").unwrap_or_else(|| "256Mi".into()),
@@ -328,6 +333,15 @@ pub fn parse_bool(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on")
 }
 
+/// The chart's `dataplane.networkStack`, normalised the way the dataplane
+/// compares it; unset or blank means the release stack.
+pub fn network_stack_value(value: Option<&str>) -> String {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if !v.is_empty() => v,
+        _ => "pingora".to_string(),
+    }
+}
+
 fn env(name: &str, value: &str) -> EnvVar {
     EnvVar {
         name: name.into(),
@@ -359,6 +373,7 @@ pub fn desired_deployment(gw: &GatewayRef, tpl: &DataplaneTemplate) -> Deploymen
     let mut envs = vec![
         env("RUST_LOG", &tpl.log_level),
         env("PORTUS_ACCESS_LOG", if tpl.access_log { "true" } else { "false" }),
+        env("PORTUS_NETWORK_STACK", &tpl.network_stack),
         env("CONTROLLER_ADDR", &tpl.controller_addr),
         env("GATEWAY_NAMESPACE", &gw.namespace),
         env("GATEWAY_NAME", &gw.name),
@@ -689,6 +704,7 @@ mod tests {
             grpc_tls_secret: Some("portus-grpc-tls".into()),
             log_level: "info".into(),
             access_log: false,
+            network_stack: "pingora".into(),
             threads: None,
             service_account: Some("portus-dataplane".into()),
             cpu_request: "250m".into(),
@@ -829,6 +845,7 @@ mod tests {
         assert!(!envs.contains_key("BOUND_PORTS"), "listener ports come from the config stream, not env");
         assert!(!envs.contains_key("DATAPLANE_THREADS"), "threads are sized by the dataplane unless the chart sets them");
         assert_eq!(envs["PORTUS_ACCESS_LOG"], "false", "access log off by default");
+        assert_eq!(envs["PORTUS_NETWORK_STACK"], "pingora", "the release stack unless the chart says otherwise");
         assert_eq!(envs["GRPC_TLS_CA"], "/etc/grpc-tls/ca.crt");
         assert!(!envs.contains_key("GRPC_TLS_INSECURE"));
         assert_eq!(
@@ -934,6 +951,26 @@ mod tests {
             .collect();
         assert_eq!(envs["DATAPLANE_THREADS"], "8");
         assert_eq!(envs["PORTUS_ACCESS_LOG"], "true");
+    }
+
+    #[test]
+    fn network_stack_reaches_the_pod_env_lowercased() {
+        let mut t = tpl();
+        t.network_stack = "rama".into();
+        let dep = desired_deployment(&gw(), &t);
+        let envs: BTreeMap<String, String> = dep.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.value.unwrap_or_default()))
+            .collect();
+        assert_eq!(envs["PORTUS_NETWORK_STACK"], "rama");
+
+        // The chart value is normalised the way the dataplane compares it.
+        assert_eq!(network_stack_value(Some(" Rama ")), "rama");
+        assert_eq!(network_stack_value(Some("")), "pingora");
+        assert_eq!(network_stack_value(None), "pingora");
     }
 
     #[test]

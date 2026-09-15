@@ -1,22 +1,16 @@
-use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
-use log::{info, warn};
-use pingora_core::upstreams::peer::HttpPeer;
-use pingora_core::Result;
-use pingora_load_balancing::selection::RoundRobin;
-use pingora_load_balancing::LoadBalancer;
-use pingora_proxy::{FailToProxy, ProxyHttp, Session};
+use log::warn;
 use hashbrown::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 
 use crate::circuit_breaker::{CircuitBreaker, ConnectionLimiter};
 use crate::types::*;
-use crate::metrics::ProxyMetrics;
-use crate::outlier::Outliers;
+use crate::pool::Pool;
+use crate::stack::StackCache;
 #[cfg(test)]
 use crate::rate_limiter::AtomicTokenBucket;
 
@@ -49,17 +43,12 @@ pub fn access_log_from_env_value(value: Option<&str>) -> bool {
     value.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes" | "on"))
 }
 
-/// HTTP/2 flow-control windows for upstream connections (gRPC and h2c
-/// backends): the h2 crate's 64 KiB defaults throttle large responses.
-pub const UPSTREAM_H2_STREAM_WINDOW: u32 = 1 << 20;
-pub const UPSTREAM_H2_CONNECTION_WINDOW: u32 = 4 << 20;
-
 /// Scheme and listener port for a request from the socket it arrived on.
-/// HTTPS connections reach Pingora on the original `:443` socket (handed off by
+/// HTTPS connections reach the stack on the original `:443` socket (handed off by
 /// the SNI mux), so the local port is always the listener port; the scheme
 /// follows the TLS state of the socket, with `:443` treated as HTTPS even when
 /// the digest carries no TLS info.
-pub(crate) fn listener_scheme_and_port(local_port: u16, is_tls: bool) -> (&'static str, u16) {
+pub fn listener_scheme_and_port(local_port: u16, is_tls: bool) -> (&'static str, u16) {
     if is_tls || local_port == HTTPS_DEFAULT_PORT {
         ("https", local_port)
     } else {
@@ -70,20 +59,20 @@ pub(crate) fn listener_scheme_and_port(local_port: u16, is_tls: bool) -> (&'stat
 // ---------------------------------------------------------------------------
 // SEC-4: Default request body size limit (10 MB) when no policy is configured.
 // ---------------------------------------------------------------------------
-const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 10 * 1024 * 1024;
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 10 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // PERF-1: Static empty Arc singletons — avoids 9 heap allocations per request
 // in new_ctx(). All Arc::clone() on these is a single atomic increment.
 // ---------------------------------------------------------------------------
-static EMPTY_HEADER_VEC: LazyLock<Arc<Vec<(HeaderName, HeaderValue)>>> =
+pub static EMPTY_HEADER_VEC: LazyLock<Arc<Vec<(HeaderName, HeaderValue)>>> =
     LazyLock::new(|| Arc::new(Vec::new()));
-static EMPTY_NAME_VEC: LazyLock<Arc<Vec<HeaderName>>> =
+pub static EMPTY_NAME_VEC: LazyLock<Arc<Vec<HeaderName>>> =
     LazyLock::new(|| Arc::new(Vec::new()));
-static EMPTY_STRING_VEC: LazyLock<Arc<Vec<String>>> =
+pub static EMPTY_STRING_VEC: LazyLock<Arc<Vec<String>>> =
     LazyLock::new(|| Arc::new(Vec::new()));
-static EMPTY_CODES: LazyLock<Arc<Vec<u16>>> = LazyLock::new(|| Arc::new(Vec::new()));
-static EMPTY_SNI: LazyLock<Arc<str>> =
+pub static EMPTY_CODES: LazyLock<Arc<Vec<u16>>> = LazyLock::new(|| Arc::new(Vec::new()));
+pub static EMPTY_SNI: LazyLock<Arc<str>> =
     LazyLock::new(|| Arc::from(""));
 
 // ---------------------------------------------------------------------------
@@ -92,53 +81,53 @@ static EMPTY_SNI: LazyLock<Arc<str>> =
 
 /// A weighted backend with optional per-backend request header mutations.
 #[derive(Clone)]
-pub(crate) struct WeightedBackendEntry {
-    pub(crate) service_name: Arc<str>,
-    pub(crate) port: u16,
-    pub(crate) weight: u32,
-    pub(crate) request_headers_add: Arc<Vec<(HeaderName, HeaderValue)>>,
-    pub(crate) request_headers_set: Arc<Vec<(HeaderName, HeaderValue)>>,
-    pub(crate) request_headers_remove: Arc<Vec<HeaderName>>,
+pub struct WeightedBackendEntry {
+    pub service_name: Arc<str>,
+    pub port: u16,
+    pub weight: u32,
+    pub request_headers_add: Arc<Vec<(HeaderName, HeaderValue)>>,
+    pub request_headers_set: Arc<Vec<(HeaderName, HeaderValue)>>,
+    pub request_headers_remove: Arc<Vec<HeaderName>>,
 }
 
 /// Configuration for HTTP redirect responses (3xx).
-pub(crate) struct RedirectConfig {
-    pub(crate) scheme: Option<String>,
-    pub(crate) hostname: Option<String>,
-    pub(crate) port: Option<u16>,
-    pub(crate) path: Option<String>,
-    pub(crate) path_type: String,   // ReplaceFullPath or ReplacePrefixMatch
-    pub(crate) status_code: u16,    // 301, 302, etc.
+pub struct RedirectConfig {
+    pub scheme: Option<String>,
+    pub hostname: Option<String>,
+    pub port: Option<u16>,
+    pub path: Option<String>,
+    pub path_type: String,   // ReplaceFullPath or ReplacePrefixMatch
+    pub status_code: u16,    // 301, 302, etc.
 }
 
 /// Configuration for URL rewriting before proxying.
 #[derive(Clone)]
-pub(crate) struct UrlRewriteConfig {
-    pub(crate) hostname: Option<Arc<str>>,
-    pub(crate) path: Option<String>,
-    pub(crate) path_type: String,
+pub struct UrlRewriteConfig {
+    pub hostname: Option<Arc<str>>,
+    pub path: Option<String>,
+    pub path_type: String,
 }
 
 /// CORS configuration for handling preflight and simple requests.
 #[derive(Clone, Debug)]
-pub(crate) struct CorsConfig {
-    pub(crate) allow_origins: Vec<String>,
-    pub(crate) allow_methods: Vec<String>,
-    pub(crate) allow_headers: Vec<String>,
-    pub(crate) expose_headers: Vec<String>,
-    pub(crate) allow_credentials: bool,
-    pub(crate) max_age: u32,
+pub struct CorsConfig {
+    pub allow_origins: Vec<String>,
+    pub allow_methods: Vec<String>,
+    pub allow_headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub allow_credentials: bool,
+    pub max_age: u32,
     // PERF-13: Pre-formatted max_age string to avoid per-request u32::to_string()
-    pub(crate) max_age_str: Arc<str>,
+    pub max_age_str: Arc<str>,
     // Pre-joined strings for hot-path use (avoids per-request allocations)
-    pub(crate) allow_methods_joined: Arc<str>,
-    pub(crate) allow_headers_joined: Arc<str>,
-    pub(crate) expose_headers_joined: Arc<str>,
+    pub allow_methods_joined: Arc<str>,
+    pub allow_headers_joined: Arc<str>,
+    pub expose_headers_joined: Arc<str>,
 }
 
 /// Header match type for multi-dimensional request matching.
 #[derive(Clone)]
-pub(crate) enum HeaderMatchType {
+pub enum HeaderMatchType {
     Exact,
     RegularExpression(regex::Regex),
 }
@@ -166,16 +155,16 @@ impl std::fmt::Debug for HeaderMatchType {
 
 /// A single header match requirement.
 #[derive(Clone, Debug)]
-pub(crate) struct HeaderMatchEntry {
-    pub(crate) name: HeaderName,
-    pub(crate) value: String,
-    pub(crate) match_type: HeaderMatchType,
+pub struct HeaderMatchEntry {
+    pub name: HeaderName,
+    pub value: String,
+    pub match_type: HeaderMatchType,
 }
 
 /// Query parameter match type, mirroring HeaderMatchType.
 /// RegularExpression holds a pre-compiled regex (built once at config time).
 #[derive(Clone)]
-pub(crate) enum QueryParamMatchType {
+pub enum QueryParamMatchType {
     Exact,
     RegularExpression(regex::Regex),
 }
@@ -203,79 +192,79 @@ impl std::fmt::Debug for QueryParamMatchType {
 
 /// A single query parameter match requirement.
 #[derive(Clone, Debug)]
-pub(crate) struct QueryParamMatchEntry {
-    pub(crate) name: String,
-    pub(crate) value: String,
-    pub(crate) match_type: QueryParamMatchType,
+pub struct QueryParamMatchEntry {
+    pub name: String,
+    pub value: String,
+    pub match_type: QueryParamMatchType,
 }
 
 /// A single path rule pointing to a backend.
-pub(crate) struct PathRoute {
-    pub(crate) path: Arc<str>,
-    pub(crate) match_type: PathMatchType,
-    pub(crate) service_name: Arc<str>,
-    pub(crate) port: u16,
-    pub(crate) connect_timeout: Option<Duration>,
-    pub(crate) read_timeout: Option<Duration>,
-    pub(crate) write_timeout: Option<Duration>,
-    pub(crate) rate_limiter: Option<crate::rate_limiter::RateLimiterMode>,
-    pub(crate) max_retries: u32,
-    pub(crate) upstream_tls: bool,
-    pub(crate) upstream_sni: Arc<str>,
-    pub(crate) upstream_verify: bool,
-    pub(crate) protocol: BackendProtocol,
-    pub(crate) request_headers_add: Arc<Vec<(HeaderName, HeaderValue)>>,
-    pub(crate) request_headers_set: Arc<Vec<(HeaderName, HeaderValue)>>,
-    pub(crate) request_headers_remove: Arc<Vec<HeaderName>>,
-    pub(crate) response_headers_add: Arc<Vec<(HeaderName, HeaderValue)>>,
-    pub(crate) response_headers_set: Arc<Vec<(HeaderName, HeaderValue)>>,
-    pub(crate) response_headers_remove: Arc<Vec<HeaderName>>,
+pub struct PathRoute {
+    pub path: Arc<str>,
+    pub match_type: PathMatchType,
+    pub service_name: Arc<str>,
+    pub port: u16,
+    pub connect_timeout: Option<Duration>,
+    pub read_timeout: Option<Duration>,
+    pub write_timeout: Option<Duration>,
+    pub rate_limiter: Option<crate::rate_limiter::RateLimiterMode>,
+    pub max_retries: u32,
+    pub upstream_tls: bool,
+    pub upstream_sni: Arc<str>,
+    pub upstream_verify: bool,
+    pub protocol: BackendProtocol,
+    pub request_headers_add: Arc<Vec<(HeaderName, HeaderValue)>>,
+    pub request_headers_set: Arc<Vec<(HeaderName, HeaderValue)>>,
+    pub request_headers_remove: Arc<Vec<HeaderName>>,
+    pub response_headers_add: Arc<Vec<(HeaderName, HeaderValue)>>,
+    pub response_headers_set: Arc<Vec<(HeaderName, HeaderValue)>>,
+    pub response_headers_remove: Arc<Vec<HeaderName>>,
     // Gateway API Core: multi-dimensional matching
-    pub(crate) header_matches: Vec<HeaderMatchEntry>,
-    pub(crate) method_match: Option<http::Method>,
-    pub(crate) query_param_matches: Vec<QueryParamMatchEntry>,
+    pub header_matches: Vec<HeaderMatchEntry>,
+    pub method_match: Option<http::Method>,
+    pub query_param_matches: Vec<QueryParamMatchEntry>,
     // Gateway API Core: filters
-    pub(crate) redirect: Option<RedirectConfig>,
-    pub(crate) url_rewrite: Option<UrlRewriteConfig>,
+    pub redirect: Option<RedirectConfig>,
+    pub url_rewrite: Option<UrlRewriteConfig>,
     // Listener binding
-    pub(crate) listener_name: Arc<str>,
+    pub listener_name: Arc<str>,
     // Extended HTTPRoute: mirror, weighted backends, per-route timeouts
     /// Multiple mirror backends: (service_name, port, percent). percent=0 means mirror all.
-    pub(crate) mirror_backends: Vec<(Arc<str>, u16, u32)>,
-    pub(crate) weighted_backends: Vec<WeightedBackendEntry>,
-    pub(crate) request_timeout: Option<Duration>,
-    pub(crate) backend_request_timeout: Option<Duration>,
+    pub mirror_backends: Vec<(Arc<str>, u16, u32)>,
+    pub weighted_backends: Vec<WeightedBackendEntry>,
+    pub request_timeout: Option<Duration>,
+    pub backend_request_timeout: Option<Duration>,
     // Phase 9: Auth config
-    pub(crate) auth_config: Option<crate::types::AuthConfig>,
+    pub auth_config: Option<crate::types::AuthConfig>,
     // Phase 10: CORS config
-    pub(crate) cors: Option<Arc<CorsConfig>>,
+    pub cors: Option<Arc<CorsConfig>>,
     // Phase 11: IP allowlist
-    pub(crate) ip_allow_cidrs: Vec<ipnet::IpNet>,
-    pub(crate) ip_deny_cidrs: Vec<ipnet::IpNet>,
-    pub(crate) ip_trusted_proxy_cidrs: Vec<ipnet::IpNet>,
+    pub ip_allow_cidrs: Vec<ipnet::IpNet>,
+    pub ip_deny_cidrs: Vec<ipnet::IpNet>,
+    pub ip_trusted_proxy_cidrs: Vec<ipnet::IpNet>,
     // Phase 11: Request body size limit (0 = no limit)
-    pub(crate) max_request_body_bytes: u64,
+    pub max_request_body_bytes: u64,
     // Phase 11: Retry conditions
-    pub(crate) retry_on: Arc<Vec<String>>,
+    pub retry_on: Arc<Vec<String>>,
     /// HTTPRoute rule `retry.codes`: upstream statuses retried while
     /// `max_retries` attempts remain.
-    pub(crate) retry_codes: Arc<Vec<u16>>,
+    pub retry_codes: Arc<Vec<u16>>,
     // PERF-8: Embedded circuit breaker and connection limiter (avoids per-request map lookups)
-    pub(crate) circuit_breaker: Option<Arc<CircuitBreaker>>,
-    pub(crate) connection_limiter: Option<Arc<ConnectionLimiter>>,
+    pub circuit_breaker: Option<Arc<CircuitBreaker>>,
+    pub connection_limiter: Option<Arc<ConnectionLimiter>>,
     // PERF-10: Pre-computed total weight for weighted backend selection
-    pub(crate) total_weight: u32,
+    pub total_weight: u32,
 }
 
 impl PathRoute {
     /// Returns true if this route is a redirect (should return 3xx, not proxy).
     #[cfg(test)]
-    pub(crate) fn has_redirect(&self) -> bool {
+    pub fn has_redirect(&self) -> bool {
         self.redirect.is_some()
     }
 
     /// Applies URL rewrite to the given path, returning the rewritten path if applicable.
-    pub(crate) fn rewrite_path(&self, original_path: &str) -> Option<String> {
+    pub fn rewrite_path(&self, original_path: &str) -> Option<String> {
         let rewrite = self.url_rewrite.as_ref()?;
         let new_path = rewrite.path.as_ref()?;
         match rewrite.path_type.as_str() {
@@ -304,25 +293,25 @@ impl PathRoute {
     }
 
     /// Returns the rewrite hostname if URL rewrite is configured with a hostname.
-    pub(crate) fn rewrite_hostname(&self) -> Option<&Arc<str>> {
+    pub fn rewrite_hostname(&self) -> Option<&Arc<str>> {
         self.url_rewrite.as_ref()?.hostname.as_ref()
     }
 }
 
 /// All path routes for a given host, ordered for matching.
-pub(crate) struct HostRoutes {
+pub struct HostRoutes {
     /// Exact path → routes for O(1) lookup. Multiple routes may share a path
     /// (differentiated by headers/method/query).
-    pub(crate) exact_map: HashMap<Arc<str>, Vec<PathRoute>>,
+    pub exact_map: HashMap<Arc<str>, Vec<PathRoute>>,
     /// Prefix rules sorted longest-first for linear scan.
-    pub(crate) rules: Vec<PathRoute>,
+    pub rules: Vec<PathRoute>,
     /// Catch-all when no paths are specified.
-    pub(crate) catch_all: Option<PathRoute>,
+    pub catch_all: Option<PathRoute>,
 }
 
 impl HostRoutes {
     /// Find an existing rate limiter for a path/type/rps combo (for reuse across rebuilds).
-    pub(crate) fn find_rate_limiter(
+    pub fn find_rate_limiter(
         &self,
         path: &str,
         match_type: &PathMatchType,
@@ -362,14 +351,14 @@ impl HostRoutes {
     }
 
     #[cfg(test)]
-    pub(crate) fn match_path(&self, request_path: &str) -> Option<&PathRoute> {
+    pub fn match_path(&self, request_path: &str) -> Option<&PathRoute> {
         // Backward-compatible convenience: match by path only (no header/method/query checks).
         self.match_request(request_path, &http::Method::GET, &http::HeaderMap::new(), None)
     }
 
     /// Multi-dimensional request matching: path + method + headers + query params.
     /// Returns the first route where ALL dimensions match.
-    pub(crate) fn match_request(
+    pub fn match_request(
         &self,
         request_path: &str,
         method: &http::Method,
@@ -489,7 +478,7 @@ impl HostRoutes {
 
 thread_local! {
     // Per-thread round-robin position for weighted backend selection. Each
-    // Pingora worker walks its own counter, so the proportional distribution
+    // worker walks its own counter, so the proportional distribution
     // holds per thread without a globally shared atomic that every worker
     // would bounce between cores on every request.
     static WEIGHT_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -497,14 +486,14 @@ thread_local! {
 
 /// Reset the current thread's weighted-backend counter (tests only).
 #[cfg(test)]
-pub(crate) fn reset_weight_counter() {
+pub fn reset_weight_counter() {
     WEIGHT_COUNTER.with(|c| c.set(0));
 }
 
 /// Select a backend from weighted list using deterministic round-robin.
 /// Distributes proportionally: weights [3, 2, 1] over 6 calls = 3 to A, 2 to B, 1 to C.
 /// Returns a reference to the selected WeightedBackendEntry.
-pub(crate) fn select_weighted_backend(backends: &[WeightedBackendEntry], precomputed_total: u32) -> Option<&WeightedBackendEntry> {
+pub fn select_weighted_backend(backends: &[WeightedBackendEntry], precomputed_total: u32) -> Option<&WeightedBackendEntry> {
     if backends.is_empty() {
         return None;
     }
@@ -545,7 +534,7 @@ static MIRROR_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
 /// rightmost-untrusted-hop algorithm. Walks XFF right-to-left; the first IP
 /// NOT in `trusted_cidrs` is the real client. If peer is not trusted, peer IS
 /// the client (XFF is completely ignored to prevent spoofing).
-fn extract_client_ip(
+pub fn extract_client_ip(
     xff: &str,
     peer_ip: std::net::IpAddr,
     trusted_cidrs: &[ipnet::IpNet],
@@ -572,14 +561,14 @@ fn extract_client_ip(
         .unwrap_or(peer_ip)
 }
 
-pub(crate) fn spawn_mirror_request(
+pub fn spawn_mirror_request(
     mirror_service: &Arc<str>,
     mirror_port: u16,
     method: &http::Method,
     path: &str,
     host: &str,
     extra_headers: &[(String, String)],
-    lbs: &HashMap<(Arc<str>, u16), Arc<LoadBalancer<RoundRobin>>>,
+    lbs: &HashMap<(Arc<str>, u16), Arc<Pool>>,
 ) {
     let sem = Arc::clone(&MIRROR_SEMAPHORE);
     let permit = match sem.try_acquire_owned() {
@@ -599,15 +588,12 @@ pub(crate) fn spawn_mirror_request(
         }
     };
 
-    let backend = match lb.select(b"", 256) {
-        Some(b) => b,
-        None => {
-            warn!("no ready endpoints for mirror backend {}:{}", mirror_service, mirror_port);
-            return;
-        }
+    let Some(backend) = lb.select() else {
+        warn!("no ready endpoints for mirror backend {}:{}", mirror_service, mirror_port);
+        return;
     };
 
-    let addr_str = format!("{}", backend.addr);
+    let addr_str = backend.to_string();
     let method = method.clone();
     // SEC-8: Strip CRLF from host/path/headers to prevent header injection in raw HTTP/1.1 request.
     let safe_path = path.replace(['\r', '\n'], "");
@@ -640,64 +626,6 @@ pub(crate) fn spawn_mirror_request(
     });
 }
 
-/// Per-request context for retry tracking and cached route info.
-pub(crate) struct RouterCtx {
-    retries_left: u32,
-    service_name: Option<Arc<str>>,
-    port: u16,
-    connect_timeout: Option<Duration>,
-    read_timeout: Option<Duration>,
-    write_timeout: Option<Duration>,
-    upstream_tls: bool,
-    upstream_sni: Arc<str>,
-    upstream_verify: bool,
-    protocol: BackendProtocol,
-    request_start: Instant,
-    request_headers_add: Arc<Vec<(HeaderName, HeaderValue)>>,
-    request_headers_set: Arc<Vec<(HeaderName, HeaderValue)>>,
-    request_headers_remove: Arc<Vec<HeaderName>>,
-    response_headers_add: Arc<Vec<(HeaderName, HeaderValue)>>,
-    response_headers_set: Arc<Vec<(HeaderName, HeaderValue)>>,
-    response_headers_remove: Arc<Vec<HeaderName>>,
-    circuit_breaker: Option<Arc<CircuitBreaker>>,
-    connection_acquired: bool,
-    connection_limiter: Option<Arc<ConnectionLimiter>>,
-    // URL rewrite support
-    rewrite_path: Option<String>,
-    rewrite_hostname: Option<Arc<str>>,
-    // Extended HTTPRoute: per-route request timeout (overall deadline)
-    request_timeout: Option<Duration>,
-    // Tracks which timeout type is active, so fail_to_proxy returns the correct status code.
-    // When backend_request_timeout is active, read timeouts are 504 (Gateway Timeout).
-    // When request_timeout is active (overall deadline), read timeouts are also 504.
-    has_timeout: bool,
-    // CORS: If Origin matches, store (origin, cors_config) to apply response headers.
-    cors_origin: Option<http::HeaderValue>,
-    cors_config: Option<Arc<CorsConfig>>,
-    has_credentials: bool,
-    // Phase 11: retry conditions (connect-failure, 5xx, gateway-error)
-    // Empty means retry on connect-failure only (backward compat).
-    retry_on: Arc<Vec<String>>,
-    // HTTPRouteRetry: upstream statuses that are retried.
-    retry_codes: Arc<Vec<u16>>,
-    // Phase 11: request body size tracking for chunked encoding
-    max_request_body_bytes: u64,
-    body_bytes_received: u64,
-    // PERF-7: Cached Prometheus histogram handle to avoid per-request HashMap lookup
-    // in logging(). Populated in request_filter() after route match.
-    cached_duration: Option<prometheus::Histogram>,
-    // PERF-9: Cached load balancer from snapshot, avoids re-loading ArcSwap in upstream_peer.
-    cached_lb: Option<Arc<LoadBalancer<RoundRobin>>>,
-    // The endpoint the last upstream attempt went to, for outlier ejection.
-    upstream_addr: Option<pingora_core::protocols::l4::socket::SocketAddr>,
-    // BackendTLSPolicy config for the selected backend, resolved in request_filter
-    // from the same snapshot load as `cached_lb`.
-    cached_backend_tls: Option<Arc<BackendTlsInfo>>,
-    // Client certificate this Gateway presents to TLS backends
-    // (Gateway spec.tls.backend.clientCertificateRef), same snapshot load.
-    cached_client_cert: Option<Arc<pingora_core::utils::tls::CertKey>>,
-}
-
 // ---------------------------------------------------------------------------
 // PERF-9: ProxySnapshot — bundles all per-request config maps into a single
 // ArcSwap to reduce atomic operations (one load instead of 4-6 per request).
@@ -706,21 +634,50 @@ pub(crate) struct RouterCtx {
 /// All per-request config maps bundled into a single atomic snapshot.
 /// One `ArcSwap::load()` (2-3 atomics) replaces 4-6 separate loads (8-18 atomics).
 /// BackendTLS configuration from BackendTLSPolicy, stored per (service, port).
-/// CA certs are pre-parsed at config build time (not per-request).
-#[derive(Clone)]
-pub(crate) struct BackendTlsInfo {
-    pub(crate) ca_certs: Arc<pingora_core::protocols::tls::CaType>,
-    pub(crate) hostname: Arc<str>,
+/// CA certs are parsed to DER at config build time (not per-request); the
+/// network stack keeps its own view in `stack`.
+pub struct BackendTlsInfo {
+    pub ca_certs_der: Arc<Vec<Vec<u8>>>,
+    pub hostname: Arc<str>,
     /// SubjectAltNames from BackendTLSPolicy for additional cert validation.
     /// Empty = no additional SAN checks (only hostname verification).
-    pub(crate) subject_alt_names: Arc<Vec<(String, String)>>, // (type, value)
+    pub subject_alt_names: Arc<Vec<(String, String)>>, // (type, value)
+    pub stack: StackCache,
+}
+
+/// The client certificate this data plane presents to TLS backends
+/// (Gateway `spec.tls.backend.clientCertificateRef`): DER chain and DER key.
+/// The network stack keeps its own view in `stack`.
+pub struct ClientIdentity {
+    pub cert_chain_der: Vec<Vec<u8>>,
+    pub key_der: Vec<u8>,
+    pub stack: StackCache,
+}
+
+impl ClientIdentity {
+    pub fn new(cert_chain_der: Vec<Vec<u8>>, key_der: Vec<u8>) -> Self {
+        Self { cert_chain_der, key_der, stack: StackCache::default() }
+    }
+}
+
+impl Drop for ClientIdentity {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.key_der.zeroize();
+    }
+}
+
+impl std::fmt::Debug for ClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientIdentity").field("certs", &self.cert_chain_der.len()).finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for BackendTlsInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackendTlsInfo")
             .field("hostname", &self.hostname)
-            .field("ca_certs_count", &self.ca_certs.len())
+            .field("ca_certs_count", &self.ca_certs_der.len())
             .finish()
     }
 }
@@ -734,41 +691,41 @@ impl std::fmt::Debug for BackendTlsInfo {
 ///   - "" → empty-hostname listener (catch-all; lowest priority)
 ///   - "*.example.com" → wildcard listener (middle priority, ranked by suffix length)
 ///   - "abc.foo.example.com" → exact listener (highest priority)
-pub(crate) struct ListenerBucket {
-    pub(crate) listener_hostname: Arc<str>,
+pub struct ListenerBucket {
+    pub listener_hostname: Arc<str>,
     /// Exact route host → HostRoutes (e.g. "foo.example.com").
-    pub(crate) exact: HashMap<String, HostRoutes>,
+    pub exact: HashMap<String, HostRoutes>,
     /// Route-host wildcard suffix → HostRoutes (e.g. ".example.com" for "*.example.com").
-    pub(crate) domain_wildcards: HashMap<String, HostRoutes>,
+    pub domain_wildcards: HashMap<String, HostRoutes>,
     /// Route host "*" catch-all within this listener.
-    pub(crate) catch_all: Option<HostRoutes>,
+    pub catch_all: Option<HostRoutes>,
 }
 
-pub(crate) struct ProxySnapshot {
+pub struct ProxySnapshot {
     /// Listener buckets indexed by listener port. Each inner vector is pre-sorted
     /// by listener hostname specificity, most specific first, so the first bucket
     /// whose hostname matches the request host claims it.
-    pub(crate) listeners_by_port: HashMap<u16, Vec<ListenerBucket>>,
+    pub listeners_by_port: HashMap<u16, Vec<ListenerBucket>>,
     /// Buckets for routes compiled with listener_port=0 (no port scoping).
     /// Consulted when no port-specific bucket claims the request.
-    pub(crate) any_port_listeners: Vec<ListenerBucket>,
-    pub(crate) lbs: HashMap<(Arc<str>, u16), Arc<LoadBalancer<RoundRobin>>>,
-    pub(crate) circuit_breakers: HashMap<(Arc<str>, u16), Arc<CircuitBreaker>>,
-    pub(crate) connection_limiters: HashMap<(Arc<str>, u16), Arc<ConnectionLimiter>>,
+    pub any_port_listeners: Vec<ListenerBucket>,
+    pub lbs: HashMap<(Arc<str>, u16), Arc<Pool>>,
+    pub circuit_breakers: HashMap<(Arc<str>, u16), Arc<CircuitBreaker>>,
+    pub connection_limiters: HashMap<(Arc<str>, u16), Arc<ConnectionLimiter>>,
     /// SEC F-2: Collected per-IP rate limiters for background eviction.
     /// Populated at config-build time; the eviction task iterates these periodically.
-    pub(crate) per_ip_limiters: Vec<Arc<crate::rate_limiter::PerIpRateLimiter>>,
+    pub per_ip_limiters: Vec<Arc<crate::rate_limiter::PerIpRateLimiter>>,
     /// BackendTLSPolicy: per-backend TLS config for proxy-to-backend connections.
     /// `Arc` so `request_filter` can cache a handle in `RouterCtx` without cloning
     /// the CA bundle.
-    pub(crate) backend_tls: HashMap<(Arc<str>, u16), Arc<BackendTlsInfo>>,
+    pub backend_tls: HashMap<(Arc<str>, u16), Arc<BackendTlsInfo>>,
     /// Client certificate this data plane's Gateway presents to TLS backends
     /// (`spec.tls.backend.clientCertificateRef`).
-    pub(crate) backend_client_cert: Option<Arc<pingora_core::utils::tls::CertKey>>,
+    pub backend_client_cert: Option<Arc<ClientIdentity>>,
     /// Fingerprint of the endpoint set + health-check config each `LoadBalancer`
     /// was built from. `apply_config` reuses the existing `LoadBalancer` (and its
     /// health state) when the signature is unchanged.
-    pub(crate) lb_signatures: HashMap<(Arc<str>, u16), u64>,
+    pub lb_signatures: HashMap<(Arc<str>, u16), u64>,
 }
 
 impl Default for ProxySnapshot {
@@ -790,7 +747,7 @@ impl Default for ProxySnapshot {
 /// Returns true when a listener's hostname pattern claims a request host.
 /// Case-insensitive. `""` matches any host; `"*.suffix"` matches any host
 /// with a non-empty label before `.suffix`; otherwise exact match.
-pub(crate) fn listener_hostname_claims(listener_hostname: &str, host: &str) -> bool {
+pub fn listener_hostname_claims(listener_hostname: &str, host: &str) -> bool {
     if listener_hostname.is_empty() {
         return true;
     }
@@ -805,7 +762,7 @@ pub(crate) fn listener_hostname_claims(listener_hostname: &str, host: &str) -> b
 
 /// Return the listener hostname specificity rank used to sort buckets.
 /// Higher = more specific and should be checked first.
-pub(crate) fn listener_specificity(listener_hostname: &str) -> u32 {
+pub fn listener_specificity(listener_hostname: &str) -> u32 {
     if listener_hostname.is_empty() {
         1
     } else if let Some(suffix) = listener_hostname.strip_prefix("*.") {
@@ -818,7 +775,7 @@ pub(crate) fn listener_specificity(listener_hostname: &str) -> u32 {
 /// Look up a host in a plain domain-wildcard suffix map (no port suffixes).
 /// Equivalent to `lookup_domain_wildcard` but used when the bucket already
 /// scopes by port.
-pub(crate) fn lookup_domain_wildcard_bucket<'a>(
+pub fn lookup_domain_wildcard_bucket<'a>(
     host: &str,
     map: &'a HashMap<String, HostRoutes>,
 ) -> Option<&'a HostRoutes> {
@@ -835,7 +792,7 @@ pub(crate) fn lookup_domain_wildcard_bucket<'a>(
 
 /// Pick the first listener bucket whose hostname pattern claims the request host.
 /// Buckets must be pre-sorted by specificity (most specific first).
-pub(crate) fn select_listener_bucket<'a>(
+pub fn select_listener_bucket<'a>(
     host: &str,
     buckets: &'a [ListenerBucket],
 ) -> Option<&'a ListenerBucket> {
@@ -858,7 +815,7 @@ pub(crate) fn select_listener_bucket<'a>(
 ///   - SNI is absent (plain HTTP or TLS handshake without SNI),
 ///   - SNI and Host resolve to the same listener bucket,
 ///   - SNI matches no listener at all (fallback cert path; no 421 emitted).
-pub(crate) fn detect_misdirected_request(
+pub fn detect_misdirected_request(
     sni: Option<&str>,
     host: &str,
     buckets: &[ListenerBucket],
@@ -878,12 +835,12 @@ pub(crate) fn detect_misdirected_request(
 }
 
 /// Single atomic slot for the bundled per-request config snapshot.
-pub(crate) type SnapshotSlot = Arc<ArcSwap<ProxySnapshot>>;
+pub type SnapshotSlot = Arc<ArcSwap<ProxySnapshot>>;
 
 /// Per-(service, port) load balancer, swapped atomically.
 /// Keyed by (service_name, port) so multi-port services route correctly.
 /// Used by L4 proxy and health check threads (not part of ProxySnapshot path).
-pub(crate) type ServiceLbMap = Arc<ArcSwap<HashMap<(Arc<str>, u16), Arc<LoadBalancer<RoundRobin>>>>>;
+pub type ServiceLbMap = Arc<ArcSwap<HashMap<(Arc<str>, u16), Arc<Pool>>>>;
 
 /// Look up a host in a domain-wildcard map by trying every dot-suffix.
 ///
@@ -892,7 +849,7 @@ pub(crate) type ServiceLbMap = Arc<ArcSwap<HashMap<(Arc<str>, u16), Arc<LoadBala
 /// Returns `None` for apex names (e.g. `bar.com` never matches `*.bar.com`
 /// because the first dot yields `.com`, which is not a wildcard key).
 #[cfg(test)]
-pub(crate) fn lookup_domain_wildcard<'a>(
+pub fn lookup_domain_wildcard<'a>(
     host: &str,
     map: &'a HashMap<String, HostRoutes>,
 ) -> Option<&'a HostRoutes> {
@@ -903,7 +860,7 @@ pub(crate) fn lookup_domain_wildcard<'a>(
 /// keys first (e.g. ".bar.com:80") then falls back to plain suffix (".bar.com").
 /// This handles routes compiled with non-zero listener_port.
 #[cfg(test)]
-pub(crate) fn lookup_domain_wildcard_with_port<'a>(
+pub fn lookup_domain_wildcard_with_port<'a>(
     host: &str,
     port: u16,
     map: &'a HashMap<String, HostRoutes>,
@@ -943,55 +900,8 @@ pub(crate) fn lookup_domain_wildcard_with_port<'a>(
 /// True when an upstream response with `status` should be retried: the route
 /// lists the status and attempts remain. An empty list never retries on
 /// status (only connect failures, see `fail_to_connect`).
-pub(crate) fn should_retry_status(status: u16, retry_codes: &[u16], retries_left: u32) -> bool {
+pub fn should_retry_status(status: u16, retry_codes: &[u16], retries_left: u32) -> bool {
     retries_left > 0 && retry_codes.contains(&status)
-}
-
-/// Maps a Pingora error to the appropriate HTTP status code for Gateway API compliance.
-///
-/// When a route has timeouts configured (`has_timeout` is true):
-/// - `ReadTimedout` or `ConnectTimedout` from upstream → **504** Gateway Timeout
-///
-/// Without timeouts, falls through to Pingora's default behavior:
-/// - Upstream errors → 502
-/// - Downstream read/write/close errors → 0 (connection dead)
-/// - Other downstream errors → 400
-/// - Internal/unset errors → 500
-fn timeout_error_to_status_code(e: &pingora_core::Error, has_timeout: bool) -> u16 {
-    use pingora_core::ErrorType::*;
-
-    // Check for explicit HTTPStatus first (e.g., our 404/500 for no-route)
-    if let HTTPStatus(code) = e.etype() {
-        return *code;
-    }
-
-    // When timeouts are configured, timeout errors become 504 Gateway Timeout
-    // regardless of error source (Pingora may set Upstream or Unset depending
-    // on where the timeout occurs).
-    if has_timeout {
-        match e.etype() {
-            ReadTimedout | ConnectTimedout => return 504,
-            _ => {}
-        }
-    }
-
-    // Default Pingora behavior for other errors
-    match e.esource() {
-        pingora_core::ErrorSource::Upstream => 502,
-        pingora_core::ErrorSource::Downstream => {
-            match e.etype() {
-                WriteError | ReadError | ConnectionClosed => 0,
-                _ => 400,
-            }
-        }
-        pingora_core::ErrorSource::Internal | pingora_core::ErrorSource::Unset => {
-            // Timeout errors from upstream are 502 even if source is Unset
-            match e.etype() {
-                ReadTimedout | ConnectTimedout => 502,
-                _ => 500,
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,7 +917,7 @@ fn timeout_error_to_status_code(e: &pingora_core::Error, has_timeout: bool) -> u
 ///   including multi-level (e.g., `"https://a.b.example.com"`).
 ///   NOTE: Wildcards match across dot boundaries. `"https://*.com"` would match
 ///   any `.com` domain. Operators should use specific enough patterns.
-fn cors_origin_matches(allow_origins: &[String], origin: &str) -> bool {
+pub fn cors_origin_matches(allow_origins: &[String], origin: &str) -> bool {
     for allowed in allow_origins {
         if allowed == "*" {
             return true;
@@ -1036,7 +946,7 @@ fn cors_origin_matches(allow_origins: &[String], origin: &str) -> bool {
 /// When allowCredentials is true and wildcard origins are used, echo the specific origin
 /// (per W3C spec: credentialed requests cannot use "*" as Allow-Origin).
 /// When allowCredentials is false and "*" is in allow_origins, may return "*" or the origin.
-fn cors_allow_origin_value<'a>(cors: &CorsConfig, origin: &'a str, has_credentials: bool) -> std::borrow::Cow<'a, str> {
+pub fn cors_allow_origin_value<'a>(cors: &CorsConfig, origin: &'a str, has_credentials: bool) -> std::borrow::Cow<'a, str> {
     if cors.allow_credentials || has_credentials {
         // When credentials are present (Cookie, Authorization) or allowCredentials
         // is true, MUST echo the specific origin — never "*" (W3C CORS spec).
@@ -1050,7 +960,7 @@ fn cors_allow_origin_value<'a>(cors: &CorsConfig, origin: &'a str, has_credentia
 
 /// Build the Allow-Methods header value for preflight responses.
 /// Uses the pre-joined string to avoid per-request allocation.
-fn cors_methods_value<'a>(allow_methods: &[String], pre_joined: &'a str, requested_method: &'a str) -> &'a str {
+pub fn cors_methods_value<'a>(allow_methods: &[String], pre_joined: &'a str, requested_method: &'a str) -> &'a str {
     if allow_methods.is_empty() {
         return "";
     }
@@ -1063,7 +973,7 @@ fn cors_methods_value<'a>(allow_methods: &[String], pre_joined: &'a str, request
 
 /// Build the Allow-Headers header value for preflight responses.
 /// Uses the pre-joined string to avoid per-request allocation.
-fn cors_headers_value<'a>(allow_headers: &[String], pre_joined: &'a str, requested_headers: &'a str) -> &'a str {
+pub fn cors_headers_value<'a>(allow_headers: &[String], pre_joined: &'a str, requested_headers: &'a str) -> &'a str {
     if allow_headers.is_empty() {
         return "";
     }
@@ -1074,1113 +984,13 @@ fn cors_headers_value<'a>(allow_headers: &[String], pre_joined: &'a str, request
     pre_joined
 }
 
-// ---------------------------------------------------------------------------
-// Router (Pingora ProxyHttp implementation)
-// ---------------------------------------------------------------------------
-
-pub(crate) struct Router {
-    /// PERF-9: Single atomic snapshot for all per-request config maps.
-    /// One ArcSwap::load() replaces 4+ separate loads per request.
-    pub(crate) snapshot: SnapshotSlot,
-    pub(crate) metrics: Arc<ProxyMetrics>,
-    /// Passive outlier ejection state, shared by the HTTP and HTTPS services.
-    pub(crate) outliers: Arc<Outliers>,
-}
-
-impl Router {
-    fn note_ejection(&self, ctx: &RouterCtx, addr: &pingora_core::protocols::l4::socket::SocketAddr, out: Duration, why: &str) {
-        let svc = ctx.service_name.as_deref().unwrap_or("unknown");
-        self.metrics.upstream_ejections_total.with_label_values(&[svc]).inc();
-        warn!("ejected {addr} from {svc}:{} for {out:?} after {why}", ctx.port);
-    }
-}
-
-#[async_trait]
-impl ProxyHttp for Router {
-    type CTX = RouterCtx;
-
-    fn new_ctx(&self) -> Self::CTX {
-        RouterCtx {
-            retries_left: 0,
-            service_name: None,
-            port: 0,
-            connect_timeout: None,
-            read_timeout: None,
-            write_timeout: None,
-            upstream_tls: false,
-            upstream_sni: Arc::clone(&EMPTY_SNI),
-            upstream_verify: true,
-            protocol: BackendProtocol::Http,
-            request_start: Instant::now(),
-            request_headers_add: Arc::clone(&EMPTY_HEADER_VEC),
-            request_headers_set: Arc::clone(&EMPTY_HEADER_VEC),
-            request_headers_remove: Arc::clone(&EMPTY_NAME_VEC),
-            response_headers_add: Arc::clone(&EMPTY_HEADER_VEC),
-            response_headers_set: Arc::clone(&EMPTY_HEADER_VEC),
-            response_headers_remove: Arc::clone(&EMPTY_NAME_VEC),
-            circuit_breaker: None,
-            connection_acquired: false,
-            connection_limiter: None,
-            rewrite_path: None,
-            rewrite_hostname: None,
-            request_timeout: None,
-            has_timeout: false,
-            cors_origin: None,
-            cors_config: None,
-            has_credentials: false,
-            retry_on: Arc::clone(&EMPTY_STRING_VEC),
-            retry_codes: Arc::clone(&EMPTY_CODES),
-            max_request_body_bytes: 0,
-            body_bytes_received: 0,
-            cached_duration: None,
-            cached_lb: None,
-            upstream_addr: None,
-            cached_backend_tls: None,
-            cached_client_cert: None,
-        }
-    }
-
-    async fn request_filter(
-        &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX,
-    ) -> Result<bool> {
-        // PERF-2: TODO — ideally this would borrow from session to avoid a heap
-        // allocation, but the borrow checker requires an owned String because
-        // `host` is used after mutable borrows on `session` (e.g., rate limiter
-        // response, redirect response). Pingora would need to expose the request
-        // header through a separate borrow scope to fix this.
-        let raw_host: String = session
-            .req_header()
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .or_else(|| {
-                session
-                    .req_header()
-                    .uri
-                    .authority()
-                    .map(|a| a.as_str())
-            })
-            .unwrap_or("")
-            .to_string();
-        let host = raw_host.split(':').next().unwrap_or(&raw_host);
-        let path = session.req_header().uri.path();
-        let method = &session.req_header().method;
-        let query = session.req_header().uri.query();
-
-        // The local listener port drives port-specific route matching.
-        let raw_local_port: u16 = session
-            .digest()
-            .and_then(|d| d.socket_digest.as_ref())
-            .and_then(|sd| sd.local_addr())
-            .and_then(|addr| addr.as_inet())
-            .map(|inet| inet.port())
-            .unwrap_or(80);
-        let socket_is_tls = session
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some();
-        let (original_scheme, local_port) = listener_scheme_and_port(raw_local_port, socket_is_tls);
-
-        // PERF-9: One atomic load for all per-request config maps.
-        let snap = self.snapshot.load();
-
-        // HTTPRouteHTTPSListenerDetectMisdirectedRequests (GEP-1486): on HTTPS,
-        // compare the listener that the TLS handshake selected (by SNI) with
-        // the listener that the HTTP Host header claims. If they differ, emit
-        // 421 Misdirected Request before any routing.
-        if socket_is_tls {
-            let misdirected = {
-                let sni = session
-                    .digest()
-                    .and_then(|d| d.ssl_digest.as_ref())
-                    .and_then(|s| s.sni.as_deref())
-                    .map(|s| s.trim_end_matches('.'));
-                let port_buckets: &[ListenerBucket] = snap
-                    .listeners_by_port
-                    .get(&local_port)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[]);
-                let hit = detect_misdirected_request(sni, host, port_buckets);
-                if hit {
-                    log::debug!("421 Misdirected: sni={sni:?} host={host} port={local_port}");
-                }
-                hit
-            };
-            if misdirected {
-                let mut header = pingora_http::ResponseHeader::build(421, None)?;
-                header.insert_header("Content-Length", "0")?;
-                session.write_response_header(Box::new(header), false).await?;
-                session.write_response_body(Some(bytes::Bytes::new()), true).await?;
-                return Ok(true);
-            }
-        }
-
-        // GatewayHTTPListenerIsolation: resolve the listener claiming this
-        // request first (most-specific listener hostname on the matching port),
-        // then match routes only within that listener. A catch-all listener
-        // on the same port does not rescue a request that a more-specific
-        // listener already claims.
-        let bucket = snap
-            .listeners_by_port
-            .get(&local_port)
-            .and_then(|bs| select_listener_bucket(host, bs))
-            .or_else(|| select_listener_bucket(host, &snap.any_port_listeners));
-
-        log::debug!(
-            "route lookup: host={} local_port={} chosen_listener={:?}",
-            host, local_port,
-            bucket.map(|b| b.listener_hostname.as_ref())
-        );
-
-        let host_routes_opt = bucket.and_then(|b| {
-            b.exact
-                .get(host)
-                .or_else(|| lookup_domain_wildcard_bucket(host, &b.domain_wildcards))
-                .or(b.catch_all.as_ref())
-        });
-        let matched = if let Some(host_routes) = host_routes_opt {
-            if let Some(pr) = host_routes.match_request(path, method, &session.req_header().headers, query) {
-                log::debug!(
-                    "matched route: listener={} path={} backend={}:{}",
-                    pr.listener_name, pr.path, pr.service_name, pr.port
-                );
-                // Handle redirect routes: return 3xx response immediately
-                if let Some(ref redirect) = pr.redirect {
-                    let status = redirect.status_code;
-                    let mut location = String::new();
-
-                    // Scheme and port of the listener the request arrived on.
-                    let original_port: u16 = local_port;
-
-                    // Build Location header from redirect config
-                    let effective_scheme = redirect.scheme.as_deref().unwrap_or(original_scheme);
-                    location.push_str(effective_scheme);
-                    location.push_str("://");
-
-                    if let Some(ref hostname) = redirect.hostname {
-                        location.push_str(hostname);
-                    } else {
-                        location.push_str(host);
-                    }
-
-                    // Determine effective port:
-                    // - If redirect specifies a port, use it
-                    // - If redirect changes the scheme (explicit scheme), default to the new scheme's port
-                    // - If redirect keeps the same scheme (no explicit scheme), preserve original listener port
-                    let effective_port = if let Some(p) = redirect.port {
-                        Some(p)
-                    } else if redirect.scheme.is_some() {
-                        // Scheme is changing: default to new scheme's standard port (omitted)
-                        None
-                    } else {
-                        // Scheme preserved: carry original listener port
-                        Some(original_port)
-                    };
-                    if let Some(port) = effective_port {
-                        let is_default_port = (effective_scheme == "http" && port == 80)
-                            || (effective_scheme == "https" && port == 443);
-                        if !is_default_port {
-                            location.push(':');
-                            location.push_str(&port.to_string());
-                        }
-                    }
-
-                    if let Some(ref redir_path) = redirect.path {
-                        match redirect.path_type.as_str() {
-                            "ReplaceFullPath" => location.push_str(redir_path),
-                            "ReplacePrefixMatch" => {
-                                let prefix = pr.path.as_ref();
-                                if let Some(suffix) = path.strip_prefix(prefix) {
-                                    location.push_str(redir_path);
-                                    if !redir_path.ends_with('/') && !suffix.starts_with('/') && !suffix.is_empty() {
-                                        location.push('/');
-                                    }
-                                    // Avoid double slash when replacement ends with '/' and suffix starts with '/'
-                                    if redir_path.ends_with('/') && suffix.starts_with('/') {
-                                        location.push_str(&suffix[1..]);
-                                    } else {
-                                        location.push_str(suffix);
-                                    }
-                                } else {
-                                    location.push_str(redir_path);
-                                }
-                            }
-                            _ => location.push_str(path),
-                        }
-                    } else {
-                        location.push_str(path);
-                    }
-
-                    let mut header = pingora_http::ResponseHeader::build(status, None)?;
-                    header.insert_header("Location", &location)?;
-                    header.insert_header("Content-Length", "0")?;
-                    session.write_response_header(Box::new(header), false).await?;
-                    session.write_response_body(Some(bytes::Bytes::new()), true).await?;
-                    return Ok(true);
-                }
-                // CORS handling: check Origin against allow_origins
-                if let Some(ref cors) = pr.cors {
-                    let origin_hv = session.req_header().headers.get("origin").cloned();
-                    let origin_str = origin_hv.as_ref().and_then(|v| v.to_str().ok());
-
-                    if let Some(origin_str) = origin_str {
-                        let origin_matched = cors_origin_matches(&cors.allow_origins, origin_str);
-                        let is_preflight = *method == http::Method::OPTIONS
-                            && session.req_header().headers.get("access-control-request-method").is_some();
-
-                        // Non-matching origin preflight: return 403 with no CORS headers.
-                        // Browser blocks the request; 403 makes rejection explicit in logs.
-                        if !origin_matched && is_preflight {
-                            let mut header = pingora_http::ResponseHeader::build(403, None)?;
-                            header.insert_header("Content-Length", "0")?;
-                            session.write_response_header(Box::new(header), false).await?;
-                            session.write_response_body(Some(bytes::Bytes::new()), true).await?;
-                            return Ok(true);
-                        }
-
-                        if origin_matched {
-                            if is_preflight {
-                                // Preflight: return 200 immediately with CORS headers
-                                let mut header = pingora_http::ResponseHeader::build(200, None)?;
-                                // Determine allowed origin header value
-                                let has_creds = session.req_header().headers.get("cookie").is_some()
-                                    || session.req_header().headers.get("authorization").is_some();
-                                let acao = cors_allow_origin_value(cors, origin_str, has_creds);
-                                header.insert_header("access-control-allow-origin", acao.as_ref())?;
-                                if acao != "*" {
-                                    header.insert_header("vary", "Origin")?;
-                                }
-
-                                // Allow-Methods: echo requested method or list configured
-                                let requested_method = session.req_header().headers.get("access-control-request-method")
-                                    .and_then(|v| v.to_str().ok())
-                                    .unwrap_or("");
-                                let methods_value = cors_methods_value(&cors.allow_methods, &cors.allow_methods_joined, requested_method);
-                                if !methods_value.is_empty() {
-                                    header.insert_header("access-control-allow-methods", methods_value)?;
-                                }
-
-                                // Allow-Headers: echo requested headers or list configured
-                                let requested_headers = session.req_header().headers.get("access-control-request-headers")
-                                    .and_then(|v| v.to_str().ok())
-                                    .unwrap_or("");
-                                let headers_value = cors_headers_value(&cors.allow_headers, &cors.allow_headers_joined, requested_headers);
-                                if !headers_value.is_empty() {
-                                    header.insert_header("access-control-allow-headers", headers_value)?;
-                                }
-
-                                // Expose-Headers
-                                if !cors.expose_headers.is_empty() {
-                                    header.insert_header("access-control-expose-headers", cors.expose_headers_joined.as_ref())?;
-                                }
-
-                                // Max-Age
-                                if cors.max_age > 0 {
-                                    header.insert_header("access-control-max-age", cors.max_age_str.as_ref())?;
-                                }
-
-                                // Allow-Credentials: only if true AND origin is not literal "*"
-                                if cors.allow_credentials && acao != "*" {
-                                    header.insert_header("access-control-allow-credentials", "true")?;
-                                }
-
-                                header.insert_header("Content-Length", "0")?;
-                                session.write_response_header(Box::new(header), false).await?;
-                                session.write_response_body(Some(bytes::Bytes::new()), true).await?;
-                                return Ok(true);
-                            } else {
-                                // Simple/actual request: store for response filtering
-                                ctx.cors_origin = origin_hv.clone();
-                                ctx.cors_config = Some(Arc::clone(cors));
-                                ctx.has_credentials = session.req_header().headers.get("cookie").is_some()
-                                    || session.req_header().headers.get("authorization").is_some();
-                            }
-                        }
-                    }
-                }
-
-                // Extract client IP once — used for IP allowlist and per-IP rate limiting.
-                // SEC-11: When trusted proxy CIDRs are configured, extract the real
-                // client IP from XFF. Otherwise use the peer address directly.
-                let client_ip: Option<std::net::IpAddr> = session
-                    .digest()
-                    .and_then(|d| d.socket_digest.as_ref())
-                    .and_then(|sd| sd.peer_addr())
-                    .and_then(|addr| addr.as_inet())
-                    .map(|sock_addr| {
-                        let peer = sock_addr.ip();
-                        if pr.ip_trusted_proxy_cidrs.is_empty() {
-                            peer
-                        } else {
-                            let xff = session.req_header().headers.get("x-forwarded-for")
-                                .and_then(|v| v.to_str().ok())
-                                .unwrap_or("");
-                            extract_client_ip(xff, peer, &pr.ip_trusted_proxy_cidrs)
-                        }
-                    });
-
-                // IP allowlist check
-                if !pr.ip_allow_cidrs.is_empty() || !pr.ip_deny_cidrs.is_empty() {
-                    let denied = if let Some(ip) = client_ip {
-                        if pr.ip_deny_cidrs.iter().any(|cidr| cidr.contains(&ip)) {
-                            true
-                        } else if !pr.ip_allow_cidrs.is_empty() {
-                            !pr.ip_allow_cidrs.iter().any(|cidr| cidr.contains(&ip))
-                        } else {
-                            false
-                        }
-                    } else {
-                        !pr.ip_allow_cidrs.is_empty()
-                    };
-
-                    if denied {
-                        let resp = pingora_http::ResponseHeader::build(403, None)?;
-                        session.write_response_header(Box::new(resp), false).await?;
-                        session.write_response_body(Some(bytes::Bytes::from_static(b"Forbidden")), true).await?;
-                        return Ok(true);
-                    }
-                }
-
-                // Request body size limit check (SEC-4: use global default when no policy)
-                let effective_body_limit = if pr.max_request_body_bytes > 0 {
-                    pr.max_request_body_bytes
-                } else {
-                    DEFAULT_MAX_REQUEST_BODY_BYTES
-                };
-                if let Some(cl) = session.req_header().headers.get("content-length")
-                    && let Ok(len) = cl.to_str().unwrap_or("0").parse::<u64>()
-                        && len > effective_body_limit {
-                            let resp = pingora_http::ResponseHeader::build(413, None)?;
-                            session.write_response_header(Box::new(resp), false).await?;
-                            session.write_response_body(Some(bytes::Bytes::from_static(b"Request Entity Too Large")), true).await?;
-                            return Ok(true);
-                        }
-
-                // Auth check -- before rate limiting so unauthenticated requests don't consume tokens
-                if let Some(ref auth_config) = pr.auth_config {
-                    use crate::auth::{validate_basic_auth, validate_api_key};
-                    use crate::types::AuthConfig;
-                    match auth_config {
-                        AuthConfig::BasicAuth { credentials, realm } => {
-                            let auth_header = session.req_header().headers.get("authorization");
-                            if let Err(status) = validate_basic_auth(auth_header, credentials).await {
-                                let mut resp = pingora_http::ResponseHeader::build(status, None)?;
-                                // SEC-10: Sanitize realm to prevent header injection via CRD field
-                                let safe_realm: String = realm.chars().filter(|c| *c != '"' && *c != '\r' && *c != '\n').collect();
-                                resp.insert_header("WWW-Authenticate", format!("Basic realm=\"{}\"", safe_realm))?;
-                                resp.insert_header("Content-Length", "0")?;
-                                session.write_response_header(Box::new(resp), false).await?;
-                                session.write_response_body(Some(bytes::Bytes::new()), true).await?;
-                                return Ok(true);
-                            }
-                        }
-                        AuthConfig::ApiKey { valid_keys, header_name } => {
-                            let key_header = session.req_header().headers.get(header_name.as_str());
-                            if let Err(status) = validate_api_key(key_header, valid_keys) {
-                                let mut resp = pingora_http::ResponseHeader::build(status, None)?;
-                                resp.insert_header("Content-Length", "0")?;
-                                session.write_response_header(Box::new(resp), false).await?;
-                                session.write_response_body(Some(bytes::Bytes::new()), true).await?;
-                                return Ok(true);
-                            }
-                        }
-                    }
-                }
-
-                // Weighted backend selection: override primary backend if weights configured
-                if let Some(selected) = select_weighted_backend(&pr.weighted_backends, pr.total_weight) {
-                    ctx.service_name = Some(Arc::clone(&selected.service_name));
-                    ctx.port = selected.port;
-                    // Per-backend headers override rule-level headers when present
-                    if !selected.request_headers_add.is_empty()
-                        || !selected.request_headers_set.is_empty()
-                        || !selected.request_headers_remove.is_empty()
-                    {
-                        ctx.request_headers_add = Arc::clone(&selected.request_headers_add);
-                        ctx.request_headers_set = Arc::clone(&selected.request_headers_set);
-                        ctx.request_headers_remove = Arc::clone(&selected.request_headers_remove);
-                    } else {
-                        ctx.request_headers_add = Arc::clone(&pr.request_headers_add);
-                        ctx.request_headers_set = Arc::clone(&pr.request_headers_set);
-                        ctx.request_headers_remove = Arc::clone(&pr.request_headers_remove);
-                    }
-                } else {
-                    ctx.service_name = Some(Arc::clone(&pr.service_name));
-                    ctx.port = pr.port;
-                    ctx.request_headers_add = Arc::clone(&pr.request_headers_add);
-                    ctx.request_headers_set = Arc::clone(&pr.request_headers_set);
-                    ctx.request_headers_remove = Arc::clone(&pr.request_headers_remove);
-                }
-                ctx.connect_timeout = pr.connect_timeout;
-                ctx.read_timeout = pr.read_timeout;
-                ctx.write_timeout = pr.write_timeout;
-                ctx.retries_left = pr.max_retries;
-                ctx.retry_on = Arc::clone(&pr.retry_on);
-                ctx.retry_codes = Arc::clone(&pr.retry_codes);
-                ctx.max_request_body_bytes = effective_body_limit;
-                ctx.upstream_tls = pr.upstream_tls;
-                ctx.upstream_sni = Arc::clone(&pr.upstream_sni);
-                ctx.upstream_verify = pr.upstream_verify;
-                ctx.protocol = pr.protocol;
-                ctx.response_headers_add = Arc::clone(&pr.response_headers_add);
-                ctx.response_headers_set = Arc::clone(&pr.response_headers_set);
-                ctx.response_headers_remove = Arc::clone(&pr.response_headers_remove);
-
-                // Gateway API conformance: when a route has no valid backends
-                // (e.g., invalid cross-namespace ref without ReferenceGrant),
-                // the compiled route has an empty service_name. Return 500.
-                if ctx.service_name.as_deref().is_some_and(|s| s.is_empty()) {
-                    let mut header = pingora_http::ResponseHeader::build(500, None)?;
-                    header.insert_header("Content-Length", "0")?;
-                    session.write_response_header(Box::new(header), false).await?;
-                    session.write_response_body(Some(bytes::Bytes::new()), true).await?;
-                    return Ok(true);
-                }
-
-                // PERF-9: Cache the LB from the snapshot so upstream_peer() doesn't
-                // need another ArcSwap load.
-                if let Some(sn) = ctx.service_name.as_ref() {
-                    let lb_key = (sn.clone(), ctx.port);
-                    ctx.cached_lb = snap.lbs.get(&lb_key).cloned();
-                    ctx.cached_backend_tls = snap.backend_tls.get(&lb_key).cloned();
-                    ctx.cached_client_cert = snap.backend_client_cert.clone();
-                }
-
-                // PERF-7: Cache the duration histogram handle now that host/proto
-                // labels are known. Avoids a HashMap lookup + Vec<String> alloc
-                // per request in logging().
-                {
-                    let host_label = ctx.service_name.as_deref().unwrap_or("no_route");
-                    let proto_label = match ctx.protocol {
-                        BackendProtocol::Http => "http",
-                        BackendProtocol::Grpc => "grpc",
-                        BackendProtocol::H2c => "h2c",
-                        BackendProtocol::WebSocket => "ws",
-                    };
-                    ctx.cached_duration = Some(
-                        self.metrics
-                            .request_duration
-                            .with_label_values(&[host_label, proto_label]),
-                    );
-                }
-
-                // Per-route timeout: backend_request_timeout overrides read_timeout
-                if let Some(t) = pr.backend_request_timeout {
-                    ctx.read_timeout = Some(t);
-                    ctx.has_timeout = true;
-                }
-                // request_timeout sets overall deadline. If no backend_request_timeout
-                // is set, use request_timeout as the read_timeout so Pingora enforces it.
-                // If both are set, use the smaller of the two.
-                if let Some(t) = pr.request_timeout {
-                    ctx.request_timeout = Some(t);
-                    ctx.has_timeout = true;
-                    match ctx.read_timeout {
-                        Some(existing) if existing <= t => {
-                            // backend_request_timeout is tighter, keep it
-                        }
-                        _ => {
-                            ctx.read_timeout = Some(t);
-                        }
-                    }
-                }
-
-                // URL rewrite: store rewritten path/hostname for upstream_request_filter
-                ctx.rewrite_path = pr.rewrite_path(path);
-                ctx.rewrite_hostname = pr.rewrite_hostname().cloned();
-
-                // Fire-and-forget mirror requests (multiple mirrors supported)
-                for (mirror_svc, mirror_port, mirror_percent) in &pr.mirror_backends {
-                    // percent=0 means mirror all; otherwise check random sample
-                    if *mirror_percent > 0 && *mirror_percent < 100 {
-                        let roll: f64 = rand::random::<f64>() * 100.0;
-                        if roll >= *mirror_percent as f64 {
-                            continue;
-                        }
-                    }
-                    // Forward key request headers to mirror backend
-                    let req_headers = session.req_header();
-                    let mirror_headers: Vec<(String, String)> = req_headers.headers
-                        .iter()
-                        .filter(|(name, _)| {
-                            let n = name.as_str();
-                            // Forward content and application headers, skip hop-by-hop
-                            n.starts_with("content-") || n.starts_with("x-") ||
-                            n == "accept" || n == "user-agent"
-                        })
-                        .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-                        .collect();
-                    // Mirror the request line verbatim (path *and* query): the
-                    // Gateway API suite keys its mirror check on the full
-                    // request target, and a mirror that drops the query is not
-                    // a faithful copy.
-                    let mirror_target = session
-                        .req_header()
-                        .uri
-                        .path_and_query()
-                        .map(|pq| pq.as_str())
-                        .unwrap_or(path);
-                    spawn_mirror_request(
-                        mirror_svc,
-                        *mirror_port,
-                        method,
-                        mirror_target,
-                        host,
-                        &mirror_headers,
-                        &snap.lbs,
-                    );
-                }
-
-                session.set_keepalive(Some(60));
-
-                if let Some(ref limiter) = pr.rate_limiter {
-                    use crate::rate_limiter::RateLimiterMode;
-                    let allowed = match limiter {
-                        RateLimiterMode::Shared(bucket) => bucket.try_acquire(),
-                        RateLimiterMode::PerIp(per_ip) => {
-                            client_ip.is_some_and(|ip| per_ip.try_acquire(ip))
-                        }
-                    };
-                    if !allowed {
-                        let mut header = pingora_http::ResponseHeader::build(429, None)?;
-                        header.insert_header("Content-Length", "19")?;
-                        session
-                            .write_response_header(Box::new(header), false)
-                            .await?;
-                        session
-                            .write_response_body(
-                                Some(bytes::Bytes::from_static(b"rate limit exceeded")),
-                                true,
-                            )
-                            .await?;
-                        self.metrics
-                            .rate_limit_rejected_total
-                            .with_label_values(&[pr.service_name.as_ref()])
-                            .inc();
-                        return Ok(true);
-                    }
-                }
-
-                // PERF-8: Circuit breaker and connection limiter are embedded
-                // directly in PathRoute — no per-request map lookups needed.
-                if let Some(ref cb) = pr.circuit_breaker {
-                    if !cb.allow_request() {
-                        let mut header = pingora_http::ResponseHeader::build(503, None)?;
-                        header.insert_header("Content-Length", "15")?;
-                        session.write_response_header(Box::new(header), false).await?;
-                        session.write_response_body(
-                            Some(bytes::Bytes::from_static(b"circuit is open")),
-                            true,
-                        ).await?;
-                        return Ok(true);
-                    }
-                    ctx.circuit_breaker = Some(Arc::clone(cb));
-                }
-                if let Some(ref cl) = pr.connection_limiter {
-                    if !cl.try_acquire() {
-                        let mut header = pingora_http::ResponseHeader::build(503, None)?;
-                        header.insert_header("Content-Length", "24")?;
-                        session.write_response_header(Box::new(header), false).await?;
-                        session.write_response_body(
-                            Some(bytes::Bytes::from_static(b"connection limit reached")),
-                            true,
-                        ).await?;
-                        return Ok(true);
-                    }
-                    ctx.connection_acquired = true;
-                    ctx.connection_limiter = Some(Arc::clone(cl));
-                }
-
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
-        if !matched {
-            session.set_keepalive(None);
-            let mut header = pingora_http::ResponseHeader::build(404, None)?;
-            header.insert_header("Content-Length", "8")?;
-            session
-                .write_response_header(Box::new(header), false)
-                .await?;
-            session
-                .write_response_body(
-                    Some(bytes::Bytes::from_static(b"no route")),
-                    true,
-                )
-                .await?;
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    async fn request_body_filter(
-        &self,
-        _session: &mut Session,
-        body: &mut Option<bytes::Bytes>,
-        _end_of_stream: bool,
-        ctx: &mut Self::CTX,
-    ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        // Enforce body size limit for chunked requests (no Content-Length header).
-        // Content-Length requests are checked in request_filter; this handles streaming.
-        if ctx.max_request_body_bytes > 0
-            && let Some(data) = body {
-                ctx.body_bytes_received += data.len() as u64;
-                if ctx.body_bytes_received > ctx.max_request_body_bytes {
-                    return Err(pingora_core::Error::explain(
-                        pingora_core::ErrorType::HTTPStatus(413),
-                        "request body exceeds size limit",
-                    ));
-                }
-            }
-        Ok(())
-    }
-
-    async fn upstream_request_filter(
-        &self,
-        session: &mut Session,
-        upstream_request: &mut pingora_http::RequestHeader,
-        ctx: &mut Self::CTX,
-    ) -> Result<()> {
-        // Inject X-Forwarded-For and X-Real-IP from downstream client address
-        // PERF-3: Use stack buffer for IP string to avoid heap allocation per request.
-        if let Some(addr) = session.downstream_session.client_addr() {
-            use std::fmt::Write;
-            let mut ip_buf = arrayvec::ArrayString::<64>::new();
-            if let Some(inet) = addr.as_inet() {
-                let _ = write!(&mut ip_buf, "{}", inet.ip());
-            } else {
-                let _ = write!(&mut ip_buf, "{}", addr);
-            }
-            let ip = ip_buf.as_str();
-            // Append to existing X-Forwarded-For if present, otherwise set
-            let xff = if let Some(existing) = upstream_request.headers.get("x-forwarded-for") {
-                format!("{}, {}", existing.to_str().unwrap_or(""), ip)
-            } else {
-                ip.to_owned()
-            };
-            upstream_request.insert_header("x-forwarded-for", &xff)?;
-            upstream_request.insert_header("x-real-ip", ip)?;
-        }
-
-        // URL rewrite: modify path and/or host before proxying
-        if let Some(ref new_path) = ctx.rewrite_path
-            && let Ok(uri) = new_path.parse::<http::Uri>() {
-                upstream_request.set_uri(uri);
-            }
-        if let Some(ref new_host) = ctx.rewrite_hostname {
-            upstream_request.insert_header("host", new_host.as_ref())?;
-        }
-
-        // CRD header mutations: removes first, then sets (overwrite), then adds (comma-append)
-        for name in ctx.request_headers_remove.iter() {
-            upstream_request.remove_header(name);
-        }
-        for (name, value) in ctx.request_headers_set.iter() {
-            upstream_request.insert_header(name.clone(), value)?;
-        }
-        for (name, value) in ctx.request_headers_add.iter() {
-            // Gateway API: add = append with comma separator if header exists
-            if let Some(existing) = upstream_request.headers.get(name) {
-                // PERF-17: Stack buffer for small header appends to avoid heap allocation
-                let existing_str = existing.to_str().unwrap_or("");
-                let value_str = value.to_str().unwrap_or("");
-                if existing_str.len() + 1 + value_str.len() < 128 {
-                    use std::fmt::Write;
-                    let mut buf = arrayvec::ArrayString::<128>::new();
-                    let _ = write!(&mut buf, "{},{}", existing_str, value_str);
-                    upstream_request.insert_header(name.clone(), buf.as_str())?;
-                } else {
-                    let new_val = format!("{},{}", existing_str, value_str);
-                    upstream_request.insert_header(name.clone(), &new_val)?;
-                }
-            } else {
-                upstream_request.insert_header(name.clone(), value)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// HTTPRoute rule-level retry (`retry.codes`): an upstream response with
-    /// one of the configured statuses is discarded and the request replayed
-    /// while attempts remain. Returning a retryable error here re-enters
-    /// Pingora's upstream loop before anything reaches the client; the last
-    /// attempt's response passes through unchanged.
-    async fn upstream_response_filter(
-        &self,
-        _session: &mut Session,
-        upstream_response: &mut pingora_http::ResponseHeader,
-        ctx: &mut Self::CTX,
-    ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        let status = upstream_response.status.as_u16();
-        if let (Some(lb), Some(addr)) = (ctx.cached_lb.as_ref(), ctx.upstream_addr.as_ref())
-            && let Some(out) = self.outliers.responded(lb, addr, status)
-        {
-            self.note_ejection(ctx, addr, out, &format!("{status} responses in a row"));
-        }
-        if should_retry_status(status, &ctx.retry_codes, ctx.retries_left) {
-            ctx.retries_left -= 1;
-            info!(
-                "upstream {:?} answered {status}, retrying ({} left)",
-                ctx.service_name, ctx.retries_left
-            );
-            let mut e = pingora_core::Error::explain(
-                pingora_core::ErrorType::HTTPStatus(status),
-                "retrying on upstream response status",
-            );
-            e.set_retry(true);
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    async fn response_filter(
-        &self,
-        _session: &mut Session,
-        upstream_response: &mut pingora_http::ResponseHeader,
-        ctx: &mut Self::CTX,
-    ) -> Result<()>
-    where
-        Self::CTX: Send + Sync,
-    {
-        // Removes first, then sets (overwrite), then adds (comma-append)
-        for name in ctx.response_headers_remove.iter() {
-            upstream_response.remove_header(name);
-        }
-        for (name, value) in ctx.response_headers_set.iter() {
-            upstream_response.insert_header(name.clone(), value)?;
-        }
-        for (name, value) in ctx.response_headers_add.iter() {
-            // Gateway API: add = append with comma separator if header exists
-            if let Some(existing) = upstream_response.headers.get(name) {
-                // PERF-17: Stack buffer for small header appends to avoid heap allocation
-                let existing_str = existing.to_str().unwrap_or("");
-                let value_str = value.to_str().unwrap_or("");
-                if existing_str.len() + 1 + value_str.len() < 128 {
-                    use std::fmt::Write;
-                    let mut buf = arrayvec::ArrayString::<128>::new();
-                    let _ = write!(&mut buf, "{},{}", existing_str, value_str);
-                    upstream_response.insert_header(name.clone(), buf.as_str())?;
-                } else {
-                    let new_val = format!("{},{}", existing_str, value_str);
-                    upstream_response.insert_header(name.clone(), &new_val)?;
-                }
-            } else {
-                upstream_response.insert_header(name.clone(), value)?;
-            }
-        }
-
-        // CORS: add response headers for simple/actual requests
-        if let (Some(origin_hv), Some(cors)) = (&ctx.cors_origin, &ctx.cors_config) {
-            let origin = origin_hv.to_str().unwrap_or("");
-            let has_creds = ctx.has_credentials;
-            let acao = cors_allow_origin_value(cors, origin, has_creds);
-            upstream_response.insert_header("access-control-allow-origin", acao.as_ref())?;
-            if acao != "*" {
-                upstream_response.append_header("vary", "Origin")?;
-            }
-            if cors.allow_credentials && acao != "*" {
-                upstream_response.insert_header("access-control-allow-credentials", "true")?;
-            }
-            if !cors.expose_headers.is_empty() {
-                upstream_response.insert_header("access-control-expose-headers", cors.expose_headers_joined.as_ref())?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn upstream_peer(
-        &self,
-        session: &mut Session,
-        ctx: &mut Self::CTX,
-    ) -> Result<Box<HttpPeer>> {
-        let service_name = ctx.service_name.as_ref().ok_or_else(|| {
-            let host = session
-                .req_header()
-                .headers
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("<unknown>");
-            let path = session.req_header().uri.path();
-            pingora_core::Error::explain(
-                pingora_core::ErrorType::HTTPStatus(404),
-                format!("no route for {host}{path}"),
-            )
-        })?;
-
-        // PERF-9: Use the LB cached in request_filter to avoid a second ArcSwap load.
-        let lb = ctx.cached_lb.as_ref().ok_or_else(|| {
-            pingora_core::Error::explain(
-                pingora_core::ErrorType::HTTPStatus(500),
-                format!("no endpoints for {}:{}", service_name, ctx.port),
-            )
-        })?;
-
-        let backend = lb.select(b"", 256).ok_or_else(|| {
-            pingora_core::Error::explain(
-                pingora_core::ErrorType::HTTPStatus(500),
-                format!("no ready endpoints for {}:{}", service_name, ctx.port),
-            )
-        })?;
-
-        // BackendTLSPolicy: resolved in request_filter from the same snapshot as
-        // the LB, so no second ArcSwap load or key allocation here. A policy
-        // overrides the route-level upstream_tls.
-        let backend_tls_info = ctx.cached_backend_tls.as_deref();
-
-        let (use_tls, sni) = if let Some(btls) = backend_tls_info {
-            // BackendTLSPolicy provides TLS config for this backend
-            (true, btls.hostname.to_string())
-        } else if ctx.upstream_tls {
-            // Route-level TLS (e.g., appProtocol: kubernetes.io/h2c or existing upstream_tls)
-            (true, ctx.upstream_sni.to_string())
-        } else {
-            (false, String::new())
-        };
-
-        ctx.upstream_addr = Some(backend.addr.clone());
-        let mut peer = HttpPeer::new(backend.addr, use_tls, sni);
-        if use_tls {
-            // Gateway spec.tls.backend.clientCertificateRef: present the
-            // Gateway's client certificate to the backend (mTLS). Part of the
-            // peer's reuse hash, so pooled connections never mix identities.
-            peer.client_cert_key = ctx.cached_client_cert.clone();
-            if let Some(btls) = backend_tls_info {
-                // BackendTLSPolicy: verify cert against the policy's custom CA certs
-                peer.options.verify_cert = true;
-                peer.options.ca = Some(Arc::clone(&btls.ca_certs));
-                if !btls.subject_alt_names.is_empty() {
-                    peer.options.required_sans = Some(Arc::clone(&btls.subject_alt_names));
-                }
-            } else {
-                peer.options.verify_cert = ctx.upstream_verify;
-            }
-        }
-        if let Some(t) = ctx.connect_timeout {
-            peer.options.connection_timeout = Some(t);
-        }
-        if let Some(t) = ctx.read_timeout {
-            peer.options.read_timeout = Some(t);
-        }
-        if let Some(t) = ctx.write_timeout {
-            peer.options.write_timeout = Some(t);
-        }
-
-        // Connection pooling: keep idle upstream connections alive for 60s.
-        // Without this, Pingora uses no idle timeout and connections may be
-        // evicted from the pool prematurely by the OS or intermediate LBs.
-        peer.options.idle_timeout = Some(Duration::from_secs(60));
-
-        // TCP keepalive: detect dead connections quickly. Kubernetes services
-        // and cloud LBs may silently drop idle TCP connections; keepalive
-        // probes prevent the proxy from sending requests on dead sockets.
-        peer.options.tcp_keepalive = Some(pingora_core::protocols::TcpKeepalive {
-            idle: Duration::from_secs(15),
-            interval: Duration::from_secs(5),
-            count: 3,
-            #[cfg(target_os = "linux")]
-            user_timeout: Duration::from_secs(0),
-        });
-
-        // gRPC requires HTTP/2 with concurrent stream support.
-        // set_http_version(2, 2) forces HTTP/2 minimum, which makes Pingora
-        // use h2c for plaintext upstreams. ALPN::H2 handles TLS negotiation.
-        if ctx.protocol == BackendProtocol::Grpc {
-            peer.options.set_http_version(2, 2);
-            // Allow many concurrent streams per connection for multiplexed RPCs.
-            // Typical gRPC servers advertise 100+ concurrent streams; 200 is a
-            // safe default that avoids under-utilization without hitting common
-            // server-side limits.
-            peer.options.max_h2_streams = 200;
-            // Periodic HTTP/2 PING frames detect dead connections quickly,
-            // critical for long-lived gRPC streams behind load balancers that
-            // silently drop idle connections.
-            peer.options.h2_ping_interval = Some(Duration::from_secs(30));
-        }
-        if ctx.protocol == BackendProtocol::Grpc || ctx.protocol == BackendProtocol::H2c {
-            peer.options.h2_stream_window_size = Some(UPSTREAM_H2_STREAM_WINDOW);
-            peer.options.h2_connection_window_size = Some(UPSTREAM_H2_CONNECTION_WINDOW);
-        }
-
-        // H2C (HTTP/2 cleartext) for backends with appProtocol: kubernetes.io/h2c.
-        // Uses HTTP/2 prior knowledge (no upgrade), matching the conformance test
-        // which sends H2CPriorKnowledgeProtocol requests.
-        if ctx.protocol == BackendProtocol::H2c {
-            peer.options.set_http_version(2, 2);
-        }
-
-        Ok(Box::new(peer))
-    }
-
-    fn fail_to_connect(
-        &self,
-        _session: &mut Session,
-        _peer: &HttpPeer,
-        ctx: &mut Self::CTX,
-        mut e: Box<pingora_core::Error>,
-    ) -> Box<pingora_core::Error> {
-        let svc = ctx.service_name.as_deref().unwrap_or("unknown");
-        self.metrics
-            .upstream_connect_errors_total
-            .with_label_values(&[svc])
-            .inc();
-        if let (Some(lb), Some(addr)) = (ctx.cached_lb.as_ref(), ctx.upstream_addr.as_ref())
-            && let Some(out) = self.outliers.connect_failed(lb, addr)
-        {
-            self.note_ejection(ctx, addr, out, "a connect failure");
-        }
-        // Retry on connect failure if retries_left > 0 AND retry_on allows it.
-        // Empty retry_on = retry on connect-failure (backward compat).
-        // Non-empty retry_on = must contain "connect-failure" or "gateway-error".
-        let should_retry = ctx.retries_left > 0
-            && (ctx.retry_on.is_empty()
-                || ctx.retry_on.iter().any(|c| c == "connect-failure" || c == "gateway-error"));
-        if should_retry {
-            ctx.retries_left -= 1;
-            e.set_retry(true);
-            warn!(
-                "upstream connect failed for {:?}, retrying ({} left)",
-                ctx.service_name, ctx.retries_left
-            );
-        }
-        e
-    }
-
-    /// Override default error handling to return Gateway API-compliant status codes.
-    ///
-    /// When a route has request_timeout or backend_request_timeout configured:
-    /// - ReadTimedout from upstream -> 504 Gateway Timeout (not default 502)
-    /// - ConnectTimedout from upstream -> 504 Gateway Timeout (not default 502)
-    ///
-    /// All other errors fall through to Pingora's default behavior.
-    async fn fail_to_proxy(
-        &self,
-        session: &mut Session,
-        e: &pingora_core::Error,
-        ctx: &mut Self::CTX,
-    ) -> FailToProxy
-    where
-        Self::CTX: Send + Sync,
-    {
-        let code = timeout_error_to_status_code(e, ctx.has_timeout);
-        if code > 0 {
-            session.respond_error(code).await.unwrap_or_else(|e| {
-                warn!("failed to send error response to downstream: {e}");
-            });
-        }
-        FailToProxy {
-            error_code: code,
-            can_reuse_downstream: false,
-        }
-    }
-
-    async fn logging(&self, session: &mut Session, _e: Option<&pingora_core::Error>, ctx: &mut Self::CTX) {
-        let duration = ctx.request_start.elapsed().as_secs_f64();
-
-        // PERF-4: Stack buffer for status code avoids heap allocation per request.
-        let status_u16 = session
-            .response_written()
-            .map_or(0u16, |resp| resp.status.as_u16());
-        let mut status_buf = arrayvec::ArrayString::<4>::new();
-        let _ = std::fmt::Write::write_fmt(&mut status_buf, format_args!("{}", status_u16));
-        let status = status_buf.as_str();
-
-        let host = ctx
-            .service_name
-            .as_deref()
-            .unwrap_or("no_route");
-
-        let proto = match ctx.protocol {
-            BackendProtocol::Http => "http",
-            BackendProtocol::Grpc => "grpc",
-            BackendProtocol::H2c => "h2c",
-            BackendProtocol::WebSocket => "ws",
-        };
-
-        self.metrics
-            .request_total
-            .with_label_values(&[host, status, proto])
-            .inc();
-
-        // PERF-7: Use cached histogram handle when available (populated in
-        // request_filter after route match), avoiding a HashMap lookup per request.
-        if let Some(ref h) = ctx.cached_duration {
-            h.observe(duration);
-        } else {
-            self.metrics
-                .request_duration
-                .with_label_values(&[host, proto])
-                .observe(duration);
-        }
-
-        // Circuit breaker recording -- record only in logging()
-        // so retries are exhausted first and only the final outcome counts.
-        if let Some(ref cb) = ctx.circuit_breaker {
-            let status_code = session.response_written()
-                .map_or(0u16, |resp| resp.status.as_u16());
-            if status_code >= 500 || status_code == 0 {
-                cb.record_failure();
-            } else {
-                cb.record_success();
-            }
-            // Update metric
-            let svc = ctx.service_name.as_deref().unwrap_or("unknown");
-            self.metrics.circuit_breaker_state
-                .with_label_values(&[svc])
-                .set(cb.current_state() as i64);
-        }
-
-        // Connection limiter release -- MUST always execute to prevent slot leak.
-        // Pingora guarantees logging() is called after every request_filter(),
-        // including early returns (auth failures, redirects, circuit breaker open).
-        if ctx.connection_acquired
-            && let Some(ref cl) = ctx.connection_limiter {
-                cl.release();
-            }
-
-        // Access log: off by default, `PORTUS_ACCESS_LOG=true` turns it on
-        // (`dataplane.accessLog` in the chart).
-        if access_log_enabled() {
-            let method = session.req_header().method.as_str();
-            let path = session.req_header().uri.path();
-            let client = session
-                .downstream_session
-                .client_addr()
-                .map(|a| {
-                    a.as_inet()
-                        .map(|inet| inet.to_string())
-                        .unwrap_or_else(|| a.to_string())
-                })
-                .unwrap_or_else(|| "-".to_string());
-            info!(
-                target: "portus_dataplane::access",
-                "{} {} {} {} {} {:.3}s",
-                client, method, path, host, status, duration
-            );
-        }
-    }
-}
-
 /// Parse CRD header mutation config into pre-validated HeaderName/HeaderValue pairs.
 /// Invalid names/values are logged at warn level and skipped.
 ///
 /// Legacy version: merges `add` and `set` into a single add list.
 /// Use `parse_header_mutations_full` for Gateway API conformance.
 #[cfg(test)]
-pub(crate) fn parse_header_mutations(
+pub fn parse_header_mutations(
     mutation: &Option<crate::types::HeaderMutation>,
 ) -> (Vec<(HeaderName, HeaderValue)>, Vec<HeaderName>) {
     let (add, _, remove) = parse_header_mutations_full(mutation);
@@ -2201,7 +1011,7 @@ type HeaderMutationParts = (
 );
 
 #[cfg(test)]
-pub(crate) fn parse_header_mutations_full(
+pub fn parse_header_mutations_full(
     mutation: &Option<crate::types::HeaderMutation>,
 ) -> HeaderMutationParts {
     let Some(m) = mutation else {
@@ -2249,7 +1059,7 @@ pub(crate) fn parse_header_mutations_full(
 /// if a route has the same host, path, and RPS config, its `AtomicTokenBucket`
 /// is reused rather than recreated (which would reset the token count).
 #[cfg(test)]
-pub(crate) fn build_route_map(
+pub fn build_route_map(
     crd_map: &HashMap<String, ProxyRouteSpec>,
     old_routes: &HashMap<String, HostRoutes>,
 ) -> (HashMap<String, HostRoutes>, Option<HostRoutes>) {
@@ -2399,6 +1209,30 @@ pub(crate) fn build_route_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stand-in for a stack's request/response header object in tests that
+    /// apply parsed header mutations the way an adapter does.
+    #[derive(Default)]
+    struct TestHeaders {
+        headers: http::HeaderMap,
+    }
+
+    impl TestHeaders {
+        fn insert_header<N, V>(&mut self, name: N, value: V) -> Result<(), String>
+        where
+            N: TryInto<HeaderName>,
+            V: TryInto<HeaderValue>,
+        {
+            let name = name.try_into().map_err(|_| "invalid header name".to_string())?;
+            let value = value.try_into().map_err(|_| "invalid header value".to_string())?;
+            self.headers.insert(name, value);
+            Ok(())
+        }
+
+        fn remove_header(&mut self, name: &HeaderName) -> Option<HeaderValue> {
+            self.headers.remove(name)
+        }
+    }
 
     #[test]
     fn access_log_flag_parses_like_the_chart_boolean() {
@@ -2774,7 +1608,7 @@ mod tests {
 
     #[test]
     fn test_request_header_add_applied() {
-        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        let mut req = TestHeaders::default();
         let adds = parse_header_mutations(&Some(crate::types::HeaderMutation {
             add: [("x-injected".into(), "hello".into())].into(),
             remove: vec![],
@@ -2791,7 +1625,7 @@ mod tests {
 
     #[test]
     fn test_request_header_remove_applied() {
-        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        let mut req = TestHeaders::default();
         req.insert_header("x-secret", "remove-me").unwrap();
         assert!(req.headers.get("x-secret").is_some());
 
@@ -2810,7 +1644,7 @@ mod tests {
 
     #[test]
     fn test_request_header_remove_then_add_replaces() {
-        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        let mut req = TestHeaders::default();
         req.insert_header("x-version", "old").unwrap();
 
         let mutation = Some(crate::types::HeaderMutation {
@@ -2833,7 +1667,7 @@ mod tests {
 
     #[test]
     fn test_response_header_add_applied() {
-        let mut resp = pingora_http::ResponseHeader::build(200, None).unwrap();
+        let mut resp = TestHeaders::default();
 
         let (adds, _) = parse_header_mutations(&Some(crate::types::HeaderMutation {
             add: [("x-request-id".into(), "abc-123".into())].into(),
@@ -2850,7 +1684,7 @@ mod tests {
 
     #[test]
     fn test_response_header_remove_applied() {
-        let mut resp = pingora_http::ResponseHeader::build(200, None).unwrap();
+        let mut resp = TestHeaders::default();
         resp.insert_header("server", "internal-v2").unwrap();
         assert!(resp.headers.get("server").is_some());
 
@@ -2869,7 +1703,7 @@ mod tests {
 
     #[test]
     fn test_multiple_headers_add_and_remove() {
-        let mut req = pingora_http::RequestHeader::build("POST", b"/api", None).unwrap();
+        let mut req = TestHeaders::default();
         req.insert_header("x-old", "remove-me").unwrap();
         req.insert_header("x-legacy", "also-remove").unwrap();
 
@@ -3621,7 +2455,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Reproduces the Location header construction from request_filter so we
-    /// can unit-test it without a live Pingora session.
+    /// can unit-test it without a live proxy session.
     /// `original_scheme` and `original_port` simulate the listener context.
     fn build_redirect_location(
         redirect: &RedirectConfig,
@@ -4679,7 +3513,7 @@ mod tests {
     // =======================================================================
     // Listener scheme/port resolution
     //
-    // HTTPS connections are handed to Pingora on the original :443 socket, so
+    // HTTPS connections are handed to the stack on the original :443 socket, so
     // the local port is the listener port. The scheme comes from the socket's
     // TLS state, with :443 defaulting to https.
     // =======================================================================
@@ -4840,7 +3674,7 @@ mod tests {
     #[test]
     fn test_request_header_add_appends_with_comma_when_existing() {
         // Gateway API: `add` should append to existing header value with comma
-        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        let mut req = TestHeaders::default();
         req.insert_header("x-existing", "original").unwrap();
 
         let (adds, _) = parse_header_mutations(&Some(crate::types::HeaderMutation {
@@ -4869,7 +3703,7 @@ mod tests {
     #[test]
     fn test_request_header_add_creates_when_missing() {
         // Gateway API: `add` should create header if it doesn't exist
-        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        let mut req = TestHeaders::default();
 
         let (adds, _) = parse_header_mutations(&Some(crate::types::HeaderMutation {
             add: [("x-new".into(), "value".into())].into(),
@@ -4891,7 +3725,7 @@ mod tests {
     #[test]
     fn test_request_header_set_overwrites_existing() {
         // Gateway API: `set` should overwrite existing header value
-        let mut req = pingora_http::RequestHeader::build("GET", b"/", None).unwrap();
+        let mut req = TestHeaders::default();
         req.insert_header("x-existing", "original").unwrap();
 
         let mutation = Some(crate::types::HeaderMutation {
@@ -5012,86 +3846,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Timeout error → status code mapping tests (Gateway API conformance)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn timeout_error_read_timedout_with_timeout_returns_504() {
-        // When backend_request_timeout or request_timeout is configured,
-        // a ReadTimedout error should produce 504 Gateway Timeout.
-        let err = pingora_core::Error::explain(
-            pingora_core::ErrorType::ReadTimedout,
-            "while reading response header",
-        );
-        assert_eq!(
-            timeout_error_to_status_code(&err, true),
-            504,
-            "ReadTimedout with has_timeout should return 504"
-        );
-    }
-
-    #[test]
-    fn timeout_error_connect_timedout_with_timeout_returns_504() {
-        let err = pingora_core::Error::explain(
-            pingora_core::ErrorType::ConnectTimedout,
-            "connecting to upstream",
-        );
-        assert_eq!(
-            timeout_error_to_status_code(&err, true),
-            504,
-            "ConnectTimedout with has_timeout should return 504"
-        );
-    }
-
-    #[test]
-    fn timeout_error_read_timedout_without_timeout_returns_502() {
-        // Without timeouts configured, ReadTimedout should fall through
-        // to default upstream error handling (502).
-        let err = pingora_core::Error::explain(
-            pingora_core::ErrorType::ReadTimedout,
-            "while reading response header",
-        );
-        assert_eq!(
-            timeout_error_to_status_code(&err, false),
-            502,
-            "ReadTimedout without has_timeout should return 502 (default upstream)"
-        );
-    }
-
-    #[test]
-    fn timeout_error_http_status_passthrough() {
-        // Explicit HTTPStatus errors should pass through unchanged.
-        let err = pingora_core::Error::explain(
-            pingora_core::ErrorType::HTTPStatus(404),
-            "no route",
-        );
-        assert_eq!(
-            timeout_error_to_status_code(&err, true),
-            404,
-            "HTTPStatus(404) should return 404 regardless of timeout flag"
-        );
-    }
-
-    #[test]
-    fn timeout_error_upstream_non_timeout_returns_502() {
-        // Other upstream errors (non-timeout) should still return 502.
-        // Use new_up() to properly set ErrorSource::Upstream.
-        let err = pingora_core::Error::new_up(pingora_core::ErrorType::ConnectError);
-        assert_eq!(
-            timeout_error_to_status_code(&err, true),
-            502,
-            "ConnectError from upstream should return 502 even with timeout flag"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // Per-route timeout enforcement tests
     // -----------------------------------------------------------------------
 
     #[test]
     fn request_timeout_sets_read_timeout_when_no_backend_timeout() {
         // When request_timeout is set but backend_request_timeout is not,
-        // read_timeout should be set to request_timeout so Pingora enforces it.
+        // read_timeout should be set to request_timeout so the stack enforces it.
         let mut route = make_path_route("/request-timeout", PathMatchType::Prefix);
         route.request_timeout = Some(Duration::from_millis(500));
         route.backend_request_timeout = None;

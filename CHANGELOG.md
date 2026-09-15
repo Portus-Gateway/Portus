@@ -4,6 +4,13 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **The data plane is split into a network-stack-independent core and a stack adapter.** `crates/portus-dataplane-core` holds everything that is not speaking HTTP on a socket: the config stream and standalone loader, route matching, policies (auth, rate limits, circuit breakers, CORS, outlier ejection), the endpoint pools with active health checks, TLS material and hot reload, the SNI mux and the L4/UDP proxies, metrics and readiness. `crates/portus-dataplane` is the binary: the Pingora `ProxyHttp` implementation, server assembly and Pingora's view of the core's TLS material. The endpoint pools no longer come from `pingora-load-balancing`; the core's own round-robin pool reproduces its semantics (endpoints start healthy, ready = healthy and enabled, health flips after a run of `healthyThreshold` / `unhealthyThreshold` checks, a check is a `GET` that must answer `200`). Nothing changes for operators.
+- **`dataplane.networkStack`** (`PORTUS_NETWORK_STACK`, default `pingora`) names the stack the pods serve on. It exists so an experimental stack can be built into the same image and compared against Pingora on the same benchmarks and conformance suite; a value the image does not carry fails the pod at start with a log line naming it.
+
 ## [0.2.3] - 2026-09-12
 
 ### Changed

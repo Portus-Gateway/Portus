@@ -1,7 +1,7 @@
 //! L4 proxy for TLS passthrough (SNI peeking), TCP proxying and the listener
 //! manager that binds every Gateway listener port (TCP and UDP).
 //!
-//! Runs as a separate async task alongside the Pingora HTTP proxy.
+//! Runs as a separate async task alongside the HTTP proxy.
 //! Reads L4Config from an ArcSwap slot populated by config_receiver.
 //! TLS passthrough uses SNI extraction from the ClientHello.
 //! TCP proxy does raw bidirectional byte copying; UDP is in `udp_proxy`.
@@ -98,7 +98,7 @@ where
 /// Bidirectional copy between two streams that ends when both directions have
 /// been idle for `idle`, when either side closes (the other side's write half is
 /// shut down and drained like `tokio::io::copy_bidirectional`), or on I/O error.
-pub(crate) async fn copy_bidirectional_idle<A, B>(
+pub async fn copy_bidirectional_idle<A, B>(
     a: A,
     b: B,
     idle: std::time::Duration,
@@ -152,7 +152,7 @@ where
 
 /// Result of inspecting the bytes peeked from a new connection.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ClientHelloPeek {
+pub enum ClientHelloPeek {
     /// A full ClientHello was parsed; carries the lowercased SNI if present.
     Complete(Option<String>),
     /// Looks like TLS so far, but the ClientHello has not fully arrived.
@@ -162,7 +162,7 @@ pub(crate) enum ClientHelloPeek {
 }
 
 /// Classify a prefix of a connection as a (possibly partial) TLS ClientHello.
-pub(crate) fn classify_client_hello(buf: &[u8]) -> ClientHelloPeek {
+pub fn classify_client_hello(buf: &[u8]) -> ClientHelloPeek {
     let mut acceptor = rustls::server::Acceptor::default();
     match acceptor.read_tls(&mut &buf[..]) {
         Ok(0) => return ClientHelloPeek::Incomplete,
@@ -186,7 +186,7 @@ pub(crate) fn classify_client_hello(buf: &[u8]) -> ClientHelloPeek {
 ///
 /// `TcpStream::readable()` fires immediately while any bytes are queued, so a
 /// short sleep paces the re-peek when no new bytes have arrived.
-pub(crate) async fn peek_client_hello(
+pub async fn peek_client_hello(
     stream: &tokio::net::TcpStream,
 ) -> std::io::Result<ClientHelloPeek> {
     let mut buf = [0u8; CLIENT_HELLO_PEEK_BUF];
@@ -215,58 +215,58 @@ pub(crate) async fn peek_client_hello(
 }
 
 /// Shared L4 configuration slot, updated atomically from gRPC config stream.
-pub(crate) type L4ConfigSlot = Arc<ArcSwap<L4Config>>;
+pub type L4ConfigSlot = Arc<ArcSwap<L4Config>>;
 
 /// L4 routing configuration for TLS passthrough and TCP proxy.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct L4Config {
+pub struct L4Config {
     /// Per-listener TLS passthrough routing. Each entry is a listener with its
     /// hostname restriction and its own set of route hostnames → backends.
     /// The SNI mux finds the most specific matching listener first, then looks
     /// up the route within that listener's scope.
-    pub(crate) tls_listeners: Vec<TlsPassthroughListener>,
+    pub tls_listeners: Vec<TlsPassthroughListener>,
     /// Listener port -> weighted TCP backends (TCPRoute).
-    pub(crate) tcp_proxy: HashMap<u16, Arc<L4RouteTarget>>,
+    pub tcp_proxy: HashMap<u16, Arc<L4RouteTarget>>,
     /// UDP listener port -> weighted UDP backends (UDPRoute).
-    pub(crate) udp_proxy: HashMap<u16, Arc<L4RouteTarget>>,
+    pub udp_proxy: HashMap<u16, Arc<L4RouteTarget>>,
     /// Ports with at least one HTTP (plaintext) Gateway listener. Connections
-    /// are handed to Pingora's HTTP service as-is.
-    pub(crate) http_ports: std::collections::BTreeSet<u16>,
+    /// are handed to the network stack's HTTP service as-is.
+    pub http_ports: std::collections::BTreeSet<u16>,
     /// Ports with at least one HTTPS Gateway listener. Connections go through
     /// the SNI decision (TLS passthrough / TLSRoute terminate / HTTPS hand-off).
-    pub(crate) https_ports: std::collections::BTreeSet<u16>,
+    pub https_ports: std::collections::BTreeSet<u16>,
     /// Ports with at least one TLS (TLSRoute) Gateway listener, bound even
     /// before any TLSRoute attaches so the listener is reachable the moment the
     /// Gateway is programmed (SNI decision; no matching route => drop).
-    pub(crate) tls_ports: std::collections::BTreeSet<u16>,
+    pub tls_ports: std::collections::BTreeSet<u16>,
     /// Ports with at least one TCP Gateway listener, bound even before a
     /// TCPRoute attaches (connections are dropped until one does).
-    pub(crate) tcp_ports: std::collections::BTreeSet<u16>,
+    pub tcp_ports: std::collections::BTreeSet<u16>,
     /// Ports with at least one UDP Gateway listener, bound even before a
     /// UDPRoute attaches (datagrams are dropped until one does).
-    pub(crate) udp_ports: std::collections::BTreeSet<u16>,
+    pub udp_ports: std::collections::BTreeSet<u16>,
 }
 
 /// One TCPRoute/UDPRoute backendRef.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct L4Backend {
-    pub(crate) service: String,
-    pub(crate) port: u16,
-    pub(crate) weight: u32,
+pub struct L4Backend {
+    pub service: String,
+    pub port: u16,
+    pub weight: u32,
 }
 
 /// The backends programmed for one TCP or UDP listener port, selected per
 /// connection (TCP) or per client session (UDP) by weighted round robin.
 /// Backends with weight 0 never receive traffic.
 #[derive(Debug)]
-pub(crate) struct L4RouteTarget {
-    pub(crate) backends: Vec<L4Backend>,
+pub struct L4RouteTarget {
+    pub backends: Vec<L4Backend>,
     total_weight: u64,
     counter: std::sync::atomic::AtomicU64,
 }
 
 impl L4RouteTarget {
-    pub(crate) fn new(backends: Vec<L4Backend>) -> Self {
+    pub fn new(backends: Vec<L4Backend>) -> Self {
         let total_weight = backends.iter().map(|b| b.weight as u64).sum();
         Self {
             backends,
@@ -278,7 +278,7 @@ impl L4RouteTarget {
     /// Weighted round-robin choice. Deterministic: over `total_weight`
     /// consecutive connections each backend is chosen exactly `weight` times,
     /// which keeps the conformance suite's ±5% tolerance trivially.
-    pub(crate) fn select(&self) -> Option<&L4Backend> {
+    pub fn select(&self) -> Option<&L4Backend> {
         if self.total_weight == 0 {
             return None;
         }
@@ -296,7 +296,7 @@ impl L4RouteTarget {
 
 /// TLS mode for a TLS listener.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum TlsMode {
+pub enum TlsMode {
     Passthrough,
     Terminate,
 }
@@ -304,18 +304,18 @@ pub(crate) enum TlsMode {
 /// A TLS listener with its hostname restriction and routes.
 /// Handles both Passthrough and Terminate modes.
 #[derive(Debug, Clone)]
-pub(crate) struct TlsPassthroughListener {
+pub struct TlsPassthroughListener {
     /// Listener hostname restriction (empty = match all).
-    pub(crate) hostname: String,
+    pub hostname: String,
     /// Route hostnames → (backend_service, backend_port) within this listener's scope.
     /// These are effective hostnames (intersection of route and listener hostnames).
-    pub(crate) routes: HashMap<String, (String, u16)>,
+    pub routes: HashMap<String, (String, u16)>,
     /// TLS mode: Passthrough (forward encrypted) or Terminate (decrypt then proxy).
-    pub(crate) tls_mode: TlsMode,
+    pub tls_mode: TlsMode,
     /// For Terminate mode: the TLS certificate for termination.
-    pub(crate) cert: Option<Arc<rustls::sign::CertifiedKey>>,
+    pub cert: Option<Arc<rustls::sign::CertifiedKey>>,
     /// Gateway listener port (used to determine which port to bind).
-    pub(crate) listener_port: u16,
+    pub listener_port: u16,
 }
 
 /// Extract SNI (server_name) from a TLS ClientHello message.
@@ -323,7 +323,7 @@ pub(crate) struct TlsPassthroughListener {
 /// Uses rustls Acceptor to parse the ClientHello and extract the SNI extension.
 /// Returns None if the data is not a valid TLS ClientHello or lacks an SNI extension.
 #[cfg(test)]
-pub(crate) fn peek_sni(buf: &[u8]) -> Option<String> {
+pub fn peek_sni(buf: &[u8]) -> Option<String> {
     match classify_client_hello(buf) {
         ClientHelloPeek::Complete(sni) => sni,
         ClientHelloPeek::Incomplete | ClientHelloPeek::NotTls => None,
@@ -332,10 +332,10 @@ pub(crate) fn peek_sni(buf: &[u8]) -> Option<String> {
 
 /// SNI multiplexer routing decision.
 #[derive(Debug)]
-pub(crate) enum MuxDecision {
+pub enum MuxDecision {
     /// Forward the connection as-is to the backend (TLS passthrough).
     Passthrough { service: String, port: u16 },
-    /// Forward the connection to the internal Pingora HTTPS listener (TLS termination for HTTPS/HTTPRoutes).
+    /// Forward the connection to the network stack's HTTPS listener (TLS termination for HTTPS/HTTPRoutes).
     Terminate,
     /// TLS Terminate mode for TLSRoute: decrypt TLS at the proxy and TCP-proxy to backend.
     TlsTerminate { service: String, port: u16, cert: Arc<rustls::sign::CertifiedKey> },
@@ -351,9 +351,9 @@ pub(crate) enum MuxDecision {
 /// 2. Within that listener's routes, find a matching route (exact then wildcard)
 /// 3. If route found → Passthrough to backend
 /// 4. If listener matches but no route → Reject (connection dropped)
-/// 5. If no listener matches → Terminate (forward to Pingora for HTTPS)
+/// 5. If no listener matches → Terminate (forward to the network stack for HTTPS)
 #[cfg(test)]
-pub(crate) fn sni_mux_decision(cfg: &L4Config, sni: Option<&str>) -> MuxDecision {
+pub fn sni_mux_decision(cfg: &L4Config, sni: Option<&str>) -> MuxDecision {
     sni_mux_decision_over(cfg.tls_listeners.iter(), sni)
 }
 
@@ -399,7 +399,7 @@ fn sni_mux_decision_over<'a>(
             }
         }
         None => {
-            // No TLS listener matches → forward to Pingora for HTTPS
+            // No TLS listener matches → forward to the network stack for HTTPS
             MuxDecision::Terminate
         }
     }
@@ -480,33 +480,31 @@ fn lookup_route_in_listener<'a>(
 /// Resolve a backend address from the ServiceLbMap.
 ///
 /// Returns the backend address as "ip:port" or None if no endpoints found.
-pub(crate) fn resolve_backend(
+pub fn resolve_backend(
     lbs: &ServiceLbMap,
     service: &str,
     port: u16,
 ) -> Option<String> {
     let guard = lbs.load();
     let key = (Arc::from(service), port);
-    let lb = guard.get(&key)?;
-    let backend = lb.select(b"", 256)?;
-    Some(backend.addr.to_string())
+    Some(guard.get(&key)?.select()?.to_string())
 }
 
-/// Sender half of a hand-off channel into one of Pingora's services. The
+/// Sender half of a hand-off channel into one of the network stack's services. The
 /// listener manager pushes accepted connections here as non-blocking
-/// `std::net::TcpStream`s; Pingora accepts them on its own runtime and speaks
+/// `std::net::TcpStream`s; the stack accepts them on its own runtime and speaks
 /// HTTP (or runs the TLS handshake) on the original socket. No loopback hop, so
-/// the peer address Pingora sees is the real client and the local port is the
+/// the peer address the stack sees is the real client and the local port is the
 /// real listener port.
-pub(crate) type Handoff = tokio::sync::mpsc::Sender<std::net::TcpStream>;
+pub type Handoff = tokio::sync::mpsc::Sender<std::net::TcpStream>;
 
-/// The two Pingora entry points every dynamically bound listener port feeds.
+/// The two network-stack entry points every dynamically bound listener port feeds.
 #[derive(Clone)]
-pub(crate) struct Handoffs {
+pub struct Handoffs {
     /// Plaintext HTTP service (HTTP listeners).
-    pub(crate) http: Handoff,
+    pub http: Handoff,
     /// TLS-terminating HTTPS service (HTTPS listeners, after the SNI decision).
-    pub(crate) https: Handoff,
+    pub https: Handoff,
 }
 
 /// Perform TLS termination on a raw TCP stream and proxy to a backend.
@@ -558,13 +556,13 @@ impl rustls::server::ResolvesServerCert for SingleCertResolver {
 /// gone away (pod terminating, node gone) otherwise leaves the client waiting on
 /// the kernel's SYN retries - minutes - with no bytes ever sent, which a TLS
 /// client experiences as a handshake that never completes.
-pub(crate) const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-pub(crate) async fn connect_upstream(addr: &str) -> std::io::Result<tokio::net::TcpStream> {
+pub async fn connect_upstream(addr: &str) -> std::io::Result<tokio::net::TcpStream> {
     connect_upstream_within(addr, UPSTREAM_CONNECT_TIMEOUT).await
 }
 
-pub(crate) async fn connect_upstream_within(
+pub async fn connect_upstream_within(
     addr: &str,
     timeout: std::time::Duration,
 ) -> std::io::Result<tokio::net::TcpStream> {
@@ -577,13 +575,13 @@ pub(crate) async fn connect_upstream_within(
     }
 }
 
-/// Hand an accepted connection to one of Pingora's services without a loopback
+/// Hand an accepted connection to one of the network stack's services without a loopback
 /// hop. Any bytes already peeked are still in the kernel receive buffer (peek
-/// does not consume), so Pingora sees the stream from its first byte, and the
+/// does not consume), so the stack sees the stream from its first byte, and the
 /// socket's peer/local addresses are the real ones. The stream is converted to
-/// the std type because the listener manager and Pingora run on different
+/// the std type because the listener manager and the stack run on different
 /// Tokio runtimes.
-pub(crate) async fn hand_off_to_pingora(
+pub async fn hand_off_to_stack(
     stream: tokio::net::TcpStream,
     target: &Handoff,
 ) -> std::io::Result<()> {
@@ -591,12 +589,12 @@ pub(crate) async fn hand_off_to_pingora(
     target.send(std_stream).await.map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
-            "Pingora service is not accepting handed-off connections",
+            "network stack is not accepting handed-off connections",
         )
     })
 }
 
-/// Ports Pingora itself binds (health, metrics); the listener manager must
+/// Ports the network stack itself binds (health, metrics); the listener manager must
 /// never try to bind them even if a Gateway asks.
 const RESERVED_PORTS: [u16; 2] = [8081, 9090];
 
@@ -604,7 +602,7 @@ const RESERVED_PORTS: [u16; 2] = [8081, 9090];
 /// stream listener port the controller has programmed - HTTP, HTTPS, TLS and
 /// TCP alike. Nothing is bound until the first config arrives, which matches
 /// readiness (`/readyz` needs a config). UDP ports are [`desired_udp_ports`].
-pub(crate) fn desired_l4_ports(cfg: &L4Config) -> std::collections::BTreeSet<u16> {
+pub fn desired_l4_ports(cfg: &L4Config) -> std::collections::BTreeSet<u16> {
     let mut desired: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     desired.extend(cfg.tcp_proxy.keys().copied());
     desired.extend(cfg.http_ports.iter().copied());
@@ -624,7 +622,7 @@ pub(crate) fn desired_l4_ports(cfg: &L4Config) -> std::collections::BTreeSet<u16
 /// UDP ports the listener manager should be bound to: every UDP listener port,
 /// with or without a UDPRoute yet. A UDP port may coincide with a TCP port;
 /// the two sockets are independent.
-pub(crate) fn desired_udp_ports(cfg: &L4Config) -> std::collections::BTreeSet<u16> {
+pub fn desired_udp_ports(cfg: &L4Config) -> std::collections::BTreeSet<u16> {
     let mut desired: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
     desired.extend(cfg.udp_proxy.keys().copied());
     desired.extend(cfg.udp_ports.iter().copied());
@@ -680,10 +678,10 @@ async fn accept_loop(
 /// For each incoming connection:
 /// - port has a TCPRoute: pick a weighted backend and proxy raw bytes
 /// - UDP port: `udp_proxy::udp_listener_loop` (per-client sessions)
-/// - HTTP-only port: hand the socket to Pingora's HTTP service untouched
+/// - HTTP-only port: hand the socket to the stack's HTTP service untouched
 /// - otherwise: peek the ClientHello, decide per SNI - TLS passthrough,
-///   TLSRoute terminate, HTTPS hand-off to Pingora, or reject
-pub(crate) async fn run_l4_proxy(l4_config: L4ConfigSlot, lbs: ServiceLbMap, handoffs: Handoffs) {
+///   TLSRoute terminate, HTTPS hand-off to the stack, or reject
+pub async fn run_l4_proxy(l4_config: L4ConfigSlot, lbs: ServiceLbMap, handoffs: Handoffs) {
     let mut bound: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut bound_udp: HashMap<u16, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut warned_bind_failure: std::collections::HashSet<u16> = std::collections::HashSet::new();
@@ -811,8 +809,8 @@ async fn handle_l4_connection(
             Ok(())
         }
         PortRole::Http => {
-            log::debug!("L4 proxy: HTTP {} on port {} -> pingora HTTP", peer, port);
-            hand_off_to_pingora(stream, &handoffs.http).await?;
+            log::debug!("L4 proxy: HTTP {} on port {} -> HTTP stack", peer, port);
+            hand_off_to_stack(stream, &handoffs.http).await?;
             Ok(())
         }
         PortRole::Tls => {
@@ -849,12 +847,12 @@ async fn handle_l4_connection(
                 MuxDecision::Terminate => {
                     if cfg.https_ports.contains(&port) {
                         log::debug!(
-                            "L4 proxy: HTTPS {:?} {} on port {} -> pingora HTTPS",
+                            "L4 proxy: HTTPS {:?} {} on port {} -> HTTPS stack",
                             sni.as_deref().unwrap_or("<no SNI>"),
                             peer,
                             port
                         );
-                        hand_off_to_pingora(stream, &handoffs.https).await?;
+                        hand_off_to_stack(stream, &handoffs.https).await?;
                     } else {
                         warn!(
                             "L4 proxy: no TLS listener claims SNI {:?} from {} on port {} and the port has no HTTPS listener; dropping",
@@ -882,17 +880,17 @@ async fn handle_l4_connection(
 
 /// What a bound port is for, decided from the current config.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PortRole {
+pub enum PortRole {
     /// A TCPRoute owns the port: raw proxying.
     Tcp,
-    /// Only HTTP listeners on the port: straight to Pingora HTTP, no peeking.
+    /// Only HTTP listeners on the port: straight to the HTTP stack, no peeking.
     Http,
     /// HTTPS and/or TLS listeners (possibly alongside HTTP, which the
     /// Gateway API forbids but we tolerate by peeking): SNI decision.
     Tls,
 }
 
-pub(crate) fn port_role(cfg: &L4Config, port: u16) -> PortRole {
+pub fn port_role(cfg: &L4Config, port: u16) -> PortRole {
     if cfg.tcp_proxy.contains_key(&port) || cfg.tcp_ports.contains(&port) {
         return PortRole::Tcp;
     }
@@ -908,13 +906,13 @@ pub(crate) fn port_role(cfg: &L4Config, port: u16) -> PortRole {
     }
     // A bound port whose listener just went away (the release is a config
     // change behind): treat as TLS so the connection is dropped with a clear
-    // log line rather than handed to Pingora.
+    // log line rather than handed to the stack.
     PortRole::Tls
 }
 
 /// `sni_mux_decision` restricted to the TLS listeners bound on `port`
 /// (listeners without a recorded port are legacy and match any port).
-pub(crate) fn sni_mux_decision_for_port(cfg: &L4Config, sni: Option<&str>, port: u16) -> MuxDecision {
+pub fn sni_mux_decision_for_port(cfg: &L4Config, sni: Option<&str>, port: u16) -> MuxDecision {
     let on_port = cfg
         .tls_listeners
         .iter()
@@ -930,7 +928,7 @@ mod tests {
     async fn hand_off_keeps_peeked_bytes_and_peer_addr() {
         use tokio::io::AsyncWriteExt;
 
-        // The mux peeks the ClientHello, then hands the socket to Pingora. The
+        // The mux peeks the ClientHello, then hands the socket to the stack. The
         // peeked bytes must still be in the socket and the peer must be the
         // real client, or HTTPS would lose client IPs and handshakes.
         let front = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -946,7 +944,7 @@ mod tests {
         assert_eq!(&peek[..n], b"\x16\x03\x01hello");
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<std::net::TcpStream>(1);
-        hand_off_to_pingora(accepted, &tx).await.unwrap();
+        hand_off_to_stack(accepted, &tx).await.unwrap();
         let handed = rx.recv().await.expect("stream delivered to the HTTPS service");
         assert_eq!(handed.peer_addr().unwrap(), client_addr);
         let mut handed = tokio::net::TcpStream::from_std(handed).unwrap();
@@ -1032,7 +1030,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_port_connection_is_handed_to_pingora_http_untouched() {
+    async fn http_port_connection_is_handed_to_the_http_stack_untouched() {
         use tokio::io::AsyncWriteExt;
         let mut cfg = L4Config::default();
         cfg.http_ports.insert(8080);
@@ -1078,7 +1076,7 @@ mod tests {
         let (accepted, _) = front.accept().await.unwrap();
         let (tx, rx) = tokio::sync::mpsc::channel::<std::net::TcpStream>(1);
         drop(rx);
-        let err = hand_off_to_pingora(accepted, &tx).await.expect_err("closed receiver must error");
+        let err = hand_off_to_stack(accepted, &tx).await.expect_err("closed receiver must error");
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
@@ -1504,7 +1502,7 @@ mod tests {
     fn test_sni_mux_reject_when_listener_matches_but_no_route() {
         // If the SNI matches a TLS Passthrough listener hostname but there is no
         // passthrough route for it, the connection should be rejected (not forwarded
-        // to Pingora for HTTPS termination).
+        // to the stack for HTTPS termination).
         let mut cfg = L4Config::default();
         // A listener with wildcard hostname that has only one route
         cfg.tls_listeners.push(TlsPassthroughListener {
@@ -1537,7 +1535,7 @@ mod tests {
     #[test]
     fn test_sni_mux_terminate_when_no_listener_match() {
         // If the SNI does not match any TLS Passthrough listener hostname,
-        // it should be forwarded to Pingora for HTTPS termination.
+        // it should be forwarded to the stack for HTTPS termination.
         let mut cfg = L4Config::default();
         cfg.tls_listeners.push(TlsPassthroughListener {
             hostname: "*.example.com".to_string(),
@@ -1604,7 +1602,7 @@ mod tests {
             decision
         );
 
-        // Non-matching SNI → Terminate (forward to Pingora)
+        // Non-matching SNI → Terminate (forward to the HTTPS stack)
         let decision = sni_mux_decision(&cfg, Some("something.else.com"));
         assert!(
             matches!(decision, MuxDecision::Terminate),
@@ -1672,7 +1670,7 @@ mod tests {
         let decision = sni_mux_decision(&cfg, Some("app.terminate.com"));
         assert!(matches!(decision, MuxDecision::TlsTerminate { .. }));
 
-        // Unknown SNI → Terminate (forward to Pingora)
+        // Unknown SNI → Terminate (forward to the HTTPS stack)
         let decision = sni_mux_decision(&cfg, Some("unknown.other.com"));
         assert!(matches!(decision, MuxDecision::Terminate));
     }
@@ -1733,7 +1731,7 @@ mod tests {
         let decision = sni_mux_decision(&cfg, Some("non.matching.com"));
         assert!(
             matches!(decision, MuxDecision::Terminate),
-            "non.matching.com should be Terminate (forward to Pingora), got {:?}",
+            "non.matching.com should be Terminate (forward to the HTTPS stack), got {:?}",
             decision
         );
     }
@@ -1902,11 +1900,11 @@ mod tests {
             ),
         }
 
-        // non.matching.com → Terminate (forward to Pingora, no TLS listener matches)
+        // non.matching.com → Terminate (forward to the HTTPS stack, no TLS listener matches)
         let decision = sni_mux_decision(&cfg, Some("non.matching.com"));
         assert!(
             matches!(decision, MuxDecision::Terminate),
-            "non.matching.com should be Terminate (forward to Pingora), got {:?}",
+            "non.matching.com should be Terminate (forward to the HTTPS stack), got {:?}",
             decision
         );
     }

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/portus-types", "crates/portus-controller", "crates/portus-dataplane", "crates/pingora-core-patch"]
+members = ["crates/portus-types", "crates/portus-controller", "crates/portus-dataplane-core", "crates/portus-dataplane", "crates/pingora-core-patch"]
 resolver = "3"
 
 [workspace.package]

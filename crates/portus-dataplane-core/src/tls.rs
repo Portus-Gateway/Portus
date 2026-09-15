@@ -5,7 +5,7 @@
 //! - `ReloadableCertResolver` — a lock-free `rustls::server::ResolvesServerCert`
 //!   backed by `ArcSwap` for atomic certificate replacement without restarts
 //! - `build_reloadable_tls_config` — constructs a `rustls::ServerConfig` wired to
-//!   the resolver, suitable for passing to Pingora's `TlsSettings::from_server_config()`
+//!   the resolver, for the network stack's TLS acceptor
 //! - `start_tls_cert_hot_reload` — background thread woken by `apply_config`
 //!   whenever the controller pushes new certs; parses them and atomically swaps
 //!   them into the resolver
@@ -46,7 +46,7 @@ struct CertMap {
     default: Option<Arc<CertifiedKey>>,
 }
 
-/// Production cert resolver for Pingora's HTTPS listener.
+/// Production cert resolver for the HTTPS listener.
 ///
 /// Implements `rustls::server::ResolvesServerCert` using lock-free `ArcSwap`
 /// for atomic cert replacement. Supports SNI-based certificate selection:
@@ -57,16 +57,16 @@ struct CertMap {
 /// 2. Wildcard match (e.g., *.example.com matches foo.example.com)
 /// 3. Default cert (listener with no hostname restriction)
 /// 4. First available cert as fallback
-pub(crate) struct ReloadableCertResolver {
+pub struct ReloadableCertResolver {
     /// Legacy single-cert field, used as bootstrap and by tests.
-    pub(crate) certified_key: ArcSwap<CertifiedKey>,
+    pub certified_key: ArcSwap<CertifiedKey>,
     /// SNI-based cert map for multi-listener support.
     cert_map: ArcSwap<CertMap>,
 }
 
 impl ReloadableCertResolver {
     /// Create a new resolver with the given initial certified key.
-    pub(crate) fn new(initial: CertifiedKey) -> Self {
+    pub fn new(initial: CertifiedKey) -> Self {
         let arc_key = Arc::new(initial);
         let map = CertMap {
             exact: hashbrown::HashMap::new(),
@@ -82,7 +82,7 @@ impl ReloadableCertResolver {
     /// Atomically swap the stored certified key (single-cert mode).
     /// Also updates the default in the cert map.
     #[cfg(test)]
-    pub(crate) fn swap(&self, new_key: CertifiedKey) {
+    pub fn swap(&self, new_key: CertifiedKey) {
         let arc_key = Arc::new(new_key);
         self.certified_key.store(Arc::clone(&arc_key));
         // Update default in cert map
@@ -96,7 +96,7 @@ impl ReloadableCertResolver {
     }
 
     /// Replace the entire cert map with new entries from multiple listeners.
-    pub(crate) fn swap_map(&self, entries: Vec<(String, CertifiedKey)>) {
+    pub fn swap_map(&self, entries: Vec<(String, CertifiedKey)>) {
         let mut exact = hashbrown::HashMap::new();
         let mut wildcard = Vec::new();
         let mut default: Option<Arc<CertifiedKey>> = None;
@@ -184,7 +184,7 @@ impl ResolvesServerCert for ReloadableCertResolver {
 /// Used when certificates are delivered via the gRPC config stream from the
 /// controller (e.g., from Kubernetes TLS Secrets). Returns a `CertifiedKey`
 /// suitable for use with rustls, or a descriptive error string on failure.
-pub(crate) fn load_certified_key_from_pem(
+pub fn load_certified_key_from_pem(
     cert_pem: &str,
     key_pem: &str,
 ) -> Result<CertifiedKey, String> {
@@ -215,7 +215,7 @@ pub(crate) fn load_certified_key_from_pem(
 /// Returns a `CertifiedKey` suitable for use with rustls, or a descriptive
 /// error string on failure.
 #[cfg(test)]
-pub(crate) fn load_certified_key(
+pub fn load_certified_key(
     cert_path: &str,
     key_path: &str,
 ) -> Result<CertifiedKey, String> {
@@ -259,9 +259,9 @@ pub(crate) fn load_certified_key(
 /// Build a rustls `ServerConfig` using the given `ReloadableCertResolver`.
 ///
 /// Called from `main.rs` to create the `ServerConfig` that is passed to
-/// `TlsSettings::from_server_config()` (patched pingora-core). The resolver
+/// the network stack's TLS acceptor. The resolver
 /// is consulted on every TLS handshake, enabling lock-free cert hot-reload.
-pub(crate) fn build_reloadable_tls_config(
+pub fn build_reloadable_tls_config(
     resolver: Arc<ReloadableCertResolver>,
 ) -> ServerConfig {
     let mut config = ServerConfig::builder_with_protocol_versions(&[
@@ -395,7 +395,7 @@ impl rustls::server::danger::ClientCertVerifier for RejectAllClientCerts {
 /// parse are skipped. With no usable trust anchor at all the verifier fails
 /// closed (rejects every handshake) and the problem is logged, because the
 /// controller only ships validation blocks it has already checked.
-pub(crate) fn build_client_cert_verifier(
+pub fn build_client_cert_verifier(
     spec: &PortClientValidation,
 ) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
     let provider = rustls::crypto::aws_lc_rs::default_provider();
@@ -438,7 +438,7 @@ pub(crate) fn build_client_cert_verifier(
 /// Build a `ServerConfig` that shares `resolver` (SNI certificate selection)
 /// with the default HTTPS config but additionally requests and validates
 /// client certificates with `verifier`.
-pub(crate) fn build_client_auth_tls_config(
+pub fn build_client_auth_tls_config(
     resolver: Arc<ReloadableCertResolver>,
     verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
 ) -> ServerConfig {
@@ -454,7 +454,7 @@ pub(crate) fn build_client_auth_tls_config(
 
 /// One `ServerConfig` per HTTPS listener port that validates client
 /// certificates. Ports absent from the map use the default (no client auth).
-pub(crate) fn build_port_configs(
+pub fn build_port_configs(
     specs: &[PortClientValidation],
     resolver: &Arc<ReloadableCertResolver>,
 ) -> hashbrown::HashMap<u16, Arc<ServerConfig>> {
@@ -467,42 +467,31 @@ pub(crate) fn build_port_configs(
         .collect()
 }
 
-/// Per-port `ServerConfig` selection for Pingora's HTTPS endpoint.
+/// Per-port `ServerConfig` selection for the HTTPS endpoint.
 ///
-/// The listener manager hands every HTTPS port's sockets to one Pingora
-/// service, so client certificate policy cannot live in a single
-/// `ServerConfig`. Pingora asks this chooser once the ClientHello is read; it
-/// answers from the port the connection was accepted on. Swapped atomically by
-/// the cert hot-reload thread; handshakes never block on it.
+/// The listener manager hands every HTTPS port's sockets to one HTTPS service,
+/// so client certificate policy cannot live in a single `ServerConfig`. The
+/// network stack asks once the ClientHello is read; the answer comes from the
+/// port the connection was accepted on. Swapped atomically by the cert
+/// hot-reload thread; handshakes never block on it.
 #[derive(Default)]
-pub(crate) struct PortServerConfigs {
+pub struct PortServerConfigs {
     by_port: ArcSwap<hashbrown::HashMap<u16, Arc<ServerConfig>>>,
 }
 
 impl PortServerConfigs {
-    pub(crate) fn store(&self, configs: hashbrown::HashMap<u16, Arc<ServerConfig>>) {
+    pub fn store(&self, configs: hashbrown::HashMap<u16, Arc<ServerConfig>>) {
         info!("client certificate validation active on {} HTTPS port(s)", configs.len());
         self.by_port.store(Arc::new(configs));
     }
 
-    pub(crate) fn config_for_port(&self, port: u16) -> Option<Arc<ServerConfig>> {
+    pub fn config_for_port(&self, port: u16) -> Option<Arc<ServerConfig>> {
         self.by_port.load().get(&port).cloned()
     }
 }
 
-impl pingora_core::listeners::tls::ServerConfigChooser for PortServerConfigs {
-    fn choose(
-        &self,
-        local_addr: Option<&pingora_core::protocols::l4::socket::SocketAddr>,
-        _client_hello: &rustls::server::ClientHello<'_>,
-    ) -> Option<Arc<ServerConfig>> {
-        let port = local_addr?.as_inet()?.port();
-        self.config_for_port(port)
-    }
-}
-
 /// Order-independent content hash of the per-port client validation policy.
-pub(crate) fn client_validation_fingerprint(specs: &[PortClientValidation]) -> u64 {
+pub fn client_validation_fingerprint(specs: &[PortClientValidation]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut fp: u64 = 0;
     for spec in specs {
@@ -526,7 +515,7 @@ pub(crate) fn client_validation_fingerprint(specs: &[PortClientValidation]) -> u
 /// the controller pushes a valid cert.
 ///
 /// Returns (cert_pem, key_pem) as strings.
-pub(crate) fn generate_self_signed_cert() -> Result<(String, String), Box<dyn std::error::Error>> {
+pub fn generate_self_signed_cert() -> Result<(String, String), Box<dyn std::error::Error>> {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
     let cert_pem = cert.cert.pem();
     let key_pem = cert.signing_key.serialize_pem();
@@ -539,7 +528,7 @@ pub(crate) fn generate_self_signed_cert() -> Result<(String, String), Box<dyn st
 
 /// Order-independent content hash of a TLS entry set: hostname, certificate
 /// and key bytes all participate, so any rotation changes it.
-pub(crate) fn tls_entries_fingerprint(entries: &[crate::config_receiver::TlsCertEntry]) -> u64 {
+pub fn tls_entries_fingerprint(entries: &[crate::config_receiver::TlsCertEntry]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut fp: u64 = 0;
     for e in entries {
@@ -568,7 +557,7 @@ pub(crate) fn tls_entries_fingerprint(entries: &[crate::config_receiver::TlsCert
 ///    immediately use the new certs; existing connections are unaffected
 /// 4. On failure for individual certs, logs an error but loads the valid ones
 /// 5. Updates the `tls_cert_expiry_seconds` Prometheus metric (shortest expiry)
-pub(crate) fn start_tls_cert_hot_reload(
+pub fn start_tls_cert_hot_reload(
     tls_cert: TlsCertSlot,
     notify: Arc<tokio::sync::Notify>,
     resolver: Arc<ReloadableCertResolver>,
@@ -1224,8 +1213,6 @@ mod fingerprint_tests {
 
     #[test]
     fn port_server_configs_pick_by_local_port() {
-        use pingora_core::listeners::tls::ServerConfigChooser;
-        use pingora_core::protocols::l4::socket::SocketAddr;
         let f = fixture();
         let specs = vec![
             spec(443, vec![f.client_ca.clone()], ClientValidationMode::AllowValidOnly),
@@ -1245,37 +1232,6 @@ mod fingerprint_tests {
         assert_eq!(handshake(cfg_443.clone(), &f.server_ca, Some((&f.client_cert, &f.client_key))), Ok(true));
         assert!(handshake(cfg_8443.clone(), &f.server_ca, Some((&f.client_cert, &f.client_key))).is_err());
         assert_eq!(handshake(cfg_8443, &f.server_ca, Some((&f.other_cert, &f.other_key))), Ok(true));
-
-        // Chooser plumbing: local address → port → config. Exercise the trait
-        // through a real ClientHello read by rustls's lazy acceptor.
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-        let chosen = rt.block_on(async {
-            let (client_io, server_io) = tokio::io::duplex(16 * 1024);
-            let mut roots = rustls::RootCertStore::empty();
-            for c in rustls_pemfile::certs(&mut f.server_ca.as_bytes()) {
-                roots.add(c.unwrap()).unwrap();
-            }
-            let client_config = Arc::new(rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth());
-            let connector = tokio_rustls::TlsConnector::from(client_config);
-            let client = tokio::spawn(async move {
-                let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
-                let _ = connector.connect(name, client_io).await;
-            });
-            let start = tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), server_io)
-                .await
-                .unwrap();
-            let hello = start.client_hello();
-            let addr_8443 = SocketAddr::Inet("127.0.0.1:8443".parse().unwrap());
-            let addr_9443 = SocketAddr::Inet("127.0.0.1:9443".parse().unwrap());
-            let picked = chooser.choose(Some(&addr_8443), &hello).map(|c| Arc::ptr_eq(&c, &cfg_443));
-            let none_for_unknown_port = chooser.choose(Some(&addr_9443), &hello).is_none();
-            let none_without_addr = chooser.choose(None, &hello).is_none();
-            drop(start);
-            client.abort();
-            (picked, none_for_unknown_port, none_without_addr)
-        });
-        assert_eq!(chosen.0, Some(false), "8443 must get its own config, not 443's");
-        assert!(chosen.1 && chosen.2);
     }
 
     #[test]

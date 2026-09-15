@@ -12,14 +12,14 @@ use std::time::{Duration, Instant};
 ///
 /// Layout: upper 32 bits = seconds since `epoch` of last refill,
 ///         lower 32 bits = remaining tokens.
-pub(crate) struct AtomicTokenBucket {
+pub struct AtomicTokenBucket {
     state: AtomicU64,
-    pub(crate) rps: u32,
+    pub rps: u32,
     epoch: Instant,
 }
 
 impl AtomicTokenBucket {
-    pub(crate) fn new(rps: u32) -> Self {
+    pub fn new(rps: u32) -> Self {
         Self {
             state: AtomicU64::new(rps as u64),
             rps,
@@ -28,7 +28,7 @@ impl AtomicTokenBucket {
     }
 
     /// Try to consume one token. Returns true if allowed.
-    pub(crate) fn try_acquire(&self) -> bool {
+    pub fn try_acquire(&self) -> bool {
         let now_secs = self.epoch.elapsed().as_secs() as u32;
 
         loop {
@@ -70,14 +70,14 @@ impl AtomicTokenBucket {
 /// Per-IP rate limiter. Each client IP gets its own token bucket.
 /// Buckets unused for longer than the eviction threshold are cleaned up
 /// periodically to prevent unbounded memory growth.
-pub(crate) struct PerIpRateLimiter {
+pub struct PerIpRateLimiter {
     buckets: DashMap<IpAddr, (AtomicTokenBucket, AtomicU64)>, // (bucket, last_access_epoch_ms)
-    pub(crate) rps: u32,
+    pub rps: u32,
     epoch: Instant,
 }
 
 impl PerIpRateLimiter {
-    pub(crate) fn new(rps: u32) -> Self {
+    pub fn new(rps: u32) -> Self {
         Self {
             buckets: DashMap::new(),
             rps,
@@ -85,7 +85,7 @@ impl PerIpRateLimiter {
         }
     }
 
-    pub(crate) fn try_acquire(&self, ip: IpAddr) -> bool {
+    pub fn try_acquire(&self, ip: IpAddr) -> bool {
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         // Fast path: a shard *read* lock. The entry API below takes the shard
         // write lock, which would serialise every request from hot IPs on the
@@ -101,7 +101,7 @@ impl PerIpRateLimiter {
         entry.value().0.try_acquire()
     }
 
-    pub(crate) fn evict_idle(&self, max_idle: Duration) {
+    pub fn evict_idle(&self, max_idle: Duration) {
         let now_ms = self.epoch.elapsed().as_millis() as u64;
         let max_idle_ms = max_idle.as_millis() as u64;
         self.buckets.retain(|_, (_, last_access)| {
@@ -112,7 +112,7 @@ impl PerIpRateLimiter {
 
 /// Rate limiter mode for a route.
 #[derive(Clone)]
-pub(crate) enum RateLimiterMode {
+pub enum RateLimiterMode {
     /// Shared bucket: all clients share one token bucket (default).
     Shared(std::sync::Arc<AtomicTokenBucket>),
     /// Per-IP: each client IP gets its own token bucket.
@@ -120,14 +120,14 @@ pub(crate) enum RateLimiterMode {
 }
 
 impl RateLimiterMode {
-    pub(crate) fn rps(&self) -> u32 {
+    pub fn rps(&self) -> u32 {
         match self {
             RateLimiterMode::Shared(b) => b.rps,
             RateLimiterMode::PerIp(p) => p.rps,
         }
     }
 
-    pub(crate) fn is_per_ip(&self) -> bool {
+    pub fn is_per_ip(&self) -> bool {
         matches!(self, RateLimiterMode::PerIp(_))
     }
 }
