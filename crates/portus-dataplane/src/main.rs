@@ -2,9 +2,11 @@
 
 #[cfg(feature = "pingora")]
 mod pingora;
+#[cfg(feature = "rama")]
+mod rama;
 mod stack;
 
-use log::{error, info};
+use log::info;
 
 use portus_dataplane_core::bootstrap::{bootstrap, fatal};
 
@@ -47,14 +49,19 @@ fn main() {
             #[cfg(not(feature = "pingora"))]
             {
                 drop(boot);
-                error!("the pingora network stack is not built into this binary");
+                log::error!("the pingora network stack is not built into this binary");
                 std::process::exit(1)
             }
         }
         NetworkStack::Rama => {
-            drop(boot);
-            error!("the rama network stack is not built into this binary");
-            std::process::exit(1)
+            #[cfg(feature = "rama")]
+            rama::run(boot);
+            #[cfg(not(feature = "rama"))]
+            {
+                drop(boot);
+                log::error!("the rama network stack is not built into this binary");
+                std::process::exit(1)
+            }
         }
     }
 }

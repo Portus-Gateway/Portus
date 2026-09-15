@@ -1,0 +1,484 @@
+//! The Rama request service: the core plans the request, this carries it
+//! out with Rama's HTTP client.
+//!
+//! Rama 0.4 has its own HTTP types (headers, method, URI) rather than the
+//! `http` crate's, so the core's header traits are implemented here on thin
+//! newtypes and nothing is copied per request beyond what forwarding needs.
+
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bytes::Bytes;
+use log::{info, warn};
+use rama::error::BoxError;
+use rama::extensions::ExtensionsRef;
+use rama::http::body::util::{BodyExt, Full};
+use rama::http::{Body, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, StreamingBody, Version};
+use rama::net::address::Host;
+use rama::net::client::{ConnectionError, ConnectionErrorDomain};
+use rama::net::http::TargetHttpVersion;
+use rama::net::stream::SocketInfo;
+use rama::tls::client::{ServerVerifyMode, TlsClientAuth, TlsServerName, TlsServerVerify};
+use rama::tls::rustls::client::RustlsServerCertVerifier;
+use rama::tls::SecureTransport;
+use rama::Service;
+
+use portus_dataplane_core::h2::{UPSTREAM_H2_CONNECTION_WINDOW, UPSTREAM_H2_STREAM_WINDOW};
+use portus_dataplane_core::metrics::ProxyMetrics;
+use portus_dataplane_core::outlier::Outliers;
+use portus_dataplane_core::plan::{
+    apply_cors_response_headers, plan_request, should_retry_connect, Forward, HeaderSink, Plan, Reply,
+    RequestFacts,
+};
+use portus_dataplane_core::router::{access_log_enabled, should_retry_status, RequestHeaders, SnapshotSlot};
+use portus_dataplane_core::types::BackendProtocol;
+
+use super::client::{Client, UpstreamTlsKey};
+use super::tls::{client_auth_for, upstream_tls_for};
+
+/// Request bodies up to this size are buffered when the route allows retries,
+/// so a failed attempt can be replayed. Larger bodies stream and get one
+/// attempt.
+const RETRY_BUFFER_MAX: u64 = 64 * 1024;
+
+/// Read view of Rama's header map for the core.
+struct Headers<'a>(&'a HeaderMap);
+
+impl RequestHeaders for Headers<'_> {
+    fn get(&self, name: &str) -> Option<&[u8]> {
+        self.0.get(name).map(|v| v.as_bytes())
+    }
+    fn for_each(&self, f: &mut dyn FnMut(&str, &[u8])) {
+        for (name, value) in self.0.iter() {
+            f(name.as_str(), value.as_bytes());
+        }
+    }
+}
+
+/// Write view of Rama's header map for the core's mutations.
+struct HeadersMut<'a>(&'a mut HeaderMap);
+
+fn rama_name(name: &http::HeaderName) -> Option<HeaderName> {
+    HeaderName::from_bytes(name.as_str().as_bytes()).ok()
+}
+
+fn rama_value(value: &http::HeaderValue) -> Option<HeaderValue> {
+    HeaderValue::from_bytes(value.as_bytes()).ok()
+}
+
+impl HeaderSink for HeadersMut<'_> {
+    fn get(&self, name: &http::HeaderName) -> Option<&[u8]> {
+        self.0.get(name.as_str()).map(|v| v.as_bytes())
+    }
+    fn insert(&mut self, name: http::HeaderName, value: http::HeaderValue) {
+        if let (Some(n), Some(v)) = (rama_name(&name), rama_value(&value)) {
+            self.0.insert(n, v);
+        }
+    }
+    fn append(&mut self, name: http::HeaderName, value: http::HeaderValue) {
+        if let (Some(n), Some(v)) = (rama_name(&name), rama_value(&value)) {
+            self.0.append(n, v);
+        }
+    }
+    fn remove(&mut self, name: &http::HeaderName) {
+        self.0.remove(name.as_str());
+    }
+}
+
+pub struct ProxyService {
+    snapshot: SnapshotSlot,
+    metrics: Arc<ProxyMetrics>,
+    outliers: Arc<Outliers>,
+    client: Client,
+}
+
+impl ProxyService {
+    pub fn new(snapshot: SnapshotSlot, metrics: Arc<ProxyMetrics>, outliers: Arc<Outliers>, client: Client) -> Self {
+        Self { snapshot, metrics, outliers, client }
+    }
+}
+
+impl Service<Request> for ProxyService {
+    type Output = Response;
+    type Error = Infallible;
+
+    async fn serve(&self, req: Request) -> Result<Self::Output, Self::Error> {
+        Ok(self.handle(req).await)
+    }
+}
+
+/// The parts of the downstream request the upstream attempts are built from.
+struct Incoming {
+    method: Method,
+    version: Version,
+    /// Path plus query as it appeared on the request line.
+    target: String,
+}
+
+enum AttemptError {
+    /// Nothing reached the backend (dial, TLS handshake).
+    Connect(String),
+    /// Our own deadline fired.
+    Timeout,
+    /// The exchange failed after the connection was up.
+    Exchange(String),
+}
+
+impl ProxyService {
+    async fn handle(&self, req: Request) -> Response {
+        let start = Instant::now();
+
+        let socket = req.extensions().get_ref::<SocketInfo>().map(|s| (s.local_addr(), s.peer_addr()));
+        let local_port = socket.and_then(|(local, _)| local).map(|a| a.port).unwrap_or(80);
+        let peer_ip: Option<IpAddr> = socket.map(|(_, peer)| peer.ip_addr);
+        let sni: Option<String> = req
+            .extensions()
+            .get_ref::<SecureTransport>()
+            .and_then(|s| s.client_hello())
+            .and_then(|h| h.ext_server_name())
+            .map(|d| d.as_str().to_string());
+        let socket_is_tls = req.extensions().contains::<SecureTransport>();
+
+        let raw_host: String = req
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| req.uri().host().map(|h| h.to_string()))
+            .unwrap_or_default();
+        let host = raw_host.split(':').next().unwrap_or(&raw_host);
+        let path: std::borrow::Cow<'_, str> =
+            req.uri().path().map(|p| p.as_encoded_str()).unwrap_or(std::borrow::Cow::Borrowed("/"));
+        let query: Option<std::borrow::Cow<'_, str>> = req.uri().query().map(|q| q.as_encoded_str());
+        let target: std::borrow::Cow<'_, str> = match &query {
+            Some(q) => std::borrow::Cow::Owned(format!("{path}?{q}")),
+            None => std::borrow::Cow::Borrowed(&path),
+        };
+
+        let snap = self.snapshot.load();
+        let facts = RequestFacts {
+            host,
+            path: &path,
+            path_and_query: &target,
+            query: query.as_deref(),
+            method: req.method().as_str(),
+            headers: &Headers(req.headers()),
+            local_port,
+            socket_is_tls,
+            sni: sni.as_deref(),
+            peer_ip,
+        };
+        let plan = match plan_request(&snap, facts, &self.metrics).await {
+            Plan::Respond(reply) => {
+                let status = reply.status;
+                self.metrics.request_total.with_label_values(&["no_route", status_label(status).as_str(), "http"]).inc();
+                self.metrics.request_duration.with_label_values(&["no_route", "http"]).observe(start.elapsed().as_secs_f64());
+                access_log(peer_ip, req.method().as_str(), &path, "no_route", status, start);
+                return reply_response(reply);
+            }
+            Plan::Forward(plan) => plan,
+        };
+        drop(snap);
+        let target = target.into_owned();
+        let logged = if access_log_enabled() { Some((req.method().as_str().to_string(), path.into_owned())) } else { None };
+
+        let response = self.forward(req, &plan, peer_ip, target).await;
+
+        let status = response.status().as_u16();
+        let host_label = plan.service_name.as_ref();
+        self.metrics.request_total.with_label_values(&[host_label, status_label(status).as_str(), plan.protocol_label()]).inc();
+        plan.duration_histogram.observe(start.elapsed().as_secs_f64());
+        if let Some(cb) = &plan.circuit_breaker {
+            if status >= 500 {
+                cb.record_failure();
+            } else {
+                cb.record_success();
+            }
+            self.metrics.circuit_breaker_state.with_label_values(&[host_label]).set(cb.current_state() as i64);
+        }
+        if let Some(cl) = &plan.connection_limiter {
+            cl.release();
+        }
+        if let Some((method, path)) = &logged {
+            access_log(peer_ip, method, path, host_label, status, start);
+        }
+        response
+    }
+
+    async fn forward(&self, req: Request, plan: &Forward, peer_ip: Option<IpAddr>, target: String) -> Response {
+        let Some(pool) = plan.pool.as_ref() else {
+            return status_response(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+
+        let (parts, body) = req.into_parts();
+        let method = parts.method;
+        let version = parts.version;
+        let mut headers = parts.headers;
+
+        // Headers the backend sees: forwarded-for, host rewrite and the
+        // route's mutations, applied once; retries reuse the result.
+        if let Some(ip) = peer_ip
+            && let Ok(ip_value) = HeaderValue::from_str(&ip.to_string())
+        {
+            let xff = match headers.get("x-forwarded-for") {
+                Some(existing) => {
+                    let mut merged = existing.as_bytes().to_vec();
+                    merged.extend_from_slice(b", ");
+                    merged.extend_from_slice(ip_value.as_bytes());
+                    HeaderValue::from_bytes(&merged).unwrap_or_else(|_| ip_value.clone())
+                }
+                None => ip_value.clone(),
+            };
+            headers.insert("x-forwarded-for", xff);
+            headers.insert("x-real-ip", ip_value);
+        }
+        if let Some(new_host) = &plan.rewrite_hostname
+            && let Ok(v) = HeaderValue::from_str(new_host)
+        {
+            headers.insert("host", v);
+        }
+        plan.request_headers.apply(&mut HeadersMut(&mut headers));
+
+        // Bodies are buffered for replay only when the route retries and the
+        // body is small; otherwise the body streams once and there is no retry.
+        let mut streaming: Option<Body> = None;
+        let mut buffered: Option<Bytes> = None;
+        let small = StreamingBody::size_hint(&body).exact().is_some_and(|n| n <= RETRY_BUFFER_MAX);
+        if plan.max_retries > 0 && small {
+            match body.collect().await {
+                Ok(collected) => buffered = Some(collected.to_bytes()),
+                Err(_) => return status_response(StatusCode::BAD_REQUEST),
+            }
+        } else {
+            streaming = Some(body);
+        }
+        let retrying = buffered.is_some();
+        let mut retries_left = if retrying { plan.max_retries } else { 0 };
+        let incoming = Incoming { method, version, target };
+
+        let mut response = loop {
+            let Some(backend) = pool.select() else {
+                return status_response(StatusCode::INTERNAL_SERVER_ERROR);
+            };
+            let body = match (&buffered, streaming.take()) {
+                (Some(b), _) => Body::new(Full::new(b.clone())),
+                (None, Some(b)) => b,
+                (None, None) => return status_response(StatusCode::BAD_GATEWAY),
+            };
+            // The single-attempt path moves the headers; only a retrying
+            // request pays for a clone.
+            let attempt_headers = if retrying { headers.clone() } else { std::mem::take(&mut headers) };
+            let upstream = self.upstream_request(&incoming, attempt_headers, plan, backend, body);
+            // One deadline for the whole exchange: the route's request timeout,
+            // else its backend-request (read) timeout, else the connect timeout.
+            let deadline = plan.request_timeout.or(plan.read_timeout).or(plan.connect_timeout);
+            match self.attempt(upstream, deadline).await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if let Some(out) = self.outliers.responded(pool, &backend, status) {
+                        self.note_ejection(plan, &backend, out, &format!("{status} responses in a row"));
+                    }
+                    if should_retry_status(status, &plan.retry_codes, retries_left) {
+                        retries_left -= 1;
+                        info!("upstream {} answered {status}, retrying ({retries_left} left)", plan.service_name);
+                        continue;
+                    }
+                    break resp;
+                }
+                Err(AttemptError::Connect(why)) => {
+                    self.metrics.upstream_connect_errors_total.with_label_values(&[plan.service_name.as_ref()]).inc();
+                    if let Some(out) = self.outliers.connect_failed(pool, &backend) {
+                        self.note_ejection(plan, &backend, out, "a connect failure");
+                    }
+                    if should_retry_connect(&plan.retry_on, retries_left) {
+                        retries_left -= 1;
+                        warn!("upstream connect failed for {} ({why}), retrying ({retries_left} left)", plan.service_name);
+                        continue;
+                    }
+                    warn!("upstream connect failed for {}: {why}", plan.service_name);
+                    break status_response(StatusCode::BAD_GATEWAY);
+                }
+                Err(AttemptError::Timeout) => {
+                    break status_response(if plan.has_timeout {
+                        StatusCode::GATEWAY_TIMEOUT
+                    } else {
+                        StatusCode::BAD_GATEWAY
+                    });
+                }
+                Err(AttemptError::Exchange(why)) => {
+                    warn!("upstream exchange with {} failed: {why}", plan.service_name);
+                    break status_response(StatusCode::BAD_GATEWAY);
+                }
+            }
+        };
+
+        let mut sink = HeadersMut(response.headers_mut());
+        plan.response_headers.apply(&mut sink);
+        if let Some((origin, cors, has_credentials)) = &plan.cors {
+            apply_cors_response_headers(&mut sink, origin, cors, *has_credentials);
+        }
+        response
+    }
+
+    async fn attempt(&self, req: Request, deadline: Option<Duration>) -> Result<Response, AttemptError> {
+        let fut = self.client.serve(req);
+        let result = match deadline {
+            Some(d) => match tokio::time::timeout(d, fut).await {
+                Ok(r) => r,
+                Err(_) => return Err(AttemptError::Timeout),
+            },
+            None => fut.await,
+        };
+        result.map_err(|e| classify(&e))
+    }
+
+    /// The request one attempt sends: same method and target, the backend as
+    /// the URI authority (Rama dials the URI), the prepared headers, and the
+    /// TLS and HTTP/2 parameters as request extensions.
+    fn upstream_request(
+        &self,
+        incoming: &Incoming,
+        headers: HeaderMap,
+        plan: &Forward,
+        backend: SocketAddr,
+        body: Body,
+    ) -> Request {
+        let use_tls = plan.backend_tls.is_some() || plan.upstream_tls;
+        let scheme = if use_tls { "https" } else { "http" };
+        let target = plan.rewrite_path.as_deref().unwrap_or(&incoming.target);
+        let uri = format!("{scheme}://{backend}{target}");
+        let h2 = matches!(plan.protocol, BackendProtocol::Grpc | BackendProtocol::H2c);
+        let version = if h2 {
+            Version::HTTP_2
+        } else if incoming.version == Version::HTTP_2 {
+            Version::HTTP_11
+        } else {
+            incoming.version
+        };
+
+        let mut req = Request::builder()
+            .method(incoming.method.clone())
+            .uri(uri.as_str())
+            .version(version)
+            .body(body)
+            .unwrap_or_else(|_| Request::new(Body::empty()));
+        *req.headers_mut() = headers;
+
+        let ext = req.extensions();
+        if h2 {
+            ext.insert(TargetHttpVersion(Version::HTTP_2));
+            ext.insert(rama::http::conn::H2ClientContextParams {
+                init_stream_window_size: Some(UPSTREAM_H2_STREAM_WINDOW),
+                init_connection_window_size: Some(UPSTREAM_H2_CONNECTION_WINDOW),
+                keep_alive_interval: (plan.protocol == BackendProtocol::Grpc).then(|| Duration::from_secs(30)),
+                max_concurrent_streams: (plan.protocol == BackendProtocol::Grpc).then_some(200),
+                ..Default::default()
+            });
+        } else {
+            ext.insert(TargetHttpVersion(Version::HTTP_11));
+        }
+        if use_tls {
+            let mut key: u64 = 0;
+            let sni = plan.backend_tls.as_ref().map(|b| b.hostname.as_ref()).unwrap_or(plan.upstream_sni.as_ref());
+            if !sni.is_empty()
+                && let Ok(host) = Host::try_from(sni)
+            {
+                ext.insert(TlsServerName(host));
+            }
+            match plan.backend_tls.as_deref() {
+                Some(btls) => {
+                    let view = upstream_tls_for(btls);
+                    ext.insert(view.trust.clone());
+                    if let Some(verifier) = &view.verifier {
+                        ext.insert(RustlsServerCertVerifier(Arc::clone(verifier)));
+                    }
+                    key ^= view.key;
+                }
+                None if !plan.upstream_verify => {
+                    ext.insert(TlsServerVerify(ServerVerifyMode::Disable));
+                    key ^= 1;
+                }
+                None => {}
+            }
+            if let Some(identity) = plan.client_identity.as_ref() {
+                if let Some(auth) = client_auth_for(identity).as_ref() {
+                    ext.insert(TlsClientAuth(auth.clone()));
+                }
+                key ^= (Arc::as_ptr(identity) as usize as u64).rotate_left(17);
+            }
+            ext.insert(UpstreamTlsKey(key));
+        }
+        req
+    }
+
+    fn note_ejection(&self, plan: &Forward, addr: &SocketAddr, out: Duration, why: &str) {
+        let svc = plan.service_name.as_ref();
+        self.metrics.upstream_ejections_total.with_label_values(&[svc]).inc();
+        warn!("ejected {addr} from {svc}:{} for {out:?} after {why}", plan.port);
+    }
+}
+
+/// Status code as a metrics label without a heap allocation.
+fn status_label(status: u16) -> arrayvec::ArrayString<4> {
+    let mut buf = arrayvec::ArrayString::<4>::new();
+    let _ = std::fmt::Write::write_fmt(&mut buf, format_args!("{status}"));
+    buf
+}
+
+fn access_log(peer_ip: Option<IpAddr>, method: &str, path: &str, host: &str, status: u16, start: Instant) {
+    if access_log_enabled() {
+        info!(
+            target: "portus_dataplane::access",
+            "{} {} {} {} {} {:.3}s",
+            peer_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "-".into()),
+            method,
+            path,
+            host,
+            status,
+            start.elapsed().as_secs_f64()
+        );
+    }
+}
+
+/// Connection-phase failures (dial, TLS) are distinguished from failures of
+/// an established exchange so retries and outlier ejection only fire when
+/// the backend never answered.
+fn classify(err: &BoxError) -> AttemptError {
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err.as_ref());
+    while let Some(e) = cur {
+        if let Some(ce) = e.downcast_ref::<ConnectionError>() {
+            return match ce.domain() {
+                ConnectionErrorDomain::Transport | ConnectionErrorDomain::Application => AttemptError::Connect(ce.to_string()),
+                _ => AttemptError::Exchange(ce.to_string()),
+            };
+        }
+        if e.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
+            return AttemptError::Timeout;
+        }
+        cur = e.source();
+    }
+    AttemptError::Exchange(err.to_string())
+}
+
+fn reply_response(reply: Reply) -> Response {
+    let mut resp = Response::new(Body::new(Full::new(reply.body)));
+    *resp.status_mut() = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    for (name, value) in &reply.headers {
+        if let (Some(n), Some(v)) = (rama_name(name), rama_value(value)) {
+            resp.headers_mut().insert(n, v);
+        }
+    }
+    if !reply.keepalive {
+        resp.headers_mut().insert("connection", HeaderValue::from_static("close"));
+    }
+    resp
+}
+
+fn status_response(status: StatusCode) -> Response {
+    let mut resp = Response::new(Body::empty());
+    *resp.status_mut() = status;
+    resp.headers_mut().insert("content-length", HeaderValue::from_static("0"));
+    resp
+}

@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.98-alpine AS builder
+# Cargo features for the dataplane binary, e.g. "rama" to build the experimental stack in.
+ARG DATAPLANE_FEATURES=""
 
 RUN apk add --no-cache musl-dev cmake make perl build-base protoc
 
@@ -15,7 +17,7 @@ COPY proto/ proto/
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=cargo-target-dataplane-release,target=/src/target \
-    cargo build --release -p portus-dataplane \
+    cargo build --release -p portus-dataplane --features "$DATAPLANE_FEATURES" \
     && mkdir -p /out && cp /src/target/release/portus-dataplane /out/portus-dataplane
 
 FROM scratch

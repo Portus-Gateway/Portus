@@ -33,7 +33,7 @@ CONTROLLER_REPO  := portus-gateway/controller
 CONTROLLER_TAG   := dev
 CONTROLLER_IMAGE := $(CONTROLLER_REPO):$(CONTROLLER_TAG)
 DATAPLANE_REPO   := portus-gateway/dataplane
-DATAPLANE_TAG    := dev
+DATAPLANE_TAG    ?= dev
 DATAPLANE_IMAGE  := $(DATAPLANE_REPO):$(DATAPLANE_TAG)
 PROXY_IMAGE      := portus/proxy:dev
 NODES       ?= 10
@@ -112,8 +112,11 @@ build: build-controller build-dataplane
 build-controller: disk-check
 	$(DOCKER) build -t $(CONTROLLER_IMAGE) -f deploy/docker/Dockerfile.controller .
 
+# DATAPLANE_FEATURES=rama builds the experimental Rama stack into the image
+# (select it at run time with dataplane.networkStack=rama).
+DATAPLANE_FEATURES ?=
 build-dataplane: disk-check
-	$(DOCKER) build -t $(DATAPLANE_IMAGE) -f deploy/docker/Dockerfile.dataplane .
+	$(DOCKER) build -t $(DATAPLANE_IMAGE) --build-arg DATAPLANE_FEATURES="$(DATAPLANE_FEATURES)" -f deploy/docker/Dockerfile.dataplane .
 
 build-proxy: disk-check
 	$(DOCKER) build -t $(PROXY_IMAGE) -f deploy/docker/Dockerfile.proxy .

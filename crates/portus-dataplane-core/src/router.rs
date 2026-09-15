@@ -309,6 +309,35 @@ pub struct HostRoutes {
     pub catch_all: Option<PathRoute>,
 }
 
+/// Read access to a request's headers, whatever type the network stack uses
+/// for them. `http::HeaderMap` implements it; a stack with its own header
+/// type wraps it in a newtype.
+pub trait RequestHeaders {
+    /// First value of `name` (case-insensitive), as bytes.
+    fn get(&self, name: &str) -> Option<&[u8]>;
+    fn contains(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+    /// Every (name, value) pair, in order.
+    fn for_each(&self, f: &mut dyn FnMut(&str, &[u8]));
+}
+
+impl RequestHeaders for http::HeaderMap {
+    fn get(&self, name: &str) -> Option<&[u8]> {
+        http::HeaderMap::get(self, name).map(|v| v.as_bytes())
+    }
+    fn for_each(&self, f: &mut dyn FnMut(&str, &[u8])) {
+        for (name, value) in self.iter() {
+            f(name.as_str(), value.as_bytes());
+        }
+    }
+}
+
+/// First value of `name` as UTF-8, if present and valid.
+pub fn header_str<'h>(headers: &'h (impl RequestHeaders + ?Sized), name: &str) -> Option<&'h str> {
+    headers.get(name).and_then(|v| std::str::from_utf8(v).ok())
+}
+
 impl HostRoutes {
     /// Find an existing rate limiter for a path/type/rps combo (for reuse across rebuilds).
     pub fn find_rate_limiter(
@@ -353,7 +382,7 @@ impl HostRoutes {
     #[cfg(test)]
     pub fn match_path(&self, request_path: &str) -> Option<&PathRoute> {
         // Backward-compatible convenience: match by path only (no header/method/query checks).
-        self.match_request(request_path, &http::Method::GET, &http::HeaderMap::new(), None)
+        self.match_request(request_path, "GET", &http::HeaderMap::new(), None)
     }
 
     /// Multi-dimensional request matching: path + method + headers + query params.
@@ -361,8 +390,8 @@ impl HostRoutes {
     pub fn match_request(
         &self,
         request_path: &str,
-        method: &http::Method,
-        headers: &http::HeaderMap,
+        method: &str,
+        headers: &(impl RequestHeaders + ?Sized),
         query: Option<&str>,
     ) -> Option<&PathRoute> {
         // O(1) exact path lookup
@@ -413,22 +442,22 @@ impl HostRoutes {
     fn extra_dimensions_match(
         &self,
         rule: &PathRoute,
-        method: &http::Method,
-        headers: &http::HeaderMap,
+        method: &str,
+        headers: &(impl RequestHeaders + ?Sized),
         query: Option<&str>,
     ) -> bool {
         // Method match: if rule specifies a method, it must match
         if let Some(ref required_method) = rule.method_match
-            && method != required_method {
+            && method != required_method.as_str() {
                 return false;
             }
 
         // Header matches: ALL must match (AND logic per Gateway API spec)
         for hm in &rule.header_matches {
-            let actual = headers.get(&hm.name);
+            let actual = headers.get(hm.name.as_str());
             match actual {
                 Some(v) => {
-                    let val_str = v.to_str().unwrap_or("");
+                    let val_str = std::str::from_utf8(v).unwrap_or("");
                     match hm.match_type {
                         HeaderMatchType::Exact => {
                             if val_str != hm.value {
@@ -564,7 +593,7 @@ pub fn extract_client_ip(
 pub fn spawn_mirror_request(
     mirror_service: &Arc<str>,
     mirror_port: u16,
-    method: &http::Method,
+    method: &str,
     path: &str,
     host: &str,
     extra_headers: &[(String, String)],
@@ -594,7 +623,7 @@ pub fn spawn_mirror_request(
     };
 
     let addr_str = backend.to_string();
-    let method = method.clone();
+    let method = method.to_string();
     // SEC-8: Strip CRLF from host/path/headers to prevent header injection in raw HTTP/1.1 request.
     let safe_path = path.replace(['\r', '\n'], "");
     let safe_host = host.replace(['\r', '\n'], "");
@@ -1777,7 +1806,7 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-custom", HeaderValue::from_static("expected-value"));
 
-        let matched = routes.match_request("/api/test", &http::Method::GET, &headers, None);
+        let matched = routes.match_request("/api/test", "GET", &headers, None);
         assert!(matched.is_some(), "should match when header is present with correct value");
     }
 
@@ -1795,7 +1824,7 @@ mod tests {
         let routes = make_host_routes(vec![route], None);
 
         let headers = http::HeaderMap::new();
-        let matched = routes.match_request("/api/test", &http::Method::GET, &headers, None);
+        let matched = routes.match_request("/api/test", "GET", &headers, None);
         assert!(matched.is_none(), "should NOT match when required header is missing");
     }
 
@@ -1815,7 +1844,7 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-custom", HeaderValue::from_static("wrong-value"));
 
-        let matched = routes.match_request("/api/test", &http::Method::GET, &headers, None);
+        let matched = routes.match_request("/api/test", "GET", &headers, None);
         assert!(matched.is_none(), "should NOT match when header has wrong value");
     }
 
@@ -1824,7 +1853,7 @@ mod tests {
         let route = make_path_route_with_method("/api", PathMatchType::Prefix, http::Method::GET);
         let routes = make_host_routes(vec![route], None);
 
-        let matched = routes.match_request("/api/test", &http::Method::GET, &http::HeaderMap::new(), None);
+        let matched = routes.match_request("/api/test", "GET", &http::HeaderMap::new(), None);
         assert!(matched.is_some(), "should match GET request");
     }
 
@@ -1833,7 +1862,7 @@ mod tests {
         let route = make_path_route_with_method("/api", PathMatchType::Prefix, http::Method::GET);
         let routes = make_host_routes(vec![route], None);
 
-        let matched = routes.match_request("/api/test", &http::Method::POST, &http::HeaderMap::new(), None);
+        let matched = routes.match_request("/api/test", "POST", &http::HeaderMap::new(), None);
         assert!(matched.is_none(), "should NOT match POST when route requires GET");
     }
 
@@ -1852,7 +1881,7 @@ mod tests {
 
         let matched = routes.match_request(
             "/api/test",
-            &http::Method::GET,
+            "GET",
             &http::HeaderMap::new(),
             Some("version=v2&other=foo"),
         );
@@ -1874,7 +1903,7 @@ mod tests {
 
         let matched = routes.match_request(
             "/api/test",
-            &http::Method::GET,
+            "GET",
             &http::HeaderMap::new(),
             Some("other=foo"),
         );
@@ -1888,7 +1917,7 @@ mod tests {
         let routes = make_host_routes(vec![route], None);
 
         let matched_old = routes.match_path("/api/test");
-        let matched_new = routes.match_request("/api/test", &http::Method::POST, &http::HeaderMap::new(), None);
+        let matched_new = routes.match_request("/api/test", "POST", &http::HeaderMap::new(), None);
 
         assert!(matched_old.is_some());
         assert!(matched_new.is_some());
@@ -1918,12 +1947,12 @@ mod tests {
         // Only one header present -- should NOT match
         let mut headers = http::HeaderMap::new();
         headers.insert("x-first", HeaderValue::from_static("a"));
-        let matched = routes.match_request("/api", &http::Method::GET, &headers, None);
+        let matched = routes.match_request("/api", "GET", &headers, None);
         assert!(matched.is_none(), "should NOT match with only one of two required headers");
 
         // Both headers present -- should match
         headers.insert("x-second", HeaderValue::from_static("b"));
-        let matched = routes.match_request("/api", &http::Method::GET, &headers, None);
+        let matched = routes.match_request("/api", "GET", &headers, None);
         assert!(matched.is_some(), "should match with both required headers");
     }
 
@@ -2032,11 +2061,11 @@ mod tests {
 
         let mut headers = http::HeaderMap::new();
         headers.insert(http::header::AUTHORIZATION, "Bearer mytoken123".parse().unwrap());
-        assert!(routes.match_request("/", &http::Method::GET, &headers, None).is_some());
+        assert!(routes.match_request("/", "GET", &headers, None).is_some());
 
         let mut bad_headers = http::HeaderMap::new();
         bad_headers.insert(http::header::AUTHORIZATION, "Basic abc".parse().unwrap());
-        assert!(routes.match_request("/", &http::Method::GET, &bad_headers, None).is_none());
+        assert!(routes.match_request("/", "GET", &bad_headers, None).is_none());
     }
 
     #[test]
@@ -2054,15 +2083,15 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-api-version", "v1.0".parse().unwrap());
         // Both match
-        assert!(routes.match_request("/api/v1/users", &http::Method::GET, &headers, None).is_some());
+        assert!(routes.match_request("/api/v1/users", "GET", &headers, None).is_some());
 
         // Path matches but header doesn't
         let mut bad_headers = http::HeaderMap::new();
         bad_headers.insert("x-api-version", "latest".parse().unwrap());
-        assert!(routes.match_request("/api/v1/users", &http::Method::GET, &bad_headers, None).is_none());
+        assert!(routes.match_request("/api/v1/users", "GET", &bad_headers, None).is_none());
 
         // Header matches but path doesn't
-        assert!(routes.match_request("/web/page", &http::Method::GET, &headers, None).is_none());
+        assert!(routes.match_request("/web/page", "GET", &headers, None).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -2230,7 +2259,7 @@ mod tests {
         // Request without the header -> should NOT match
         let empty_headers = http::HeaderMap::new();
         assert!(
-            routes.match_request("/", &http::Method::GET, &empty_headers, None).is_none(),
+            routes.match_request("/", "GET", &empty_headers, None).is_none(),
             "route with header requirement should not match request without that header"
         );
 
@@ -2238,7 +2267,7 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("color", http::HeaderValue::from_static("blue"));
         assert!(
-            routes.match_request("/", &http::Method::GET, &headers, None).is_some(),
+            routes.match_request("/", "GET", &headers, None).is_some(),
             "route with header requirement should match request with matching header"
         );
     }
@@ -2268,19 +2297,19 @@ mod tests {
         // Blue header -> blue-svc
         let mut blue_headers = http::HeaderMap::new();
         blue_headers.insert("color", http::HeaderValue::from_static("blue"));
-        let matched = routes.match_request("/", &http::Method::GET, &blue_headers, None).unwrap();
+        let matched = routes.match_request("/", "GET", &blue_headers, None).unwrap();
         assert_eq!(matched.service_name.as_ref(), "blue-svc");
 
         // Green header -> green-svc
         let mut green_headers = http::HeaderMap::new();
         green_headers.insert("color", http::HeaderValue::from_static("green"));
-        let matched = routes.match_request("/", &http::Method::GET, &green_headers, None).unwrap();
+        let matched = routes.match_request("/", "GET", &green_headers, None).unwrap();
         assert_eq!(matched.service_name.as_ref(), "green-svc");
 
         // No header -> no match
         let empty_headers = http::HeaderMap::new();
         assert!(
-            routes.match_request("/", &http::Method::GET, &empty_headers, None).is_none(),
+            routes.match_request("/", "GET", &empty_headers, None).is_none(),
             "no header should not match either route"
         );
     }
@@ -2434,19 +2463,19 @@ mod tests {
 
         // Request to /one -> exact match (no headers needed)
         let empty_headers = http::HeaderMap::new();
-        let matched = routes.match_request("/one", &http::Method::GET, &empty_headers, None).unwrap();
+        let matched = routes.match_request("/one", "GET", &empty_headers, None).unwrap();
         assert_eq!(matched.path.as_ref(), "/one");
 
         // Request to / without headers -> no match (prefix "/" requires header)
         assert!(
-            routes.match_request("/", &http::Method::GET, &empty_headers, None).is_none(),
+            routes.match_request("/", "GET", &empty_headers, None).is_none(),
             "prefix / with header requirement should not match without the header"
         );
 
         // Request to / with header -> matches
         let mut headers = http::HeaderMap::new();
         headers.insert("x-test", http::HeaderValue::from_static("yes"));
-        let matched = routes.match_request("/", &http::Method::GET, &headers, None).unwrap();
+        let matched = routes.match_request("/", "GET", &headers, None).unwrap();
         assert_eq!(matched.service_name.as_ref(), "header-svc");
     }
 
@@ -3801,7 +3830,7 @@ mod tests {
 
         // Route order: 2qp before 1qp (more specific first)
         let routes = make_host_routes(vec![route_2qp, route_1qp], None);
-        let matched = routes.match_request("/", &http::Method::GET, &http::HeaderMap::new(), Some("animal=dolphin&color=blue"));
+        let matched = routes.match_request("/", "GET", &http::HeaderMap::new(), Some("animal=dolphin&color=blue"));
         assert_eq!(matched.unwrap().service_name.as_ref(), "v3", "2-param route should match before 1-param route");
     }
 
@@ -3837,11 +3866,11 @@ mod tests {
 
         let mut headers = http::HeaderMap::new();
         headers.insert("version", HeaderValue::from_static("one"));
-        let matched = routes.match_request("/", &http::Method::GET, &headers, Some("animal=whale"));
+        let matched = routes.match_request("/", "GET", &headers, Some("animal=whale"));
         assert_eq!(matched.unwrap().service_name.as_ref(), "v2", "header+query combo should match");
 
         // Without header, should fall through to plain route
-        let matched2 = routes.match_request("/", &http::Method::GET, &http::HeaderMap::new(), Some("animal=whale"));
+        let matched2 = routes.match_request("/", "GET", &http::HeaderMap::new(), Some("animal=whale"));
         assert_eq!(matched2.unwrap().service_name.as_ref(), "v1", "without header, should match plain query route");
     }
 

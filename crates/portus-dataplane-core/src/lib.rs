@@ -20,6 +20,7 @@ pub mod h2;
 pub mod l4_proxy;
 pub mod metrics;
 pub mod outlier;
+pub mod plan;
 pub mod pool;
 pub mod rate_limiter;
 pub mod readiness;

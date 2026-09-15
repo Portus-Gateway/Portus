@@ -34,4 +34,5 @@ bcrypt = "0.19"
 subtle = "2"
 ipnet = "2"
 rcgen = "0.14"
+rand = "0.10"
 zeroize = { version = "1", features = ["derive"] }

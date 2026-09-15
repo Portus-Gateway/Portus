@@ -2455,7 +2455,7 @@ mod tests {
         let (result, _, _) = build_route_map_from_proto(&routes, existing, &HashMap::new(), &HashMap::new());
         let host_routes = result.get("example.com").unwrap();
         let empty = http::HeaderMap::new();
-        let matched = host_routes.match_request("/hostname-redirect", &http::Method::GET, &empty, None);
+        let matched = host_routes.match_request("/hostname-redirect", "GET", &empty, None);
         assert!(matched.is_some(), "redirect-only route must be matchable");
         let route = matched.unwrap();
         assert!(route.has_redirect());
@@ -2491,7 +2491,7 @@ mod tests {
         let (result, _, _) = build_route_map_from_proto(&routes, existing, &HashMap::new(), &HashMap::new());
         let host_routes = result.get("example.com").unwrap();
         let empty = http::HeaderMap::new();
-        let route = host_routes.match_request("/host-and-status", &http::Method::GET, &empty, None).unwrap();
+        let route = host_routes.match_request("/host-and-status", "GET", &empty, None).unwrap();
         let redir = route.redirect.as_ref().unwrap();
         assert_eq!(redir.status_code, 301);
         assert_eq!(redir.hostname.as_deref(), Some("example.org"));
@@ -2703,7 +2703,7 @@ mod tests {
     fn match_service(
         hr: &HostRoutes,
         path: &str,
-        method: &http::Method,
+        method: &str,
         headers: &http::HeaderMap,
     ) -> Option<String> {
         hr.match_request(path, method, headers, None)
@@ -2714,7 +2714,7 @@ mod tests {
     fn match_service_with_query(
         hr: &HostRoutes,
         path: &str,
-        method: &http::Method,
+        method: &str,
         headers: &http::HeaderMap,
         query: Option<&str>,
     ) -> Option<String> {
@@ -2753,47 +2753,47 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // /one matches → v1
         assert_eq!(
-            match_service(hr, "/one", &get, &empty_headers),
+            match_service(hr, "/one", get, &empty_headers),
             Some("v1".to_string()),
             "exact /one should match v1"
         );
 
         // /two matches → v2
         assert_eq!(
-            match_service(hr, "/two", &get, &empty_headers),
+            match_service(hr, "/two", get, &empty_headers),
             Some("v2".to_string()),
             "exact /two should match v2"
         );
 
         // / → no match
         assert_eq!(
-            match_service(hr, "/", &get, &empty_headers),
+            match_service(hr, "/", get, &empty_headers),
             None,
             "/ should not match any exact route"
         );
 
         // /one/example → no match (exact does not match sub-paths)
         assert_eq!(
-            match_service(hr, "/one/example", &get, &empty_headers),
+            match_service(hr, "/one/example", get, &empty_headers),
             None,
             "/one/example should not match exact /one"
         );
 
         // /two/ → no match (trailing slash makes it different)
         assert_eq!(
-            match_service(hr, "/two/", &get, &empty_headers),
+            match_service(hr, "/two/", get, &empty_headers),
             None,
             "/two/ should not match exact /two"
         );
 
         // /Two → no match (case sensitive)
         assert_eq!(
-            match_service(hr, "/Two", &get, &empty_headers),
+            match_service(hr, "/Two", get, &empty_headers),
             None,
             "/Two should not match exact /two (case sensitive)"
         );
@@ -2932,14 +2932,14 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
 
         // GET / [version: one] → v1
         {
             let mut headers = http::HeaderMap::new();
             headers.insert("version", "one".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("v1".to_string()),
                 "version=one should match v1"
             );
@@ -2950,7 +2950,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("version", "two".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("v2".to_string()),
                 "version=two (alone) should match v2"
             );
@@ -2962,7 +2962,7 @@ mod tests {
             headers.insert("version", "two".parse().unwrap());
             headers.insert("color", "orange".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("v1-and".to_string()),
                 "version=two AND color=orange should match v1-and (most specific)"
             );
@@ -2976,7 +2976,7 @@ mod tests {
             headers.insert("version", "two".parse().unwrap());
             headers.insert("color", "blue".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("v2".to_string()),
                 "version=two AND color=blue should match v2 (rule 2 before rule 4)"
             );
@@ -2987,7 +2987,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("color", "blue".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("v1-blue".to_string()),
                 "color=blue should match v1-blue"
             );
@@ -2998,7 +2998,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("color", "green".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("v1-green".to_string()),
                 "color=green should match v1-green"
             );
@@ -3009,7 +3009,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("color", "red".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("v2-red".to_string()),
                 "color=red should match v2-red"
             );
@@ -3020,7 +3020,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("color", "purple".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 None,
                 "color=purple should not match any route"
             );
@@ -3030,7 +3030,7 @@ mod tests {
         {
             let empty_headers = http::HeaderMap::new();
             assert_eq!(
-                match_service(hr, "/", &get, &empty_headers),
+                match_service(hr, "/", get, &empty_headers),
                 None,
                 "no headers should not match any header-requiring route"
             );
@@ -3102,26 +3102,26 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // GET /one (no headers) → exact-v1 (exact path, no header needed)
         assert_eq!(
-            match_service(hr, "/one", &get, &empty_headers),
+            match_service(hr, "/one", get, &empty_headers),
             Some("exact-v1".to_string()),
             "exact /one should match even without headers"
         );
 
         // GET /two (no headers) → exact-v2
         assert_eq!(
-            match_service(hr, "/two", &get, &empty_headers),
+            match_service(hr, "/two", get, &empty_headers),
             Some("exact-v2".to_string()),
             "exact /two should match even without headers"
         );
 
         // GET / (no headers) → no match (prefix / routes all require headers)
         assert_eq!(
-            match_service(hr, "/", &get, &empty_headers),
+            match_service(hr, "/", get, &empty_headers),
             None,
             "/ without headers should not match header-requiring prefix routes"
         );
@@ -3131,7 +3131,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("version", "one".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("header-v1".to_string()),
                 "/ with version=one should match header-v1"
             );
@@ -3142,7 +3142,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("version", "one".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/one", &get, &headers),
+                match_service(hr, "/one", get, &headers),
                 Some("exact-v1".to_string()),
                 "exact /one should take precedence over prefix / with headers"
             );
@@ -3150,7 +3150,7 @@ mod tests {
 
         // GET /random (no headers) → no match
         assert_eq!(
-            match_service(hr, "/random", &get, &empty_headers),
+            match_service(hr, "/random", get, &empty_headers),
             None,
             "/random without headers should not match"
         );
@@ -3193,28 +3193,28 @@ mod tests {
 
         // POST / → v1
         assert_eq!(
-            match_service(hr, "/", &http::Method::POST, &empty_headers),
+            match_service(hr, "/", "POST", &empty_headers),
             Some("v1".to_string()),
             "POST should match v1"
         );
 
         // GET / → v2
         assert_eq!(
-            match_service(hr, "/", &http::Method::GET, &empty_headers),
+            match_service(hr, "/", "GET", &empty_headers),
             Some("v2".to_string()),
             "GET should match v2"
         );
 
         // HEAD / → no match
         assert_eq!(
-            match_service(hr, "/", &http::Method::HEAD, &empty_headers),
+            match_service(hr, "/", "HEAD", &empty_headers),
             None,
             "HEAD should not match any route"
         );
 
         // PUT / → no match
         assert_eq!(
-            match_service(hr, "/", &http::Method::PUT, &empty_headers),
+            match_service(hr, "/", "PUT", &empty_headers),
             None,
             "PUT should not match any route"
         );
@@ -3254,7 +3254,7 @@ mod tests {
         ];
 
         let (route_map, wildcard, domain_wildcards) = build_routes(routes);
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // No wildcard routes
@@ -3272,7 +3272,7 @@ mod tests {
                 .get("foo.wildcard.io")
                 .expect("should have foo.wildcard.io routes");
             assert_eq!(
-                match_service(hr, "/s2", &get, &empty_headers),
+                match_service(hr, "/s2", get, &empty_headers),
                 Some("v2".to_string()),
                 "foo.wildcard.io /s2 should match v2"
             );
@@ -3284,7 +3284,7 @@ mod tests {
                 .get("very.specific.com")
                 .expect("should have very.specific.com routes");
             assert_eq!(
-                match_service(hr, "/s1", &get, &empty_headers),
+                match_service(hr, "/s1", get, &empty_headers),
                 Some("v1".to_string()),
                 "very.specific.com /s1 should match v1"
             );
@@ -3335,7 +3335,7 @@ mod tests {
         ];
 
         let (route_map, wildcard, domain_wildcards) = build_routes(routes);
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // No wildcard (*) routes
@@ -3356,7 +3356,7 @@ mod tests {
                 .get(suffix)
                 .expect("domain wildcard .wildcard.io should exist");
             assert_eq!(
-                match_service(hr, "/s2", &get, &empty_headers),
+                match_service(hr, "/s2", get, &empty_headers),
                 Some("v2".to_string()),
                 "foo.wildcard.io /s2 should match v2 via domain wildcard"
             );
@@ -3368,7 +3368,7 @@ mod tests {
             let suffix = &host[host.find('.').unwrap()..];
             let hr = domain_wildcards.get(suffix).expect("should exist");
             assert_eq!(
-                match_service(hr, "/s2", &get, &empty_headers),
+                match_service(hr, "/s2", get, &empty_headers),
                 Some("v2".to_string()),
                 "bar.wildcard.io /s2 should also match v2 via domain wildcard"
             );
@@ -3380,7 +3380,7 @@ mod tests {
                 .get("very.specific.com")
                 .expect("should have very.specific.com");
             assert_eq!(
-                match_service(hr, "/s1", &get, &empty_headers),
+                match_service(hr, "/s1", get, &empty_headers),
                 Some("v1".to_string()),
             );
         }
@@ -3434,19 +3434,19 @@ mod tests {
 
         let (_rm, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().unwrap();
-        let get = http::Method::GET;
+        let get = "GET";
         let empty = http::HeaderMap::new();
 
         // /foo exactly → exact-svc (exact beats prefix)
         assert_eq!(
-            match_service(hr, "/foo", &get, &empty),
+            match_service(hr, "/foo", get, &empty),
             Some("exact-svc".to_string()),
             "exact match should take priority over prefix match"
         );
 
         // /foo/bar → prefix-svc (exact doesn't match sub-paths)
         assert_eq!(
-            match_service(hr, "/foo/bar", &get, &empty),
+            match_service(hr, "/foo/bar", get, &empty),
             Some("prefix-svc".to_string()),
             "/foo/bar should fall through to prefix match"
         );
@@ -3480,25 +3480,25 @@ mod tests {
 
         let (_rm, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().unwrap();
-        let get = http::Method::GET;
+        let get = "GET";
         let empty = http::HeaderMap::new();
 
         // /foo/bar → long-svc (longer prefix wins)
         assert_eq!(
-            match_service(hr, "/foo/bar", &get, &empty),
+            match_service(hr, "/foo/bar", get, &empty),
             Some("long-svc".to_string()),
             "longer prefix should take priority"
         );
 
         // /foo/bar/baz → long-svc (longer prefix still wins)
         assert_eq!(
-            match_service(hr, "/foo/bar/baz", &get, &empty),
+            match_service(hr, "/foo/bar/baz", get, &empty),
             Some("long-svc".to_string()),
         );
 
         // /foo/other → short-svc (only shorter prefix matches)
         assert_eq!(
-            match_service(hr, "/foo/other", &get, &empty),
+            match_service(hr, "/foo/other", get, &empty),
             Some("short-svc".to_string()),
         );
     }
@@ -3549,26 +3549,26 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("x-version", "v2".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/api", &http::Method::POST, &headers),
+                match_service(hr, "/api", "POST", &headers),
                 Some("special-svc".to_string()),
             );
         }
 
         // GET /api → general-svc (method doesn't match special)
         assert_eq!(
-            match_service(hr, "/api", &http::Method::GET, &empty),
+            match_service(hr, "/api", "GET", &empty),
             Some("general-svc".to_string()),
         );
 
         // POST /api (no header) → general-svc (header doesn't match special)
         assert_eq!(
-            match_service(hr, "/api", &http::Method::POST, &empty),
+            match_service(hr, "/api", "POST", &empty),
             Some("general-svc".to_string()),
         );
 
         // GET /other → no match
         assert_eq!(
-            match_service(hr, "/other", &http::Method::GET, &empty),
+            match_service(hr, "/other", "GET", &empty),
             None,
         );
     }
@@ -3663,7 +3663,7 @@ mod tests {
                 }
             };
             resolved.and_then(|hr: &HostRoutes| {
-                hr.match_request(path, &http::Method::GET, &empty_headers, None)
+                hr.match_request(path, "GET", &empty_headers, None)
                     .map(|r| r.service_name.to_string())
             })
         };
@@ -3831,7 +3831,7 @@ mod tests {
                 }
             };
             resolved.and_then(|hr: &HostRoutes| {
-                hr.match_request(path, &http::Method::GET, &empty_headers, None)
+                hr.match_request(path, "GET", &empty_headers, None)
                     .map(|r| r.service_name.to_string())
             })
         };
@@ -3943,25 +3943,25 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // Go test: GET / -> 200, backend=infra-backend-v1
         assert_eq!(
-            match_service(hr, "/", &get, &empty_headers),
+            match_service(hr, "/", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "GET / should reach infra-backend-v1"
         );
 
         // Additional: any path should match since it's Prefix /
         assert_eq!(
-            match_service(hr, "/anything", &get, &empty_headers),
+            match_service(hr, "/anything", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "GET /anything should also reach infra-backend-v1 (Prefix /)"
         );
 
         assert_eq!(
-            match_service(hr, "/deep/nested/path", &get, &empty_headers),
+            match_service(hr, "/deep/nested/path", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "GET /deep/nested/path should also reach infra-backend-v1"
         );
@@ -4050,19 +4050,19 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // Go testCase 0: GET / -> v1
         assert_eq!(
-            match_service(hr, "/", &get, &empty_headers),
+            match_service(hr, "/", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "GET / should match infra-backend-v1 (catch-all Prefix /)"
         );
 
         // Go testCase 1: GET /example -> v1
         assert_eq!(
-            match_service(hr, "/example", &get, &empty_headers),
+            match_service(hr, "/example", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "GET /example should match infra-backend-v1 (catch-all Prefix /)"
         );
@@ -4072,7 +4072,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("version", "one".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("infra-backend-v1".to_string()),
                 "GET / [version=one] should match infra-backend-v1"
             );
@@ -4080,14 +4080,14 @@ mod tests {
 
         // Go testCase 3: GET /v2 -> v2
         assert_eq!(
-            match_service(hr, "/v2", &get, &empty_headers),
+            match_service(hr, "/v2", get, &empty_headers),
             Some("infra-backend-v2".to_string()),
             "GET /v2 should match infra-backend-v2 (PathPrefix /v2)"
         );
 
         // Go testCase 4: GET /v2/example -> v2
         assert_eq!(
-            match_service(hr, "/v2/example", &get, &empty_headers),
+            match_service(hr, "/v2/example", get, &empty_headers),
             Some("infra-backend-v2".to_string()),
             "GET /v2/example should match infra-backend-v2 (PathPrefix /v2)"
         );
@@ -4097,7 +4097,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("version", "two".parse().unwrap());
             assert_eq!(
-                match_service(hr, "/", &get, &headers),
+                match_service(hr, "/", get, &headers),
                 Some("infra-backend-v2".to_string()),
                 "GET / [version=two] should match infra-backend-v2 (header match)"
             );
@@ -4105,21 +4105,21 @@ mod tests {
 
         // Go testCase 6: GET /v2/ -> v2
         assert_eq!(
-            match_service(hr, "/v2/", &get, &empty_headers),
+            match_service(hr, "/v2/", get, &empty_headers),
             Some("infra-backend-v2".to_string()),
             "GET /v2/ should match infra-backend-v2 (PathPrefix /v2)"
         );
 
         // Go testCase 7: GET /v2example -> v1 (not a path segment boundary)
         assert_eq!(
-            match_service(hr, "/v2example", &get, &empty_headers),
+            match_service(hr, "/v2example", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "GET /v2example should NOT match /v2 (not segment boundary), falls to v1"
         );
 
         // Go testCase 8: GET /foo/v2/example -> v1
         assert_eq!(
-            match_service(hr, "/foo/v2/example", &get, &empty_headers),
+            match_service(hr, "/foo/v2/example", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "GET /foo/v2/example should match v1 (prefix / catch-all, /v2 only at start)"
         );
@@ -4234,7 +4234,7 @@ mod tests {
         ];
 
         let (route_map, _wildcard, _dw) = build_routes(routes);
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // -- example.com tests --
@@ -4244,14 +4244,14 @@ mod tests {
 
         // Go testCase 0: Host=example.com, GET / -> v1
         assert_eq!(
-            match_service(hr_com, "/", &get, &empty_headers),
+            match_service(hr_com, "/", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "example.com GET / should match v1"
         );
 
         // Go testCase 1: Host=example.com, GET /example -> v1
         assert_eq!(
-            match_service(hr_com, "/example", &get, &empty_headers),
+            match_service(hr_com, "/example", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "example.com GET /example should match v1"
         );
@@ -4261,7 +4261,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("version", "one".parse().unwrap());
             assert_eq!(
-                match_service(hr_com, "/example", &get, &headers),
+                match_service(hr_com, "/example", get, &headers),
                 Some("infra-backend-v1".to_string()),
                 "example.com GET /example [version=one] should match v1"
             );
@@ -4269,14 +4269,14 @@ mod tests {
 
         // Go testCase 4: Host=example.com, GET /v2 -> v2
         assert_eq!(
-            match_service(hr_com, "/v2", &get, &empty_headers),
+            match_service(hr_com, "/v2", get, &empty_headers),
             Some("infra-backend-v2".to_string()),
             "example.com GET /v2 should match v2"
         );
 
         // Go testCase 6: Host=example.com, GET /v2/example -> v2
         assert_eq!(
-            match_service(hr_com, "/v2/example", &get, &empty_headers),
+            match_service(hr_com, "/v2/example", get, &empty_headers),
             Some("infra-backend-v2".to_string()),
             "example.com GET /v2/example should match v2"
         );
@@ -4286,7 +4286,7 @@ mod tests {
             let mut headers = http::HeaderMap::new();
             headers.insert("version", "two".parse().unwrap());
             assert_eq!(
-                match_service(hr_com, "/", &get, &headers),
+                match_service(hr_com, "/", get, &headers),
                 Some("infra-backend-v2".to_string()),
                 "example.com GET / [version=two] should match v2 (header match)"
             );
@@ -4299,7 +4299,7 @@ mod tests {
 
         // Go testCase 2: Host=example.net, GET /example -> v1
         assert_eq!(
-            match_service(hr_net, "/example", &get, &empty_headers),
+            match_service(hr_net, "/example", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "example.net GET /example should match v1"
         );
@@ -4307,7 +4307,7 @@ mod tests {
         // Go testCase 5: Host=example.net, GET /v2 -> v1
         // v2 routes only exist on example.com, so example.net falls to v1
         assert_eq!(
-            match_service(hr_net, "/v2", &get, &empty_headers),
+            match_service(hr_net, "/v2", get, &empty_headers),
             Some("infra-backend-v1".to_string()),
             "example.net GET /v2 should match v1 (no v2 route on example.net)"
         );
@@ -4359,11 +4359,11 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // Go test: GET / -> 200 (any backend)
-        let matched = hr.match_request("/", &get, &empty_headers, None);
+        let matched = hr.match_request("/", get, &empty_headers, None);
         assert!(matched.is_some(), "GET / should match the weighted route");
 
         let route = matched.unwrap();
@@ -4441,47 +4441,47 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // Go test iterates over service types, each expecting 200 at its path.
 
         // /manual-endpointslices -> manual-endpointslices
         assert_eq!(
-            match_service(hr, "/manual-endpointslices", &get, &empty_headers),
+            match_service(hr, "/manual-endpointslices", get, &empty_headers),
             Some("manual-endpointslices".to_string()),
             "GET /manual-endpointslices should match manual-endpointslices service"
         );
 
         // /headless -> headless
         assert_eq!(
-            match_service(hr, "/headless", &get, &empty_headers),
+            match_service(hr, "/headless", get, &empty_headers),
             Some("headless".to_string()),
             "GET /headless should match headless service"
         );
 
         // /headless-manual-endpointslices -> headless-manual-endpointslices
         assert_eq!(
-            match_service(hr, "/headless-manual-endpointslices", &get, &empty_headers),
+            match_service(hr, "/headless-manual-endpointslices", get, &empty_headers),
             Some("headless-manual-endpointslices".to_string()),
             "GET /headless-manual-endpointslices should match headless-manual-endpointslices"
         );
 
         // Exact match means sub-paths and other paths should NOT match
         assert_eq!(
-            match_service(hr, "/manual-endpointslices/sub", &get, &empty_headers),
+            match_service(hr, "/manual-endpointslices/sub", get, &empty_headers),
             None,
             "sub-path of exact match should not match"
         );
 
         assert_eq!(
-            match_service(hr, "/other", &get, &empty_headers),
+            match_service(hr, "/other", get, &empty_headers),
             None,
             "unrelated path should not match any exact route"
         );
 
         assert_eq!(
-            match_service(hr, "/", &get, &empty_headers),
+            match_service(hr, "/", get, &empty_headers),
             None,
             "root path should not match any exact route"
         );
@@ -4516,19 +4516,19 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // Go test: GET / -> 200, backend=web-backend
         assert_eq!(
-            match_service(hr, "/", &get, &empty_headers),
+            match_service(hr, "/", get, &empty_headers),
             Some("web-backend".to_string()),
             "GET / should reach web-backend (cross-namespace route)"
         );
 
         // Any path should match the catch-all
         assert_eq!(
-            match_service(hr, "/anything", &get, &empty_headers),
+            match_service(hr, "/anything", get, &empty_headers),
             Some("web-backend".to_string()),
             "GET /anything should also reach web-backend"
         );
@@ -4610,68 +4610,68 @@ mod tests {
 
         let (route_map, _, _) = build_routes(routes);
         let hr = route_map.get("example.com").unwrap();
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // /?animal=whale -> v1
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &empty_headers, Some("animal=whale")),
+            match_service_with_query(hr, "/", get, &empty_headers, Some("animal=whale")),
             Some("infra-backend-v1".to_string()),
             "animal=whale should match v1"
         );
 
         // /?animal=dolphin -> v2
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &empty_headers, Some("animal=dolphin")),
+            match_service_with_query(hr, "/", get, &empty_headers, Some("animal=dolphin")),
             Some("infra-backend-v2".to_string()),
             "animal=dolphin should match v2"
         );
 
         // /?animal=dolphin&color=blue -> v3 (more specific: 2 query params)
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &empty_headers, Some("animal=dolphin&color=blue")),
+            match_service_with_query(hr, "/", get, &empty_headers, Some("animal=dolphin&color=blue")),
             Some("infra-backend-v3".to_string()),
             "animal=dolphin&color=blue should match v3 (2 query params more specific)"
         );
 
         // /?ANIMAL=Whale -> v3 (case-sensitive query param name)
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &empty_headers, Some("ANIMAL=Whale")),
+            match_service_with_query(hr, "/", get, &empty_headers, Some("ANIMAL=Whale")),
             Some("infra-backend-v3".to_string()),
             "ANIMAL=Whale should match v3"
         );
 
         // /?animal=whale&otherparam=irrelevant -> v1 (extra params don't matter)
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &empty_headers, Some("animal=whale&otherparam=irrelevant")),
+            match_service_with_query(hr, "/", get, &empty_headers, Some("animal=whale&otherparam=irrelevant")),
             Some("infra-backend-v1".to_string()),
             "animal=whale with extra params should still match v1"
         );
 
         // /?animal=dolphin&color=yellow -> v2 (color=yellow doesn't match v3's color=blue)
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &empty_headers, Some("animal=dolphin&color=yellow")),
+            match_service_with_query(hr, "/", get, &empty_headers, Some("animal=dolphin&color=yellow")),
             Some("infra-backend-v2".to_string()),
             "animal=dolphin&color=yellow should match v2 (not v3)"
         );
 
         // /?color=blue -> no match (no animal param)
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &empty_headers, Some("color=blue")),
+            match_service_with_query(hr, "/", get, &empty_headers, Some("color=blue")),
             None,
             "color=blue without animal should not match"
         );
 
         // /?animal=dog -> no match
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &empty_headers, Some("animal=dog")),
+            match_service_with_query(hr, "/", get, &empty_headers, Some("animal=dog")),
             None,
             "animal=dog should not match any rule"
         );
 
         // / (no query) -> no match
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &empty_headers, None),
+            match_service_with_query(hr, "/", get, &empty_headers, None),
             None,
             "no query params should not match"
         );
@@ -4741,12 +4741,12 @@ mod tests {
 
         let (route_map, _, _) = build_routes(routes);
         let hr = route_map.get("example.com").unwrap();
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // /path1?animal=whale -> v1
         assert_eq!(
-            match_service_with_query(hr, "/path1", &get, &empty_headers, Some("animal=whale")),
+            match_service_with_query(hr, "/path1", get, &empty_headers, Some("animal=whale")),
             Some("infra-backend-v1".to_string()),
             "/path1?animal=whale should match v1"
         );
@@ -4755,7 +4755,7 @@ mod tests {
         let mut headers_v1 = http::HeaderMap::new();
         headers_v1.insert("version", "one".parse().unwrap());
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &headers_v1, Some("animal=whale")),
+            match_service_with_query(hr, "/", get, &headers_v1, Some("animal=whale")),
             Some("infra-backend-v2".to_string()),
             "/?animal=whale with version=one should match v2"
         );
@@ -4764,7 +4764,7 @@ mod tests {
         let mut headers_v2 = http::HeaderMap::new();
         headers_v2.insert("version", "two".parse().unwrap());
         assert_eq!(
-            match_service_with_query(hr, "/path2", &get, &headers_v2, Some("animal=whale")),
+            match_service_with_query(hr, "/path2", get, &headers_v2, Some("animal=whale")),
             Some("infra-backend-v3".to_string()),
             "/path2?animal=whale with version=two should match v3"
         );
@@ -4824,12 +4824,12 @@ mod tests {
 
         let (route_map, _, _) = build_routes(routes);
         let hr = route_map.get("example.com").unwrap();
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // /path5?animal=hydra -> v1 (longer path wins)
         assert_eq!(
-            match_service_with_query(hr, "/path5", &get, &empty_headers, Some("animal=hydra")),
+            match_service_with_query(hr, "/path5", get, &empty_headers, Some("animal=hydra")),
             Some("infra-backend-v1".to_string()),
             "/path5?animal=hydra should match v1 (path /path5 > /)"
         );
@@ -4838,7 +4838,7 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("version", "four".parse().unwrap());
         assert_eq!(
-            match_service_with_query(hr, "/", &get, &headers, Some("animal=hydra")),
+            match_service_with_query(hr, "/", get, &headers, Some("animal=hydra")),
             Some("infra-backend-v3".to_string()),
             "version=four + animal=hydra should match v3 (header > query param precedence)"
         );
@@ -4918,11 +4918,11 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // /request-timeout should route to infra-backend-v1 with request_timeout set
-        let matched = hr.match_request("/request-timeout", &get, &empty_headers, None).unwrap();
+        let matched = hr.match_request("/request-timeout", get, &empty_headers, None).unwrap();
         assert_eq!(matched.service_name.as_ref(), "infra-backend-v1");
         assert_eq!(
             matched.request_timeout,
@@ -4931,7 +4931,7 @@ mod tests {
         );
 
         // /disable-request-timeout should have no timeout (0 = disabled)
-        let disabled = hr.match_request("/disable-request-timeout", &get, &empty_headers, None).unwrap();
+        let disabled = hr.match_request("/disable-request-timeout", get, &empty_headers, None).unwrap();
         assert_eq!(disabled.service_name.as_ref(), "infra-backend-v1");
         assert!(
             disabled.request_timeout.is_none(),
@@ -4982,11 +4982,11 @@ mod tests {
 
         let (_route_map, wildcard, _dw) = build_routes(routes);
         let hr = wildcard.as_ref().expect("wildcard routes should exist");
-        let get = http::Method::GET;
+        let get = "GET";
         let empty_headers = http::HeaderMap::new();
 
         // /backend-timeout should route to infra-backend-v1 with backend_request_timeout set
-        let matched = hr.match_request("/backend-timeout", &get, &empty_headers, None).unwrap();
+        let matched = hr.match_request("/backend-timeout", get, &empty_headers, None).unwrap();
         assert_eq!(matched.service_name.as_ref(), "infra-backend-v1");
         assert_eq!(
             matched.backend_request_timeout,
@@ -4995,7 +4995,7 @@ mod tests {
         );
 
         // /disable-backend-timeout should have no timeout (0 = disabled)
-        let disabled = hr.match_request("/disable-backend-timeout", &get, &empty_headers, None).unwrap();
+        let disabled = hr.match_request("/disable-backend-timeout", get, &empty_headers, None).unwrap();
         assert_eq!(disabled.service_name.as_ref(), "infra-backend-v1");
         assert!(
             disabled.backend_request_timeout.is_none(),
@@ -5400,33 +5400,33 @@ mod tests {
         // version=one → v1
         let mut headers = http::HeaderMap::new();
         headers.insert("version", http::HeaderValue::from_static("one"));
-        let m = wc.match_request("/svc/Method", &http::Method::POST, &headers, None);
+        let m = wc.match_request("/svc/Method", "POST", &headers, None);
         assert!(m.is_some(), "version=one should match");
         assert_eq!(m.unwrap().service_name.as_ref(), "grpc-infra-backend-v1");
 
         // version=two → v2
         let mut headers = http::HeaderMap::new();
         headers.insert("version", http::HeaderValue::from_static("two"));
-        let m = wc.match_request("/svc/Method", &http::Method::POST, &headers, None);
+        let m = wc.match_request("/svc/Method", "POST", &headers, None);
         assert!(m.is_some(), "version=two should match");
         assert_eq!(m.unwrap().service_name.as_ref(), "grpc-infra-backend-v2");
 
         // color=red → v2
         let mut headers = http::HeaderMap::new();
         headers.insert("color", http::HeaderValue::from_static("red"));
-        let m = wc.match_request("/svc/Method", &http::Method::POST, &headers, None);
+        let m = wc.match_request("/svc/Method", "POST", &headers, None);
         assert!(m.is_some(), "color=red should match");
         assert_eq!(m.unwrap().service_name.as_ref(), "grpc-infra-backend-v2");
 
         // color=purple → NO MATCH (negative case)
         let mut headers = http::HeaderMap::new();
         headers.insert("color", http::HeaderValue::from_static("purple"));
-        let m = wc.match_request("/svc/Method", &http::Method::POST, &headers, None);
+        let m = wc.match_request("/svc/Method", "POST", &headers, None);
         assert!(m.is_none(), "color=purple should NOT match, got: {:?}", m.map(|r| r.service_name.as_ref().to_string()));
 
         // no headers → NO MATCH
         let headers = http::HeaderMap::new();
-        let m = wc.match_request("/svc/Method", &http::Method::POST, &headers, None);
+        let m = wc.match_request("/svc/Method", "POST", &headers, None);
         assert!(m.is_none(), "no headers should NOT match, got: {:?}", m.map(|r| r.service_name.as_ref().to_string()));
     }
 
