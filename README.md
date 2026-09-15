@@ -177,17 +177,17 @@ Everything the data plane decides — routing, policies, TLS material, endpoint 
 
 Rama is there to be compared with Pingora on the same core, benchmarks and conformance suite; a value the image was not built with fails the pod at start with a log line naming it.
 
-Preliminary Rama numbers: medians of two rounds on the same 10 vCPU machine as the tables above, each round interleaved with a Pingora round (3 pods each, fortio, 10 s per rung, all requests 200). The box was not quiet for the whole second round, so treat differences under 10 % as noise.
+Preliminary Rama numbers: medians of three rounds on the same 10 vCPU machine as the tables above, each round interleaved with a Pingora round (3 pods each, fortio, 10 s per rung, all requests 200). One of the three rounds ran with other load on the box, so treat differences under 5 % as noise.
 
 | | 64 / 1 KB | 128 / 16 KB | 256 / 128 KB | 1 MiB |
 |---|---|---|---|---|
-| Traffic (bare `GET /`, by connections) | 134,257 | 148,565 | 147,858 | – |
-| Download (by response size) | 91,000 | 74,174 | 40,925 | 7,540 |
-| Upload (POST, echoed) | 81,593 | 37,317 | 10,032 | 5,508 |
-| HTTPS download | 84,723 | 66,064 | 30,026 | 5,623 |
-| HTTP/2 download | 67,038 | 53,590 | 24,754 | 4,618 |
+| Traffic (bare `GET /`, by connections) | 136,520 | 150,300 | 149,126 | – |
+| Download (by response size) | 90,970 | 74,227 | 40,755 | 7,391 |
+| Upload (POST, echoed) | 82,337 | 37,396 | 9,982 | 5,504 |
+| HTTPS download | 84,565 | 65,630 | 29,767 | 5,531 |
+| HTTP/2 download | 65,951 | 52,724 | 24,198 | 4,414 |
 
-Against Pingora in the same rounds: level on bare traffic and HTTP/2, 7 to 18 % ahead on the download, upload and HTTPS body rungs. CPU was level on every ladder (within ±10 %); memory means were similar, with Rama's peaks higher on upload and HTTPS (450 to 530 Mi against 320 to 360 Mi) and lower on HTTP/2.
+Against Pingora in the same rounds: level on bare traffic (−1 to +2 %), 3 to 7 % ahead on download, upload and HTTP/2 body rungs (14 % on 16 KB uploads, 17 % on 1 MiB HTTPS), 2 to 3 % behind on 1 KB HTTPS and HTTP/2. Resources over the same rounds, three pods: CPU level on the body ladders (Rama lower on upload and HTTPS, higher on download by 1 %), but 1.0 cores against Pingora's 0.75 on bare traffic; memory peaks higher on every body ladder (download 220 vs 117 Mi, upload 518 vs 323, HTTPS 452 vs 280, HTTP/2 603 vs 464) and lower on bare traffic.
 
 ## Configuration
 
