@@ -641,10 +641,17 @@ pub fn build_listener_buckets_from_proto(
             exact_map.entry(Arc::clone(&rule.path)).or_default().push(rule);
         }
 
+        let needs_body = exact_map
+            .values()
+            .flatten()
+            .chain(prefix_rules.iter())
+            .chain(catch_all.iter())
+            .any(|r| crate::router::needs_body_fields(&r.header_matches));
         let host_routes = HostRoutes {
             exact_map,
             rules: prefix_rules,
             catch_all,
+            needs_body,
         };
 
         // Place this HostRoutes into the right bucket slot based on the

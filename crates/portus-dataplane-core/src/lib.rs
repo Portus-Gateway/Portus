@@ -12,6 +12,7 @@
 //! drives one request through [`router`]'s decisions and talks to the backend
 //! the [`pool::Pool`] picked. Nothing in this crate names a proxy framework.
 
+pub mod ai;
 pub mod auth;
 pub mod bootstrap;
 pub mod circuit_breaker;

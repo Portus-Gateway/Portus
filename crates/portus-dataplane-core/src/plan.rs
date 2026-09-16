@@ -24,8 +24,8 @@ use crate::router::{
     cors_allow_origin_value, cors_headers_value, cors_methods_value, cors_origin_matches,
     detect_misdirected_request, extract_client_ip, header_str, listener_scheme_and_port,
     lookup_domain_wildcard_bucket, select_listener_bucket, select_weighted_backend,
-    spawn_mirror_request, BackendTlsInfo, ClientIdentity, CorsConfig, ListenerBucket, PathRoute,
-    ProxySnapshot, RequestHeaders, DEFAULT_MAX_REQUEST_BODY_BYTES,
+    spawn_mirror_request, BackendTlsInfo, BodyFields, ClientIdentity, CorsConfig, ListenerBucket,
+    PathRoute, ProxySnapshot, RequestHeaders, DEFAULT_MAX_REQUEST_BODY_BYTES,
 };
 use crate::types::{AuthConfig, BackendProtocol};
 
@@ -48,6 +48,31 @@ pub struct RequestFacts<'a, H: RequestHeaders + ?Sized> {
     pub sni: Option<&'a str>,
     /// Peer address of the connection.
     pub peer_ip: Option<IpAddr>,
+    /// Fields the body scanner extracted, on the second pass after a
+    /// [`Plan::NeedsBody`]. `None` on the first pass.
+    pub body_fields: Option<&'a BodyFields>,
+}
+
+/// The routes for this host match on request body fields: scan the body for
+/// `keys` (holding at most `max_bytes`), then plan again with
+/// [`RequestFacts::body_fields`] set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyNeed {
+    pub keys: &'static [&'static str],
+    pub max_bytes: usize,
+}
+
+/// Top-level JSON keys an AI route can match on.
+pub const AI_BODY_KEYS: &[&str] = &["model", "stream"];
+/// Bytes of a request body held while scanning for [`AI_BODY_KEYS`]; larger
+/// bodies are refused with 413. Anthropic and OpenAI SDKs put `model` after
+/// `messages`, so a 200k-token prompt puts it ~800 KB in.
+pub const AI_BODY_SCAN_LIMIT: usize = 8 * 1024 * 1024;
+
+/// Whether the request carries a body worth scanning.
+fn has_request_body(headers: &(impl RequestHeaders + ?Sized)) -> bool {
+    headers.contains("transfer-encoding")
+        || header_str(headers, "content-length").is_some_and(|cl| cl.trim() != "0")
 }
 
 /// A response the data plane sends itself instead of proxying.
@@ -70,7 +95,7 @@ impl Reply {
         }
     }
 
-    fn text(status: u16, body: &'static str) -> Self {
+    pub fn text(status: u16, body: &'static str) -> Self {
         Self {
             status,
             headers: vec![(http::header::CONTENT_LENGTH, HeaderValue::from(body.len()))],
@@ -210,6 +235,7 @@ pub fn protocol_label(protocol: BackendProtocol) -> &'static str {
 pub enum Plan {
     Respond(Reply),
     Forward(Box<Forward>),
+    NeedsBody(BodyNeed),
 }
 
 /// Decide what to do with one request.
@@ -255,7 +281,14 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
             .or_else(|| lookup_domain_wildcard_bucket(host, &b.domain_wildcards))
             .or(b.catch_all.as_ref())
     });
-    let Some(pr) = host_routes.and_then(|hr| hr.match_request(facts.path, facts.method, facts.headers, facts.query))
+    if facts.body_fields.is_none()
+        && host_routes.is_some_and(|hr| hr.needs_body)
+        && has_request_body(facts.headers)
+    {
+        return Plan::NeedsBody(BodyNeed { keys: AI_BODY_KEYS, max_bytes: AI_BODY_SCAN_LIMIT });
+    }
+    let Some(pr) = host_routes
+        .and_then(|hr| hr.match_request_with_body(facts.path, facts.method, facts.headers, facts.query, facts.body_fields))
     else {
         let mut reply = Reply::text(404, "no route");
         reply.keepalive = false;
@@ -633,6 +666,108 @@ pub fn should_retry_connect(retry_on: &[String], retries_left: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::{HeaderMatchEntry, HeaderMatchType, HostRoutes};
+    use crate::types::PathMatchType;
+    use hashbrown::HashMap;
+
+    fn messages_route(service: &str, model: Option<&str>) -> PathRoute {
+        let mut route = crate::router::test_support::path_route("/v1/messages", PathMatchType::Exact);
+        route.service_name = Arc::from(service);
+        if let Some(model) = model {
+            route.header_matches = vec![HeaderMatchEntry {
+                name: HeaderName::from_static("portus-body-model"),
+                value: model.to_string(),
+                match_type: HeaderMatchType::Exact,
+            }];
+        }
+        route
+    }
+
+    fn snapshot_with(routes: Vec<PathRoute>) -> ProxySnapshot {
+        let needs_body = crate::router::needs_body_fields(
+            &routes.iter().flat_map(|r| r.header_matches.iter().cloned()).collect::<Vec<_>>(),
+        );
+        let mut exact_map = HashMap::new();
+        exact_map.insert(Arc::from("/v1/messages"), routes);
+        let host_routes = HostRoutes { exact_map, rules: Vec::new(), catch_all: None, needs_body };
+        let bucket = ListenerBucket {
+            listener_hostname: Arc::from(""),
+            exact: HashMap::from([("llm.example.com".to_string(), host_routes)]),
+            domain_wildcards: HashMap::new(),
+            catch_all: None,
+        };
+        let mut snap = ProxySnapshot::default();
+        snap.listeners_by_port.insert(80, vec![bucket]);
+        snap
+    }
+
+    fn metrics() -> &'static ProxyMetrics {
+        crate::metrics::shared_metrics()
+    }
+
+    fn facts<'a>(headers: &'a HeaderMap, body_fields: Option<&'a BodyFields>) -> RequestFacts<'a, HeaderMap> {
+        RequestFacts {
+            host: "llm.example.com",
+            path: "/v1/messages",
+            path_and_query: "/v1/messages",
+            query: None,
+            method: "POST",
+            headers,
+            local_port: 80,
+            socket_is_tls: false,
+            sni: None,
+            peer_ip: None,
+            body_fields,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_body_route_asks_for_the_body_once_then_routes_on_its_fields() {
+        let snap = snapshot_with(vec![messages_route("opus", Some("claude-opus-5")), messages_route("fallback", None)]);
+        let metrics = metrics();
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", "512".parse().unwrap());
+
+        let first = plan_request(&snap, facts(&headers, None), metrics).await;
+        assert_eq!(
+            match first {
+                Plan::NeedsBody(need) => Some(need),
+                _ => None,
+            },
+            Some(BodyNeed { keys: AI_BODY_KEYS, max_bytes: AI_BODY_SCAN_LIMIT })
+        );
+
+        let fields: BodyFields = vec![("model", "claude-opus-5".to_string())];
+        match plan_request(&snap, facts(&headers, Some(&fields)), metrics).await {
+            Plan::Forward(f) => assert_eq!(f.service_name.as_ref(), "opus"),
+            _ => panic!("expected a forward"),
+        }
+
+        let other: BodyFields = vec![("model", "gpt-5".to_string())];
+        match plan_request(&snap, facts(&headers, Some(&other)), metrics).await {
+            Plan::Forward(f) => assert_eq!(f.service_name.as_ref(), "fallback"),
+            _ => panic!("expected the fallback route"),
+        }
+    }
+
+    #[tokio::test]
+    async fn requests_without_a_body_skip_the_scan_and_the_body_routes() {
+        let snap = snapshot_with(vec![messages_route("opus", Some("claude-opus-5")), messages_route("fallback", None)]);
+        let metrics = metrics();
+        let headers = HeaderMap::new();
+        match plan_request(&snap, facts(&headers, None), metrics).await {
+            Plan::Forward(f) => assert_eq!(f.service_name.as_ref(), "fallback"),
+            _ => panic!("expected the fallback route"),
+        }
+        // Hosts without body routes never ask, body or not.
+        let plain = snapshot_with(vec![messages_route("only", None)]);
+        let mut headers = HeaderMap::new();
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+        match plan_request(&plain, facts(&headers, None), metrics).await {
+            Plan::Forward(f) => assert_eq!(f.service_name.as_ref(), "only"),
+            _ => panic!("expected a forward"),
+        }
+    }
 
     #[test]
     fn header_add_appends_with_a_comma_and_set_overwrites() {

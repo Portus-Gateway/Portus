@@ -100,15 +100,17 @@ impl ProxyMetrics {
         }
     }
 }
+/// The one `ProxyMetrics` a test binary may register: Prometheus refuses a
+/// second registration of the same names in one process.
+#[cfg(test)]
+pub(crate) fn shared_metrics() -> &'static ProxyMetrics {
+    static METRICS: std::sync::OnceLock<ProxyMetrics> = std::sync::OnceLock::new();
+    METRICS.get_or_init(ProxyMetrics::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
-
-    fn shared_metrics() -> &'static ProxyMetrics {
-        static METRICS: OnceLock<ProxyMetrics> = OnceLock::new();
-        METRICS.get_or_init(ProxyMetrics::new)
-    }
 
     #[test]
     fn test_metrics_registration() {

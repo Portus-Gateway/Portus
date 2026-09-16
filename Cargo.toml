@@ -53,6 +53,7 @@ prost = "0.14"
 prost-types = "0.14"
 tokio-stream = { version = "0.1", features = ["sync"] }
 dashmap = "6.1"
+memchr = "2"
 regex = "1"
 hashbrown = "0.17"
 arcstr = "1"

@@ -30,6 +30,7 @@ notify = { workspace = true }
 regex = { workspace = true }
 hashbrown = { workspace = true }
 dashmap = "6"
+memchr = { workspace = true }
 bcrypt = "0.19"
 subtle = "2"
 ipnet = "2"

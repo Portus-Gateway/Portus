@@ -307,6 +307,30 @@ pub struct HostRoutes {
     pub rules: Vec<PathRoute>,
     /// Catch-all when no paths are specified.
     pub catch_all: Option<PathRoute>,
+    /// At least one route matches on a request body field
+    /// ([`BODY_FIELD_HEADER_PREFIX`]), so a request with a body must be
+    /// scanned before it can be matched.
+    pub needs_body: bool,
+}
+
+/// Header-match names with this prefix are matched against fields the body
+/// scanner extracted (`portus-body-model` ↔ the top-level `model` key), never
+/// against request headers, so a client cannot forge them.
+pub const BODY_FIELD_HEADER_PREFIX: &str = "portus-body-";
+
+/// Body fields the scanner extracts, as (key, value) with the key as it
+/// appears in the JSON (`model`, `stream`). Booleans and numbers are their
+/// JSON text.
+pub type BodyFields = Vec<(&'static str, String)>;
+
+/// Whether any of `matches` needs the body scanned.
+pub fn needs_body_fields(matches: &[HeaderMatchEntry]) -> bool {
+    matches.iter().any(|hm| hm.name.as_str().starts_with(BODY_FIELD_HEADER_PREFIX))
+}
+
+fn body_field<'a>(body: Option<&'a BodyFields>, header_name: &str) -> Option<&'a str> {
+    let key = header_name.strip_prefix(BODY_FIELD_HEADER_PREFIX)?;
+    body?.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
 }
 
 /// Read access to a request's headers, whatever type the network stack uses
@@ -386,7 +410,8 @@ impl HostRoutes {
     }
 
     /// Multi-dimensional request matching: path + method + headers + query params.
-    /// Returns the first route where ALL dimensions match.
+    /// Returns the first route where ALL dimensions match. Routes that match
+    /// on body fields never match here; see [`Self::match_request_with_body`].
     pub fn match_request(
         &self,
         request_path: &str,
@@ -394,10 +419,23 @@ impl HostRoutes {
         headers: &(impl RequestHeaders + ?Sized),
         query: Option<&str>,
     ) -> Option<&PathRoute> {
+        self.match_request_with_body(request_path, method, headers, query, None)
+    }
+
+    /// [`Self::match_request`] with the fields the body scanner extracted;
+    /// `None` when the request has no body or it was not scanned.
+    pub fn match_request_with_body(
+        &self,
+        request_path: &str,
+        method: &str,
+        headers: &(impl RequestHeaders + ?Sized),
+        query: Option<&str>,
+        body: Option<&BodyFields>,
+    ) -> Option<&PathRoute> {
         // O(1) exact path lookup
         if let Some(exact_routes) = self.exact_map.get(request_path) {
             for rule in exact_routes {
-                if self.extra_dimensions_match(rule, method, headers, query) {
+                if self.extra_dimensions_match(rule, method, headers, query, body) {
                     return Some(rule);
                 }
             }
@@ -406,14 +444,14 @@ impl HostRoutes {
         // Prefix rules (sorted longest-first)
         for rule in &self.rules {
             if self.path_matches(rule, request_path)
-                && self.extra_dimensions_match(rule, method, headers, query)
+                && self.extra_dimensions_match(rule, method, headers, query, body)
             {
                 return Some(rule);
             }
         }
         // Check catch-all with extra dimensions too
         if let Some(ref ca) = self.catch_all
-            && self.extra_dimensions_match(ca, method, headers, query) {
+            && self.extra_dimensions_match(ca, method, headers, query, body) {
                 return Some(ca);
             }
         None
@@ -445,6 +483,7 @@ impl HostRoutes {
         method: &str,
         headers: &(impl RequestHeaders + ?Sized),
         query: Option<&str>,
+        body: Option<&BodyFields>,
     ) -> bool {
         // Method match: if rule specifies a method, it must match
         if let Some(ref required_method) = rule.method_match
@@ -452,9 +491,14 @@ impl HostRoutes {
                 return false;
             }
 
-        // Header matches: ALL must match (AND logic per Gateway API spec)
+        // Header matches: ALL must match (AND logic per Gateway API spec).
+        // Body-field matches read the scanner's fields, never the headers.
         for hm in &rule.header_matches {
-            let actual = headers.get(hm.name.as_str());
+            let actual = if hm.name.as_str().starts_with(BODY_FIELD_HEADER_PREFIX) {
+                body_field(body, hm.name.as_str()).map(str::as_bytes)
+            } else {
+                headers.get(hm.name.as_str())
+            };
             match actual {
                 Some(v) => {
                     let val_str = std::str::from_utf8(v).unwrap_or("");
@@ -1225,6 +1269,7 @@ pub fn build_route_map(
                 exact_map,
                 rules: prefix_rules,
                 catch_all,
+                needs_body: false,
             },
         );
     }
@@ -1233,6 +1278,57 @@ pub fn build_route_map(
     let wildcard = route_map.remove("*");
 
     (route_map, wildcard)
+}
+
+/// Route constructors for tests in this crate.
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+
+    pub fn path_route(path: &str, match_type: PathMatchType) -> PathRoute {
+        PathRoute {
+            path: Arc::from(path),
+            match_type,
+            service_name: Arc::from("test-svc"),
+            port: 8080,
+            connect_timeout: None,
+            read_timeout: None,
+            write_timeout: None,
+            rate_limiter: None,
+            max_retries: 0,
+            upstream_tls: false,
+            upstream_sni: Arc::from("test-svc"),
+            upstream_verify: true,
+            protocol: BackendProtocol::Http,
+            request_headers_add: Arc::new(Vec::new()),
+            request_headers_set: Arc::new(Vec::new()),
+            request_headers_remove: Arc::new(Vec::new()),
+            response_headers_add: Arc::new(Vec::new()),
+            response_headers_set: Arc::new(Vec::new()),
+            response_headers_remove: Arc::new(Vec::new()),
+            header_matches: Vec::new(),
+            method_match: None,
+            query_param_matches: Vec::new(),
+            redirect: None,
+            url_rewrite: None,
+            listener_name: Arc::from(""),
+            mirror_backends: Vec::new(),
+            weighted_backends: Vec::new(),
+            request_timeout: None,
+            backend_request_timeout: None,
+            auth_config: None,
+            cors: None,
+            ip_allow_cidrs: Vec::new(),
+            ip_deny_cidrs: Vec::new(),
+            ip_trusted_proxy_cidrs: Vec::new(),
+            max_request_body_bytes: 0,
+            retry_on: Arc::new(Vec::new()),
+            retry_codes: Arc::new(Vec::new()),
+            circuit_breaker: None,
+            connection_limiter: None,
+            total_weight: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1278,48 +1374,7 @@ mod tests {
 
     /// Helper: build a PathRoute with minimal required fields
     fn make_path_route(path: &str, match_type: PathMatchType) -> PathRoute {
-        PathRoute {
-            path: Arc::from(path),
-            match_type,
-            service_name: Arc::from("test-svc"),
-            port: 8080,
-            connect_timeout: None,
-            read_timeout: None,
-            write_timeout: None,
-            rate_limiter: None,
-            max_retries: 0,
-            upstream_tls: false,
-            upstream_sni: Arc::from("test-svc"),
-            upstream_verify: true,
-            protocol: BackendProtocol::Http,
-            request_headers_add: Arc::new(Vec::new()),
-            request_headers_set: Arc::new(Vec::new()),
-            request_headers_remove: Arc::new(Vec::new()),
-            response_headers_add: Arc::new(Vec::new()),
-            response_headers_set: Arc::new(Vec::new()),
-            response_headers_remove: Arc::new(Vec::new()),
-            header_matches: Vec::new(),
-            method_match: None,
-            query_param_matches: Vec::new(),
-            redirect: None,
-            url_rewrite: None,
-            listener_name: Arc::from(""),
-            mirror_backends: Vec::new(),
-            weighted_backends: Vec::new(),
-            request_timeout: None,
-            backend_request_timeout: None,
-            auth_config: None,
-            cors: None,
-            ip_allow_cidrs: Vec::new(),
-            ip_deny_cidrs: Vec::new(),
-            ip_trusted_proxy_cidrs: Vec::new(),
-            max_request_body_bytes: 0,
-            retry_on: Arc::new(Vec::new()),
-            retry_codes: Arc::new(Vec::new()),
-            circuit_breaker: None,
-            connection_limiter: None,
-            total_weight: 0,
-        }
+        super::test_support::path_route(path, match_type)
     }
 
     fn make_host_routes(rules: Vec<PathRoute>, catch_all: Option<PathRoute>) -> HostRoutes {
@@ -1333,7 +1388,43 @@ mod tests {
                 _ => prefix_rules.push(rule),
             }
         }
-        HostRoutes { exact_map, rules: prefix_rules, catch_all }
+        let needs_body = exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter())
+            .any(|r| needs_body_fields(&r.header_matches));
+        HostRoutes { exact_map, rules: prefix_rules, catch_all, needs_body }
+    }
+
+    #[test]
+    fn body_field_matches_read_the_scanned_fields_not_the_headers() {
+        let mut opus = make_path_route("/v1/messages", PathMatchType::Exact);
+        opus.service_name = Arc::from("opus-provider");
+        opus.header_matches = vec![HeaderMatchEntry {
+            name: HeaderName::from_static("portus-body-model"),
+            value: "claude-opus-5".to_string(),
+            match_type: HeaderMatchType::Exact,
+        }];
+        let mut haiku = make_path_route("/v1/messages", PathMatchType::Exact);
+        haiku.service_name = Arc::from("haiku-provider");
+        haiku.header_matches = vec![HeaderMatchEntry {
+            name: HeaderName::from_static("portus-body-model"),
+            value: "^claude-haiku-.*".to_string(),
+            match_type: HeaderMatchType::RegularExpression(regex::Regex::new("^claude-haiku-.*").unwrap()),
+        }];
+        let mut any = make_path_route("/v1/messages", PathMatchType::Exact);
+        any.service_name = Arc::from("default-provider");
+        let routes = make_host_routes(vec![opus, haiku, any], None);
+        assert!(routes.needs_body);
+
+        let mut forged = http::HeaderMap::new();
+        forged.insert("portus-body-model", "claude-opus-5".parse().unwrap());
+        let svc = |body: Option<&BodyFields>| {
+            routes.match_request_with_body("/v1/messages", "POST", &forged, None, body).map(|r| r.service_name.to_string())
+        };
+        assert_eq!(svc(None), Some("default-provider".into()), "a forged header never matches a body route");
+        assert_eq!(svc(Some(&vec![("model", "claude-opus-5".to_string())])), Some("opus-provider".into()));
+        assert_eq!(svc(Some(&vec![("model", "claude-haiku-4-5".to_string())])), Some("haiku-provider".into()));
+        assert_eq!(svc(Some(&vec![("model", "gpt-5".to_string())])), Some("default-provider".into()));
+        assert_eq!(svc(Some(&vec![])), Some("default-provider".into()), "a body without the key skips body routes");
+        assert!(!make_host_routes(vec![make_path_route("/", PathMatchType::Prefix)], None).needs_body);
     }
 
     #[test]
