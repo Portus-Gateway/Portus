@@ -1,3 +1,4 @@
+pub mod ai_types;
 pub mod compiler;
 #[cfg(test)]
 mod conformance_tests;
@@ -22,6 +23,7 @@ use portus_types::proto::portus::config::v1::config_distribution_server::ConfigD
 use portus_types::*;
 use tokio::sync::watch;
 
+use crate::ai_types::{AIProvider, AIRoute};
 use crate::gateway_types::{GRPCRoute, Gateway, GatewayClass, HTTPRoute, ListenerSet, ReferenceGrant, TCPRoute, TLSRoute, UDPRoute};
 use crate::policy_types::{
     APIKeyAuthPolicy, BasicAuthPolicy, CORSPolicy, CircuitBreakerPolicy, ConnectionPolicy,
@@ -31,6 +33,8 @@ use crate::policy_types::{
 use crate::gateway_types::BackendTLSPolicy;
 use crate::reconcilers::backend_tls_policy::reconcile_backend_tls_policy;
 use crate::reconcilers::configmap::{reconcile_configmap, reconcile_configmap_inner};
+use crate::reconcilers::ai_provider::reconcile_ai_provider;
+use crate::reconcilers::ai_route::reconcile_ai_route;
 use crate::reconcilers::api_key_auth_policy::reconcile_api_key_auth_policy;
 use crate::reconcilers::basic_auth_policy::reconcile_basic_auth_policy;
 use crate::reconcilers::circuit_breaker_policy::reconcile_circuit_breaker_policy;
@@ -218,6 +222,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let hr_reader = spawn("HTTPRoute", route_controller::<HTTPRoute>(&client, &ctx.store), reconcile_http_route, ctx.clone(), Some(gone_route(|s| &s.http_routes, RouteKind::Http)));
+    // AI gateway: providers (with a resolver keeping their endpoints fresh) and routes.
+    let aip_reader = spawn(
+        "AIProvider",
+        spec_controller::<AIProvider>(&client),
+        reconcile_ai_provider,
+        ctx.clone(),
+        Some(Arc::new(|store: &ConfigStore, ns: Option<&str>, name: &str| reconcilers::ai_provider::forget(store, ns.unwrap_or_default(), name))),
+    );
+    let air_reader = spawn("AIRoute", route_controller::<AIRoute>(&client, &ctx.store), reconcile_ai_route, ctx.clone(), Some(gone_route(|s| &s.ai_routes, RouteKind::Ai)));
+    tokio::spawn(reconcilers::ai_provider::resolve_loop(ctx.store.clone()));
     let grpc_reader = spawn("GRPCRoute", route_controller::<GRPCRoute>(&client, &ctx.store), reconcile_grpc_route, ctx.clone(), Some(gone_route(|s| &s.grpc_routes, RouteKind::Grpc)));
     let tls_reader = spawn("TLSRoute", route_controller::<TLSRoute>(&client, &ctx.store), reconcile_tls_route, ctx.clone(), Some(gone_route(|s| &s.tls_routes, RouteKind::Tls)));
     let tcp_reader = spawn("TCPRoute", route_controller::<TCPRoute>(&client, &ctx.store), reconcile_l4_route::<TCPRoute>, ctx.clone(), Some(gone_route(|s| &s.tcp_routes, RouteKind::Tcp)));
@@ -349,6 +363,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             backend_tls_policies: btls_reader,
             cors_policies: cors_reader,
             timeout_policies: tp_reader,
+            ai_providers: aip_reader,
+            ai_routes: air_reader,
             secrets: secret_reader,
             config_maps: cm_reader,
             gateway_classes: gc_reader,
@@ -531,6 +547,8 @@ struct PruneReaders {
     backend_tls_policies: kube::runtime::reflector::Store<BackendTLSPolicy>,
     cors_policies: kube::runtime::reflector::Store<CORSPolicy>,
     timeout_policies: kube::runtime::reflector::Store<TimeoutPolicy>,
+    ai_providers: kube::runtime::reflector::Store<AIProvider>,
+    ai_routes: kube::runtime::reflector::Store<AIRoute>,
     secrets: kube::runtime::reflector::Store<Secret>,
     config_maps: kube::runtime::reflector::Store<k8s_openapi::api::core::v1::ConfigMap>,
     gateway_classes: kube::runtime::reflector::Store<GatewayClass>,
@@ -592,6 +610,8 @@ impl PruneReaders {
         self.backend_tls_policies.wait_until_ready().await?;
         self.cors_policies.wait_until_ready().await?;
         self.timeout_policies.wait_until_ready().await?;
+        self.ai_providers.wait_until_ready().await?;
+        self.ai_routes.wait_until_ready().await?;
         self.secrets.wait_until_ready().await?;
         self.config_maps.wait_until_ready().await?;
         self.gateway_classes.wait_until_ready().await?;
@@ -621,6 +641,8 @@ impl PruneReaders {
         pruned += prune_map(&store.backend_tls_policies, &live_names(&self.backend_tls_policies), "BackendTLSPolicy");
         pruned += prune_map(&store.cors_policies, &live_names(&self.cors_policies), "CORSPolicy");
         pruned += prune_map(&store.timeout_policies, &live_names(&self.timeout_policies), "TimeoutPolicy");
+        pruned += prune_map(&store.ai_providers, &live_names(&self.ai_providers), "AIProvider");
+        pruned += prune_map(&store.ai_routes, &live_names(&self.ai_routes), "AIRoute");
         // Secrets/ConfigMaps deleted from Kubernetes must not linger in memory.
         pruned += prune_map(&store.secrets, &live_names(&self.secrets), "Secret");
         pruned += prune_map(&store.config_maps, &live_names(&self.config_maps), "ConfigMap");

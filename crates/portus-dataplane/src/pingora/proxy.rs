@@ -176,6 +176,7 @@ impl ProxyHttp for Router {
             socket_is_tls,
             sni,
             peer_ip,
+            body_fields: None,
         };
         match plan_request(&snap, facts, &self.metrics).await {
             Plan::Respond(reply) => {
@@ -187,6 +188,14 @@ impl ProxyHttp for Router {
                 ctx.plan = Some(plan);
                 session.set_keepalive(Some(60));
                 Ok(false)
+            }
+            Plan::NeedsBody(_) => {
+                // Routing on request body fields (AI routes) is a Rama
+                // feature; the Pingora request pipeline cannot replay a peeked
+                // body ahead of the streamed remainder.
+                log::warn!("route on host {host} matches on body fields, unsupported on the pingora stack");
+                respond(session, portus_dataplane_core::plan::Reply::text(501, "body-field routing needs the rama stack")).await?;
+                Ok(true)
             }
         }
     }

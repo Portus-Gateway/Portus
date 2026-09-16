@@ -232,9 +232,12 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         .iter()
         .cloned()
         .collect();
-    let http_routes: Vec<(NamespacedName, HTTPRouteState)> = store.http_routes.iter()
+    let mut http_routes: Vec<(NamespacedName, HTTPRouteState)> = store.http_routes.iter()
         .map(|e| (e.key().clone(), e.value().clone()))
         .collect();
+    // AIRoutes are HTTPRoutes whose matches include body fields and whose
+    // backends are provider hosts; they go through the same compile loop.
+    http_routes.extend(ai_routes_as_http_routes(store));
     let grpc_routes: Vec<(NamespacedName, _)> = store.grpc_routes.iter()
         .map(|e| (e.key().clone(), e.value().clone()))
         .collect();
@@ -845,6 +848,22 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
                     _ => {}
                 }
             }
+        }
+    }
+
+    // AI providers: TLS to the provider host with its name as SNI. The route
+    // carries the provider's synthetic Service name.
+    for route in &mut routes {
+        let Some(rest) = route.service_name.strip_prefix(crate::store::AI_PROVIDER_SERVICE_PREFIX) else {
+            continue;
+        };
+        let Some((ns, name)) = rest.split_once('/') else {
+            continue;
+        };
+        if let Some(provider) = store.ai_providers.get(&NamespacedName { namespace: ns.to_string(), name: name.to_string() })
+            && provider.tls
+        {
+            route.upstream_tls = Some(UpstreamTlsConfig { enabled: true, verify_cert: true, sni: provider.host.clone() });
         }
     }
 
@@ -1586,6 +1605,63 @@ fn apply_policies(
     }
 }
 
+/// Every accepted AIRoute as the HTTPRouteState the HTTP compile loop
+/// consumes: body-field matches are already `portus-body-*` header matches;
+/// each rule sets the provider's Host and credential header and points at
+/// the provider's synthetic Service. Rules whose provider is gone compile
+/// with no backend and answer 500, like an HTTPRoute with a missing Service.
+fn ai_routes_as_http_routes(store: &ConfigStore) -> Vec<(NamespacedName, HTTPRouteState)> {
+    let ai_routes: Vec<(NamespacedName, crate::store::AIRouteState)> =
+        store.ai_routes.iter().map(|e| (e.key().clone(), e.value().clone())).collect();
+    ai_routes
+        .into_iter()
+        .map(|(key, ar)| {
+            let rules = ar
+                .rules
+                .iter()
+                .map(|rule| {
+                    let mut set: Vec<(String, String)> = Vec::new();
+                    if let Some(provider) = store.ai_providers.get(&rule.provider) {
+                        set.push(("host".to_string(), provider.host.clone()));
+                        if let Some(cred) = &provider.credential {
+                            let secret_key = NamespacedName { namespace: provider.namespace.clone(), name: cred.secret_name.clone() };
+                            match store.secrets.get(&secret_key).and_then(|s| s.data.get(&cred.secret_key).cloned()) {
+                                Some(value) => set.push((cred.header.clone(), format!("{}{}", cred.prefix, value.trim()))),
+                                None => log::warn!(
+                                    "AIProvider {}/{}: Secret {} has no key {:?}; requests go out without a credential",
+                                    provider.namespace, provider.name, cred.secret_name, cred.secret_key
+                                ),
+                            }
+                        }
+                    }
+                    HTTPRouteRuleState {
+                        matches: rule.matches.clone(),
+                        filters: if set.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![HTTPFilterState::RequestHeaderModifier { add: Vec::new(), set, remove: Vec::new() }]
+                        },
+                        backend_refs: rule.backend_refs.clone(),
+                        request_timeout_ms: None,
+                        backend_request_timeout_ms: None,
+                        retry: None,
+                    }
+                })
+                .collect();
+            (
+                NamespacedName { namespace: key.namespace, name: format!("airoute/{}", key.name) },
+                HTTPRouteState {
+                    namespace: ar.namespace,
+                    hostnames: ar.hostnames,
+                    parent_refs: ar.parent_refs,
+                    rules,
+                    generation: ar.generation,
+                },
+            )
+        })
+        .collect()
+}
+
 /// Compile a single HTTPRoute rule into RouteConfig entries.
 ///
 /// Convert a RequestHeaderModifier filter state into a HeaderMutation proto.
@@ -2169,6 +2245,82 @@ mod tests {
         assert_eq!(route.service_name, "backend-svc");
         assert_eq!(route.port, 8080);
         assert_eq!(route.protocol, "HTTP");
+    }
+
+    #[test]
+    fn ai_routes_compile_to_body_field_header_matches_with_provider_tls_and_credential() {
+        use crate::store::{AICredentialState, AIProviderState, AIRouteRuleState, AIRouteState, SecretState, ServiceKey};
+        let store = empty_store();
+        let parent = setup_default_gateway(&store);
+        store.secrets.insert(
+            NamespacedName { namespace: "default".into(), name: "anthropic-key".into() },
+            SecretState { data: [("api-key".to_string(), "sk-ant-test\n".to_string())].into_iter().collect() },
+        );
+        let provider = AIProviderState {
+            namespace: "default".into(),
+            name: "anthropic".into(),
+            kind: "anthropic".into(),
+            tls: true,
+            host: "api.anthropic.com".into(),
+            port: 443,
+            credential: Some(AICredentialState {
+                secret_name: "anthropic-key".into(),
+                secret_key: "api-key".into(),
+                header: "x-api-key".into(),
+                prefix: String::new(),
+            }),
+            generation: 1,
+        };
+        store.endpoints.insert(
+            provider.service_key(),
+            vec![BackendEndpoint { address: "160.79.104.10".into(), port: 443 }],
+        );
+        store.ai_providers.insert(NamespacedName { namespace: "default".into(), name: "anthropic".into() }, provider.clone());
+        store.ai_routes.insert(
+            NamespacedName { namespace: "default".into(), name: "claude".into() },
+            AIRouteState {
+                namespace: "default".into(),
+                hostnames: vec!["llm.example.com".into()],
+                parent_refs: vec![parent],
+                rules: vec![AIRouteRuleState {
+                    matches: vec![HTTPRouteMatchState {
+                        path: Some(("/v1/messages".into(), "PathPrefix".into())),
+                        headers: vec![("portus-body-model".into(), "^claude\\-".into(), "RegularExpression".into())],
+                        method: None,
+                        query_params: vec![],
+                    }],
+                    backend_refs: vec![BackendRefState {
+                        namespace: "default".into(),
+                        name: provider.service_name(),
+                        port: 443,
+                        weight: 1,
+                        filters: vec![],
+                    }],
+                    provider: NamespacedName { namespace: "default".into(), name: "anthropic".into() },
+                }],
+                generation: 1,
+            },
+        );
+
+        let config = compile_config(&store);
+        assert_eq!(config.routes.len(), 1);
+        let route = &config.routes[0];
+        assert_eq!(route.host, "llm.example.com");
+        assert_eq!(route.service_name, "aiprovider/default/anthropic");
+        assert_eq!(route.port, 443);
+        assert_eq!(route.header_matches.len(), 1);
+        assert_eq!((route.header_matches[0].name.as_str(), route.header_matches[0].match_type.as_str()), ("portus-body-model", "RegularExpression"));
+        let set = &route.request_headers.as_ref().unwrap().set;
+        assert_eq!(set.get("host").map(String::as_str), Some("api.anthropic.com"));
+        assert_eq!(set.get("x-api-key").map(String::as_str), Some("sk-ant-test"), "credential trimmed, no prefix for anthropic");
+        let tls = route.upstream_tls.as_ref().unwrap();
+        assert!(tls.enabled && tls.verify_cert);
+        assert_eq!(tls.sni, "api.anthropic.com");
+        let group = config.backends.iter().find(|b| b.service_name == "aiprovider/default/anthropic").expect("provider backend group");
+        assert_eq!(group.port, 443);
+        assert_eq!(group.endpoints.len(), 1);
+        assert_eq!(group.endpoints[0].address, "160.79.104.10");
+        let _ = ServiceKey { namespace: String::new(), name: String::new(), port: 0 };
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! Experimental: compared against the Pingora stack on the same benchmarks
 //! and conformance suite. Selected with `PORTUS_NETWORK_STACK=rama`.
 
+mod body;
 mod client;
 mod health;
 mod proxy;

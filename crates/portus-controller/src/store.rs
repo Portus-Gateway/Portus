@@ -34,6 +34,9 @@ pub struct ConfigStore {
     pub cors_policies: DashMap<NamespacedName, CORSPolicyState>,
     pub timeout_policies: DashMap<NamespacedName, TimeoutPolicyState>,
     pub backend_tls_policies: DashMap<NamespacedName, BackendTLSPolicyState>,
+    /// AI gateway: LLM providers and the routes that pick between them.
+    pub ai_providers: DashMap<NamespacedName, AIProviderState>,
+    pub ai_routes: DashMap<NamespacedName, AIRouteState>,
     pub secrets: DashMap<NamespacedName, SecretState>,
     /// ConfigMap data, keyed by namespace/name. Used by BackendTLSPolicy and
     /// Gateway frontend validation to resolve CA certificate references.
@@ -139,6 +142,7 @@ pub enum RouteKind {
     Tls,
     Tcp,
     Udp,
+    Ai,
 }
 
 /// What one data plane node reported it is running.
@@ -181,6 +185,8 @@ impl ConfigStore {
             cors_policies: DashMap::new(),
             timeout_policies: DashMap::new(),
             backend_tls_policies: DashMap::new(),
+            ai_providers: DashMap::new(),
+            ai_routes: DashMap::new(),
             secrets: DashMap::new(),
             config_maps: DashMap::new(),
             gateway_tls: DashMap::new(),
@@ -490,6 +496,77 @@ impl RouteState for HTTPRouteState {
     fn backend_refs(&self) -> Vec<&BackendRefState> {
         self.rules.iter().flat_map(|r| r.backend_refs.iter()).collect()
     }
+}
+
+impl RouteState for AIRouteState {
+    fn parent_refs(&self) -> &[ParentRefState] {
+        &self.parent_refs
+    }
+    fn backend_refs(&self) -> Vec<&BackendRefState> {
+        self.rules.iter().flat_map(|r| r.backend_refs.iter()).collect()
+    }
+}
+
+/// An `AIProvider`: where an LLM API lives and how to authenticate to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AIProviderState {
+    pub namespace: String,
+    pub name: String,
+    /// `anthropic`, `openai` or `openai-compatible`.
+    pub kind: String,
+    pub tls: bool,
+    pub host: String,
+    pub port: u16,
+    pub credential: Option<AICredentialState>,
+    pub generation: i64,
+}
+
+impl AIProviderState {
+    /// The synthetic Service name the provider's routes and endpoints share.
+    /// Contains a slash, which no Kubernetes Service name can.
+    pub fn service_name(&self) -> String {
+        ai_provider_service_name(&self.namespace, &self.name)
+    }
+
+    pub fn service_key(&self) -> ServiceKey {
+        ServiceKey { namespace: self.namespace.clone(), name: self.service_name(), port: self.port }
+    }
+}
+
+pub fn ai_provider_service_name(namespace: &str, name: &str) -> String {
+    format!("{AI_PROVIDER_SERVICE_PREFIX}{namespace}/{name}")
+}
+
+/// Prefix of the synthetic Service names AI providers are compiled as.
+pub const AI_PROVIDER_SERVICE_PREFIX: &str = "aiprovider/";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AICredentialState {
+    pub secret_name: String,
+    pub secret_key: String,
+    pub header: String,
+    pub prefix: String,
+}
+
+/// An `AIRoute`, already shaped like an HTTPRoute: body-field matches are
+/// header matches on `portus-body-*` names and each rule's provider is a
+/// backend ref to the provider's synthetic Service.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AIRouteState {
+    pub namespace: String,
+    pub hostnames: Vec<String>,
+    pub parent_refs: Vec<ParentRefState>,
+    pub rules: Vec<AIRouteRuleState>,
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AIRouteRuleState {
+    pub matches: Vec<HTTPRouteMatchState>,
+    /// Exactly one backend ref (the rule's provider) when it resolved.
+    pub backend_refs: Vec<BackendRefState>,
+    /// The provider named by the rule, resolved or not.
+    pub provider: NamespacedName,
 }
 
 impl RouteState for GRPCRouteState {

@@ -42,7 +42,7 @@ use std::sync::Arc;
 /// - Listener protocol accepts HTTPRoute (HTTP or HTTPS)
 /// - Route namespace is allowed by listener's allowedRoutes
 /// - Route hostnames are compatible with listener hostname
-fn bind_to_parents(
+pub(crate) fn bind_to_parents(
     parent_refs: &[ParentReference],
     route_namespace: &str,
     route_ns_labels: &std::collections::BTreeMap<String, String>,

@@ -60,6 +60,8 @@ rules:
       - healthcheckpolicies
       - corspolicies
       - timeoutpolicies
+      - aiproviders
+      - airoutes
     verbs: ["get", "list", "watch"]
   # Policy CRDs - portus-gateway.dev (status write)
   - apiGroups: ["portus-gateway.dev"]
@@ -75,6 +77,8 @@ rules:
       - healthcheckpolicies/status
       - corspolicies/status
       - timeoutpolicies/status
+      - aiproviders/status
+      - airoutes/status
     verbs: ["get", "patch", "update"]
   # Services: read for port mapping (service port → target port); write for
   # the per-Gateway Services the provisioner owns.

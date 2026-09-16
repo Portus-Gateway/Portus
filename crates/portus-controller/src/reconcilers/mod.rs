@@ -1,4 +1,6 @@
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+pub mod ai_provider;
+pub mod ai_route;
 pub mod api_key_auth_policy;
 pub mod backend_tls_policy;
 pub mod basic_auth_policy;

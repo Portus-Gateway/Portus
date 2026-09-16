@@ -1,3 +1,4 @@
+pub mod ai_types;
 pub mod compiler;
 #[cfg(test)]
 mod conformance_tests;

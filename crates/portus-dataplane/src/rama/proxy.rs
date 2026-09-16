@@ -33,9 +33,10 @@ use portus_dataplane_core::plan::{
     apply_cors_response_headers, plan_request, should_retry_connect, Forward, HeaderSink, Plan, Reply,
     RequestFacts,
 };
-use portus_dataplane_core::router::{access_log_enabled, should_retry_status, RequestHeaders, SnapshotSlot};
+use portus_dataplane_core::router::{access_log_enabled, should_retry_status, BodyFields, RequestHeaders, SnapshotSlot};
 use portus_dataplane_core::types::BackendProtocol;
 
+use super::body::scan_body;
 use super::client::{Upstream, UpstreamTarget};
 use super::tls::{client_auth_for, upstream_tls_for};
 
@@ -150,39 +151,68 @@ impl ProxyService {
             .or_else(|| req.uri().host().map(|h| h.to_string()))
             .unwrap_or_default();
         let host = raw_host.split(':').next().unwrap_or(&raw_host);
-        let path: std::borrow::Cow<'_, str> =
-            req.uri().path().map(|p| p.as_encoded_str()).unwrap_or(std::borrow::Cow::Borrowed("/"));
-        let query: Option<std::borrow::Cow<'_, str>> = req.uri().query().map(|q| q.as_encoded_str());
-        let target: std::borrow::Cow<'_, str> = match &query {
-            Some(q) => std::borrow::Cow::Owned(format!("{path}?{q}")),
-            None => std::borrow::Cow::Borrowed(&path),
-        };
 
-        let snap = self.snapshot.load();
-        let facts = RequestFacts {
-            host,
-            path: &path,
-            path_and_query: &target,
-            query: query.as_deref(),
-            method: req.method().as_str(),
-            headers: &Headers(req.headers()),
-            local_port,
-            socket_is_tls,
-            sni: sni.as_deref(),
-            peer_ip,
-        };
-        let plan = match plan_request(&snap, facts, &self.metrics).await {
-            Plan::Respond(reply) => {
-                let status = reply.status;
-                self.metrics.request_total.with_label_values(&["no_route", status_label(status).as_str(), "http"]).inc();
-                self.metrics.request_duration.with_label_values(&["no_route", "http"]).observe(start.elapsed().as_secs_f64());
-                access_log(peer_ip, req.method().as_str(), &path, "no_route", status, start);
-                return reply_response(reply);
+        // Plan, scanning the body first when the host's routes match on
+        // body fields. The borrows of `req` end with each pass so the body
+        // can be taken and replaced between them.
+        let mut req = req;
+        let mut body_fields: Option<BodyFields> = None;
+        let (plan, logged) = loop {
+            let step = {
+                let path: std::borrow::Cow<'_, str> =
+                    req.uri().path().map(|p| p.as_encoded_str()).unwrap_or(std::borrow::Cow::Borrowed("/"));
+                let query: Option<std::borrow::Cow<'_, str>> = req.uri().query().map(|q| q.as_encoded_str());
+                let target: std::borrow::Cow<'_, str> = match &query {
+                    Some(q) => std::borrow::Cow::Owned(format!("{path}?{q}")),
+                    None => std::borrow::Cow::Borrowed(&path),
+                };
+                let snap = self.snapshot.load();
+                let facts = RequestFacts {
+                    host,
+                    path: &path,
+                    path_and_query: &target,
+                    query: query.as_deref(),
+                    method: req.method().as_str(),
+                    headers: &Headers(req.headers()),
+                    local_port,
+                    socket_is_tls,
+                    sni: sni.as_deref(),
+                    peer_ip,
+                    body_fields: body_fields.as_ref(),
+                };
+                match plan_request(&snap, facts, &self.metrics).await {
+                    Plan::Respond(reply) => {
+                        let status = reply.status;
+                        self.metrics.request_total.with_label_values(&["no_route", status_label(status).as_str(), "http"]).inc();
+                        self.metrics.request_duration.with_label_values(&["no_route", "http"]).observe(start.elapsed().as_secs_f64());
+                        access_log(peer_ip, req.method().as_str(), &path, "no_route", status, start);
+                        return reply_response(reply);
+                    }
+                    Plan::Forward(plan) => {
+                        let logged = access_log_enabled().then(|| (req.method().as_str().to_string(), path.into_owned()));
+                        Ok((plan, logged))
+                    }
+                    Plan::NeedsBody(need) => Err(need),
+                }
+            };
+            match step {
+                Ok(done) => break done,
+                Err(need) => {
+                    if body_fields.is_some() {
+                        // The second pass asked again: the plan is inconsistent.
+                        return status_response(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
+                    let (parts, body) = req.into_parts();
+                    match scan_body(body, need).await {
+                        Ok((fields, replay)) => {
+                            body_fields = Some(fields);
+                            req = Request::from_parts(parts, replay);
+                        }
+                        Err(status) => return status_response(status),
+                    }
+                }
             }
-            Plan::Forward(plan) => plan,
         };
-        drop(snap);
-        let logged = if access_log_enabled() { Some((req.method().as_str().to_string(), path.into_owned())) } else { None };
         // HTTP/2 carries the authority in `:authority`, not a `Host` header;
         // the backend must still see the client's authority, not ours.
         let authority = if req.headers().contains_key("host") {

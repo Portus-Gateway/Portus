@@ -1,0 +1,137 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: airoutes.portus-gateway.dev
+spec:
+  group: portus-gateway.dev
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Hostnames
+          type: string
+          jsonPath: .spec.hostnames
+        - name: Accepted
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Accepted")].status
+        - name: Resolved
+          type: string
+          jsonPath: .status.conditions[?(@.type=="ResolvedRefs")].status
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [parentRefs, rules]
+              properties:
+                parentRefs:
+                  type: array
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      group:
+                        type: string
+                      kind:
+                        type: string
+                      namespace:
+                        type: string
+                      name:
+                        type: string
+                      sectionName:
+                        type: string
+                      port:
+                        type: integer
+                hostnames:
+                  type: array
+                  items:
+                    type: string
+                rules:
+                  type: array
+                  items:
+                    type: object
+                    required: [providerRefs]
+                    properties:
+                      matches:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            path:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, PathPrefix, RegularExpression]
+                                value:
+                                  type: string
+                            model:
+                              type: object
+                              required: [value]
+                              description: "Matches the request body's top-level model field"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
+                            stream:
+                              type: boolean
+                              description: "Matches the request body's top-level stream flag"
+                            headers:
+                              type: array
+                              items:
+                                type: object
+                                required: [name, value]
+                                properties:
+                                  type:
+                                    type: string
+                                    enum: [Exact, RegularExpression]
+                                  name:
+                                    type: string
+                                  value:
+                                    type: string
+                      providerRefs:
+                        type: array
+                        minItems: 1
+                        maxItems: 1
+                        description: "The AIProvider (same namespace) this rule forwards to; one per rule"
+                        items:
+                          type: object
+                          required: [name]
+                          properties:
+                            name:
+                              type: string
+                            weight:
+                              type: integer
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+  scope: Namespaced
+  names:
+    plural: airoutes
+    singular: airoute
+    kind: AIRoute
+    shortNames: [air]

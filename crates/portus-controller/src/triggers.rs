@@ -118,6 +118,16 @@ impl RouteRefs for HTTPRoute {
     }
 }
 
+impl RouteRefs for crate::ai_types::AIRoute {
+    fn parent_refs(&self) -> &[ParentReference] {
+        &self.spec.parent_refs
+    }
+    fn backend_services(&self) -> Vec<NamespacedName> {
+        // Providers are not Services; nothing to follow here.
+        Vec::new()
+    }
+}
+
 impl RouteRefs for GRPCRoute {
     fn parent_refs(&self) -> &[ParentReference] {
         &self.spec.parent_refs

@@ -1,0 +1,82 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: aiproviders.portus-gateway.dev
+spec:
+  group: portus-gateway.dev
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Kind
+          type: string
+          jsonPath: .spec.kind
+        - name: URL
+          type: string
+          jsonPath: .spec.url
+        - name: Accepted
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [kind, url]
+              properties:
+                kind:
+                  type: string
+                  enum: [anthropic, openai, openai-compatible]
+                url:
+                  type: string
+                  description: "Base URL, scheme and host only: https://api.anthropic.com"
+                credential:
+                  type: object
+                  required: [secretRef]
+                  properties:
+                    secretRef:
+                      type: object
+                      required: [name]
+                      properties:
+                        name:
+                          type: string
+                        key:
+                          type: string
+                          description: "Key in the Secret's data; default api-key"
+                    header:
+                      type: string
+                      description: "Header carrying the key; default x-api-key (anthropic) or authorization"
+                    prefix:
+                      type: string
+                      description: "Text before the key in the header value; default empty (anthropic) or 'Bearer '"
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+  scope: Namespaced
+  names:
+    plural: aiproviders
+    singular: aiprovider
+    kind: AIProvider
+    shortNames: [aip]
