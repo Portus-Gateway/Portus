@@ -101,12 +101,7 @@ impl Refusal {
             Dialect::Anthropic => format!(r#"{{"type":"error","error":{{"type":"{kind}","message":"{message}"}}}}"#),
             Dialect::OpenAi => format!(r#"{{"error":{{"message":"{message}","type":"{kind}","code":null}}}}"#),
         };
-        let mut reply = Reply::empty(status).with_header(
-            http::header::CONTENT_TYPE,
-            http::HeaderValue::from_static("application/json"),
-        );
-        reply.body = body.into();
-        reply
+        Reply::json(status, body)
     }
 }
 
@@ -203,5 +198,6 @@ mod tests {
         assert!(std::str::from_utf8(&r.body).unwrap().contains(r#""type":"permission_error""#));
         assert!(std::str::from_utf8(&r.body).unwrap().contains("gpt-5"));
         assert!(r.headers.iter().any(|(n, v)| n == http::header::CONTENT_TYPE && v == "application/json"));
+        assert!(r.headers.iter().any(|(n, v)| n == http::header::CONTENT_LENGTH && v == r.body.len().to_string().as_str()), "the length must match the body or clients read nothing");
     }
 }

@@ -12,7 +12,7 @@ use rama::error::BoxError;
 use rama::http::body::{Frame, SizeHint};
 use rama::http::{Body, StreamingBody};
 
-use portus_dataplane_core::ai::budget::Allowance;
+use portus_dataplane_core::ai::budget::Reservation;
 use portus_dataplane_core::ai::usage::{UsageRecord, UsageRing, UsageTracker};
 use portus_dataplane_core::router::{AiBackend, BodyFields};
 
@@ -25,8 +25,8 @@ pub struct RequestSide<'a> {
     pub start: Instant,
     /// The Portus API key that authenticated the request; 0 when none.
     pub key_id: u64,
-    /// The budget allowance to debit with the response's tokens.
-    pub allowance: Option<Arc<Allowance>>,
+    /// The budget reservation to settle with the response's tokens.
+    pub reservation: Option<Reservation>,
 }
 
 /// Wrap `body` so its usage is recorded into `ring` when it completes.
@@ -56,7 +56,7 @@ pub fn observe(body: Body, status: u16, req: RequestSide<'_>, ring: Arc<UsageRin
         record,
         start: req.start,
         ring,
-        allowance: req.allowance,
+        reservation: req.reservation,
     })
 }
 
@@ -66,7 +66,7 @@ struct Observed {
     record: UsageRecord,
     start: Instant,
     ring: Arc<UsageRing>,
-    allowance: Option<Arc<Allowance>>,
+    reservation: Option<Reservation>,
 }
 
 impl Observed {
@@ -76,8 +76,8 @@ impl Observed {
         let mut record = self.record.clone();
         record.duration_micros = self.start.elapsed().as_micros() as u64;
         record.tokens = usage.tokens;
-        if let (Some(allowance), Some(tokens)) = (&self.allowance, &usage.tokens) {
-            allowance.debit(tokens);
+        if let Some(reservation) = self.reservation.take() {
+            reservation.settle(usage.tokens.as_ref());
         }
         if let Some(m) = usage.model {
             record.served_model = UsageRecord::name(&m);
@@ -130,7 +130,7 @@ mod tests {
     use rama::http::body::util::{BodyExt, Full};
 
     fn side<'a>(ai: &'a AiBackend, fields: &'a BodyFields) -> RequestSide<'a> {
-        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, allowance: None }
+        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, reservation: None }
     }
 
     #[tokio::test]

@@ -39,7 +39,7 @@ use portus_dataplane_core::types::BackendProtocol;
 use super::body::scan_body;
 use super::client::{Upstream, UpstreamTarget};
 use super::usage::{observe, RequestSide};
-use portus_dataplane_core::ai::budget::{exhausted_reply, now_micros, Scope, Verdict};
+use portus_dataplane_core::ai::budget::{estimate, exhausted_reply, now_micros, Scope, Verdict, REMAINING_HEADER};
 use portus_dataplane_core::ai::keys::{authorize, Refusal};
 use portus_dataplane_core::ai::ledger::LedgerReporter;
 use super::tls::{client_auth_for, upstream_tls_for};
@@ -268,9 +268,11 @@ impl ProxyService {
             req.headers_mut().remove("x-api-key");
             req.headers_mut().remove("authorization");
         }
-        // Token budget: two atomics against the subject's local allowance;
-        // the ledger is asked for the next grant in the background.
-        let mut allowance = None;
+        // Token budget: reserve an estimate against the subject's counter
+        // (one atomic), settle to the real count when the response ends. The
+        // counter syncs with the ledger in the background.
+        let mut reservation = None;
+        let mut remaining_header: Option<i64> = None;
         if let (Some(ai), Some(budget)) = (plan.ai.as_ref(), plan.ai.as_ref().and_then(|ai| ai.budget.as_ref())) {
             let subject: Arc<str> = match budget.per {
                 Scope::Key if key_id != 0 => Arc::from(key_id.to_string()),
@@ -278,28 +280,37 @@ impl ProxyService {
                 Scope::Tenant => tenant.clone().unwrap_or_else(|| Arc::from("anonymous")),
                 Scope::Route => Arc::from("route"),
             };
-            let (verdict, held) = match self.ledger.as_ref() {
+            let max_tokens = body_fields
+                .as_ref()
+                .and_then(|f| f.iter().find(|(k, _)| *k == "max_tokens"))
+                .and_then(|(_, v)| v.parse::<u64>().ok());
+            let cost = estimate(max_tokens, request_bytes);
+            let verdict = match self.ledger.as_ref() {
                 Some(ledger) => {
-                    let (mut v, a) = ledger.budgets.check(budget, &subject, now_micros());
+                    let mut v = ledger.budgets.check(budget, &subject, cost, now_micros());
                     if v == Verdict::Unknown {
-                        // A subject this pod has never seen in this window:
+                        // A subject this pod has not synced in this window:
                         // give the ledger one bounded chance to answer before
                         // the fail-open/closed knob decides.
-                        a.wait_for_grant(Duration::from_millis(250)).await;
-                        v = ledger.budgets.check(budget, &subject, now_micros()).0;
+                        ledger.budgets.counter(budget, &subject).wait_for_sync(Duration::from_millis(250)).await;
+                        v = ledger.budgets.check(budget, &subject, cost, now_micros());
                     }
-                    (v, Some(a))
+                    v
                 }
-                None => (Verdict::Unknown, None),
+                None => Verdict::Unknown,
             };
             let refuse = match verdict {
-                Verdict::Allow => None,
-                Verdict::Exhausted { retry_after_secs } => Some(retry_after_secs),
+                Verdict::Allow(r) => {
+                    remaining_header = Some(r.remaining());
+                    reservation = Some(r);
+                    None
+                }
+                Verdict::Exhausted { retry_after_secs, remaining, needed } => Some((retry_after_secs, remaining, needed)),
                 Verdict::Unknown if budget.fail_open => None,
-                Verdict::Unknown => Some(1),
+                Verdict::Unknown => Some((1, 0, cost)),
             };
-            if let Some(retry) = refuse {
-                let reply = exhausted_reply(ai.dialect, retry);
+            if let Some((retry, remaining, needed)) = refuse {
+                let reply = exhausted_reply(ai.dialect, retry, remaining, needed);
                 let status = reply.status;
                 self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                 if let Some((method, path)) = &logged {
@@ -307,13 +318,17 @@ impl ProxyService {
                 }
                 return reply_response(reply);
             }
-            allowance = held;
         }
         let mut response = self.forward(req, &plan, peer_ip, authority).await;
 
         let status = response.status().as_u16();
+        if let Some(remaining) = remaining_header
+            && let Some(n) = rama_name(&REMAINING_HEADER)
+        {
+            response.headers_mut().insert(n, HeaderValue::from(remaining.max(0)));
+        }
         if let (Some(ai), Some(ledger)) = (plan.ai.as_ref(), self.ledger.as_ref()) {
-            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, allowance };
+            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation };
             let body = std::mem::replace(response.body_mut(), Body::empty());
             *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring));
         }

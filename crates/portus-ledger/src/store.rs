@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use portus_types::proto::portus::ledger::v1::{KeySnapshot, UsageRecord};
 
-use crate::budget::{self, Granted};
+use crate::budget::{self, Synced};
 use crate::keys::{self, KeyRow};
 
 pub struct Store {
@@ -95,12 +95,13 @@ impl Store {
         Ok(Self { conn })
     }
 
-    /// The next budget slice for a subject; `None` for an unknown window.
-    pub fn grant(&self, policy: &str, subject: &str, budget_tokens: u64, window: &str, spent: u64, now_micros: u64) -> rusqlite::Result<Option<Granted>> {
-        budget::grant(&self.conn, policy, subject, budget_tokens, window, spent, now_micros)
+    /// Add a pod's spend delta and return the window's total; `None` for
+    /// an unknown window.
+    pub fn sync_spend(&self, policy: &str, subject: &str, window: &str, delta: u64, now_micros: u64) -> rusqlite::Result<Option<Synced>> {
+        budget::sync(&self.conn, policy, subject, window, delta, now_micros)
     }
 
-    pub fn prune_grants(&self, now_micros: u64) -> rusqlite::Result<usize> {
+    pub fn prune_spend(&self, now_micros: u64) -> rusqlite::Result<usize> {
         budget::prune(&self.conn, now_micros)
     }
 

@@ -42,29 +42,28 @@ message ReportAck {
   uint64 accepted = 1;
 }
 
-// Token budgets. A data plane never decides a budget on its own: it spends
-// from grants the ledger hands out for one subject in one window, asking for
-// the next one before the current runs dry. The ledger stops granting when
-// the window's budget is out.
+// Token budgets. Every data plane keeps a local spent counter per subject
+// and syncs the delta to the ledger about once a second (sooner under
+// load); the ledger answers with the window's global total. Remaining is
+// budget minus the global total minus what this pod has not synced yet, so
+// the overrun is bounded by one sync interval of spend, not by grants.
 service Budget {
-  rpc Grant(GrantRequest) returns (GrantResponse);
+  rpc Sync(SyncRequest) returns (SyncResponse);
 }
 
-message GrantRequest {
+message SyncRequest {
   string node = 1;
   string policy = 2;          // namespace/name of the AIUsagePolicy
   string subject = 3;         // key id, tenant or "route", per the policy
-  uint64 budget_tokens = 4;   // the policy's budget, so the ledger needs no CRD access
-  string window = 5;          // HOURLY | DAILY | MONTHLY
-  // Tokens the data plane spent from its previous grant, for accounting.
-  uint64 spent = 6;
+  string window = 4;          // HOURLY | DAILY | MONTHLY
+  // Tokens this pod has spent in the window since its last sync.
+  uint64 spent_delta = 5;
 }
 
-message GrantResponse {
-  // Tokens the data plane may spend before asking again; 0 when exhausted.
-  uint64 tokens = 1;
+message SyncResponse {
+  // Everything spent in the window across all pods, this delta included.
+  uint64 spent_total = 1;
   uint64 window_end_unix_micros = 2;
-  bool exhausted = 3;
 }
 
 // API keys, pushed from the ledger to every data plane as whole snapshots.

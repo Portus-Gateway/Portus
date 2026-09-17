@@ -131,7 +131,7 @@ mod tests {
     async fn fields_come_out_and_the_backend_sees_the_whole_body_unchanged() {
         let parts = [r#"{"max_tokens":1024,"messages":[{"role":"user","content":"hel"#, r#"lo {\"model\": 1}"}],"#, r#""model":"claude-opus-5","stream":true,"#, r#""metadata":{"user_id":"u1"}}"#];
         let (fields, body) = scan_body(chunked(&parts), need()).await.unwrap();
-        assert_eq!(fields, vec![("model", "claude-opus-5".to_string()), ("stream", "true".to_string())]);
+        assert_eq!(fields, vec![("model", "claude-opus-5".to_string()), ("stream", "true".to_string()), ("max_tokens", "1024".to_string())]);
         let replayed = body.collect().await.unwrap().to_bytes();
         assert_eq!(replayed, Bytes::from(parts.concat()));
     }

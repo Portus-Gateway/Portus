@@ -29,7 +29,7 @@ use axum::{Json, Router};
 use portus_types::proto::portus::ledger::v1::budget_server::{Budget, BudgetServer};
 use portus_types::proto::portus::ledger::v1::key_distribution_server::{KeyDistribution, KeyDistributionServer};
 use portus_types::proto::portus::ledger::v1::ledger_ingest_server::{LedgerIngest, LedgerIngestServer};
-use portus_types::proto::portus::ledger::v1::{GrantRequest, GrantResponse, KeySnapshot, KeyWatchRequest, ReportAck, UsageBatch};
+use portus_types::proto::portus::ledger::v1::{KeySnapshot, KeyWatchRequest, ReportAck, SyncRequest, SyncResponse, UsageBatch};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::{Stream, StreamExt};
@@ -43,8 +43,8 @@ struct Stats {
     batches: AtomicU64,
     records: AtomicU64,
     write_errors: AtomicU64,
-    grants: AtomicU64,
-    granted_tokens: AtomicU64,
+    syncs: AtomicU64,
+    synced_tokens: AtomicU64,
     /// Sum of the data planes' own drop counters, as last reported per node.
     dataplane_dropped: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
@@ -61,8 +61,8 @@ enum Op {
     ListKeys(Done<Vec<KeyRow>>),
     /// Advance the persisted version and build the snapshot at it.
     NextKeySnapshot(Done<KeySnapshot>),
-    Grant { req: GrantRequest, now_micros: u64, done: Done<Option<budget::Granted>> },
-    PruneGrants { now_micros: u64, done: Done<usize> },
+    SyncSpend { req: SyncRequest, now_micros: u64, done: Done<Option<budget::Synced>> },
+    PruneSpend { now_micros: u64, done: Done<usize> },
 }
 
 fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
@@ -89,11 +89,11 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
             Op::NextKeySnapshot(done) => {
                 let _ = done.send(store.bump_key_version().and_then(|v| store.key_snapshot(v)));
             }
-            Op::Grant { req, now_micros, done } => {
-                let _ = done.send(store.grant(&req.policy, &req.subject, req.budget_tokens, &req.window, req.spent, now_micros));
+            Op::SyncSpend { req, now_micros, done } => {
+                let _ = done.send(store.sync_spend(&req.policy, &req.subject, &req.window, req.spent_delta, now_micros));
             }
-            Op::PruneGrants { now_micros, done } => {
-                let _ = done.send(store.prune_grants(now_micros));
+            Op::PruneSpend { now_micros, done } => {
+                let _ = done.send(store.prune_spend(now_micros));
             }
         }
     }
@@ -162,30 +162,27 @@ impl LedgerIngest for Ingest {
     }
 }
 
-struct Grants(Arc<Shared>);
+struct Spend(Arc<Shared>);
 
 #[tonic::async_trait]
-impl Budget for Grants {
-    async fn grant(&self, request: Request<GrantRequest>) -> Result<tonic::Response<GrantResponse>, Status> {
+impl Budget for Spend {
+    async fn sync(&self, request: Request<SyncRequest>) -> Result<tonic::Response<SyncResponse>, Status> {
         let req = request.into_inner();
         if req.policy.is_empty() || req.subject.is_empty() {
             return Err(Status::invalid_argument("policy and subject are required"));
         }
         let now = now_micros();
-        let (policy, subject) = (req.policy.clone(), req.subject.clone());
-        match self.0.run(|done| Op::Grant { req, now_micros: now, done }).await {
-            Ok(Some(g)) => {
-                self.0.stats.grants.fetch_add(1, Ordering::Relaxed);
-                self.0.stats.granted_tokens.fetch_add(g.tokens, Ordering::Relaxed);
-                if g.exhausted {
-                    log::info!("budget {policy} exhausted for {subject} until {}", g.window_end_unix_micros);
-                }
-                Ok(tonic::Response::new(GrantResponse { tokens: g.tokens, window_end_unix_micros: g.window_end_unix_micros, exhausted: g.exhausted }))
+        let delta = req.spent_delta;
+        match self.0.run(|done| Op::SyncSpend { req, now_micros: now, done }).await {
+            Ok(Some(s)) => {
+                self.0.stats.syncs.fetch_add(1, Ordering::Relaxed);
+                self.0.stats.synced_tokens.fetch_add(delta, Ordering::Relaxed);
+                Ok(tonic::Response::new(SyncResponse { spent_total: s.spent_total, window_end_unix_micros: s.window_end_unix_micros }))
             }
             Ok(None) => Err(Status::invalid_argument("unknown budget window")),
             Err(e) => {
-                log::error!("grant failed: {e}");
-                Err(Status::internal("grant failed"))
+                log::error!("budget sync failed: {e}");
+                Err(Status::internal("sync failed"))
             }
         }
     }
@@ -276,8 +273,8 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> Response {
          # TYPE ledger_dataplane_dropped_total gauge\nledger_dataplane_dropped_total {}\n\
          # TYPE ledger_api_keys_live gauge\nledger_api_keys_live {}\n\
          # TYPE ledger_key_snapshot_version gauge\nledger_key_snapshot_version {}\n\
-         # TYPE ledger_grants_total counter\nledger_grants_total {}\n\
-         # TYPE ledger_granted_tokens_total counter\nledger_granted_tokens_total {}\n",
+         # TYPE ledger_budget_syncs_total counter\nledger_budget_syncs_total {}\n\
+         # TYPE ledger_budget_tokens_total counter\nledger_budget_tokens_total {}\n",
         shared.stats.batches.load(Ordering::Relaxed),
         shared.stats.records.load(Ordering::Relaxed),
         shared.stats.write_errors.load(Ordering::Relaxed),
@@ -285,8 +282,8 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> Response {
         dropped,
         live_keys,
         shared.key_version.load(Ordering::Relaxed),
-        shared.stats.grants.load(Ordering::Relaxed),
-        shared.stats.granted_tokens.load(Ordering::Relaxed),
+        shared.stats.syncs.load(Ordering::Relaxed),
+        shared.stats.synced_tokens.load(Ordering::Relaxed),
     );
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
@@ -425,7 +422,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
             tick.tick().await;
-            if let Ok(n) = sweeper.run(|done| Op::PruneGrants { now_micros: now_micros(), done }).await
+            if let Ok(n) = sweeper.run(|done| Op::PruneSpend { now_micros: now_micros(), done }).await
                 && n > 0
             {
                 log::info!("pruned {n} closed budget windows");
@@ -447,7 +444,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     builder
         .add_service(LedgerIngestServer::new(Ingest(Arc::clone(&shared))).max_decoding_message_size(16 * 1024 * 1024))
         .add_service(KeyDistributionServer::new(Keys(Arc::clone(&shared))))
-        .add_service(BudgetServer::new(Grants(shared)))
+        .add_service(BudgetServer::new(Spend(shared)))
         .serve(grpc_addr)
         .await?;
     Ok(())

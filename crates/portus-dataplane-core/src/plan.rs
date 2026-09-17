@@ -63,7 +63,7 @@ pub struct BodyNeed {
 }
 
 /// Top-level JSON keys an AI route can match on.
-pub const AI_BODY_KEYS: &[&str] = &["model", "stream"];
+pub const AI_BODY_KEYS: &[&str] = &["model", "stream", "max_tokens"];
 /// Bytes of a request body held while scanning for [`AI_BODY_KEYS`]; larger
 /// bodies are refused with 413. Anthropic and OpenAI SDKs put `model` after
 /// `messages`, so a 200k-token prompt puts it ~800 KB in.
@@ -91,6 +91,20 @@ impl Reply {
             status,
             headers: vec![(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"))],
             body: Bytes::new(),
+            keepalive: true,
+        }
+    }
+
+    /// A JSON body with its Content-Length set; `empty` pins the length to
+    /// zero, so a body assigned afterwards would never reach the client.
+    pub fn json(status: u16, body: String) -> Self {
+        Self {
+            status,
+            headers: vec![
+                (http::header::CONTENT_LENGTH, HeaderValue::from(body.len())),
+                (http::header::CONTENT_TYPE, HeaderValue::from_static("application/json")),
+            ],
+            body: Bytes::from(body),
             keepalive: true,
         }
     }
