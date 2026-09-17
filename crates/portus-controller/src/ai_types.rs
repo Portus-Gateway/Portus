@@ -7,7 +7,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::gateway_types::{HTTPHeaderMatchCRD, HTTPPathMatchCRD, ParentReference};
-use crate::policy_types::PolicyStatus;
+use crate::policy_types::{PolicyStatus, PolicyTargetRef};
 
 // ---- AIProvider ----
 
@@ -119,4 +119,40 @@ pub struct AIProviderRef {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
+}
+
+// ---- AIUsagePolicy ----
+
+/// A token budget attached to an AIRoute. The data plane enforces it with
+/// grants from the ledger; overrun is bounded by one grant per pod.
+#[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "portus-gateway.dev",
+    version = "v1alpha1",
+    kind = "AIUsagePolicy",
+    plural = "aiusagepolicies",
+    namespaced,
+    status = "PolicyStatus",
+    derive = "Default"
+)]
+pub struct AIUsagePolicySpec {
+    /// The AIRoute this budget applies to (kind `AIRoute`, same namespace).
+    #[serde(rename = "targetRef")]
+    pub target_ref: PolicyTargetRef,
+    pub budget: AIBudgetSpec,
+    /// `Open` (default) lets requests through while no allowance is held and
+    /// the ledger cannot be reached; `Closed` refuses them.
+    #[serde(rename = "onLedgerUnavailable", default, skip_serializing_if = "Option::is_none")]
+    pub on_ledger_unavailable: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AIBudgetSpec {
+    /// Tokens (input + output + cache read + cache creation) per window.
+    pub tokens: u64,
+    /// `Hourly`, `Daily` or `Monthly`, fixed windows in UTC.
+    pub window: String,
+    /// Whose counter: `Key` (default), `Tenant` or `Route`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per: Option<String>,
 }

@@ -23,7 +23,7 @@ use portus_types::proto::portus::config::v1::config_distribution_server::ConfigD
 use portus_types::*;
 use tokio::sync::watch;
 
-use crate::ai_types::{AIProvider, AIRoute};
+use crate::ai_types::{AIProvider, AIRoute, AIUsagePolicy};
 use crate::gateway_types::{GRPCRoute, Gateway, GatewayClass, HTTPRoute, ListenerSet, ReferenceGrant, TCPRoute, TLSRoute, UDPRoute};
 use crate::policy_types::{
     APIKeyAuthPolicy, BasicAuthPolicy, CORSPolicy, CircuitBreakerPolicy, ConnectionPolicy,
@@ -35,6 +35,7 @@ use crate::reconcilers::backend_tls_policy::reconcile_backend_tls_policy;
 use crate::reconcilers::configmap::{reconcile_configmap, reconcile_configmap_inner};
 use crate::reconcilers::ai_provider::reconcile_ai_provider;
 use crate::reconcilers::ai_route::reconcile_ai_route;
+use crate::reconcilers::ai_usage_policy::reconcile_ai_usage_policy;
 use crate::reconcilers::api_key_auth_policy::reconcile_api_key_auth_policy;
 use crate::reconcilers::basic_auth_policy::reconcile_basic_auth_policy;
 use crate::reconcilers::circuit_breaker_policy::reconcile_circuit_breaker_policy;
@@ -232,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let air_reader = spawn("AIRoute", route_controller::<AIRoute>(&client, &ctx.store), reconcile_ai_route, ctx.clone(), Some(gone_route(|s| &s.ai_routes, RouteKind::Ai)));
     tokio::spawn(reconcilers::ai_provider::resolve_loop(ctx.store.clone()));
+    let aiup_reader = spawn("AIUsagePolicy", policy_controller::<AIUsagePolicy>(&client, &ctx.store), reconcile_ai_usage_policy, ctx.clone(), Some(gone_policy("AIUsagePolicy", |s| &s.ai_usage_policies)));
     let grpc_reader = spawn("GRPCRoute", route_controller::<GRPCRoute>(&client, &ctx.store), reconcile_grpc_route, ctx.clone(), Some(gone_route(|s| &s.grpc_routes, RouteKind::Grpc)));
     let tls_reader = spawn("TLSRoute", route_controller::<TLSRoute>(&client, &ctx.store), reconcile_tls_route, ctx.clone(), Some(gone_route(|s| &s.tls_routes, RouteKind::Tls)));
     let tcp_reader = spawn("TCPRoute", route_controller::<TCPRoute>(&client, &ctx.store), reconcile_l4_route::<TCPRoute>, ctx.clone(), Some(gone_route(|s| &s.tcp_routes, RouteKind::Tcp)));
@@ -365,6 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             timeout_policies: tp_reader,
             ai_providers: aip_reader,
             ai_routes: air_reader,
+            ai_usage_policies: aiup_reader,
             secrets: secret_reader,
             config_maps: cm_reader,
             gateway_classes: gc_reader,
@@ -549,6 +552,7 @@ struct PruneReaders {
     timeout_policies: kube::runtime::reflector::Store<TimeoutPolicy>,
     ai_providers: kube::runtime::reflector::Store<AIProvider>,
     ai_routes: kube::runtime::reflector::Store<AIRoute>,
+    ai_usage_policies: kube::runtime::reflector::Store<AIUsagePolicy>,
     secrets: kube::runtime::reflector::Store<Secret>,
     config_maps: kube::runtime::reflector::Store<k8s_openapi::api::core::v1::ConfigMap>,
     gateway_classes: kube::runtime::reflector::Store<GatewayClass>,
@@ -612,6 +616,7 @@ impl PruneReaders {
         self.timeout_policies.wait_until_ready().await?;
         self.ai_providers.wait_until_ready().await?;
         self.ai_routes.wait_until_ready().await?;
+        self.ai_usage_policies.wait_until_ready().await?;
         self.secrets.wait_until_ready().await?;
         self.config_maps.wait_until_ready().await?;
         self.gateway_classes.wait_until_ready().await?;
@@ -643,6 +648,7 @@ impl PruneReaders {
         pruned += prune_map(&store.timeout_policies, &live_names(&self.timeout_policies), "TimeoutPolicy");
         pruned += prune_map(&store.ai_providers, &live_names(&self.ai_providers), "AIProvider");
         pruned += prune_map(&store.ai_routes, &live_names(&self.ai_routes), "AIRoute");
+        pruned += prune_map(&store.ai_usage_policies, &live_names(&self.ai_usage_policies), "AIUsagePolicy");
         // Secrets/ConfigMaps deleted from Kubernetes must not linger in memory.
         pruned += prune_map(&store.secrets, &live_names(&self.secrets), "Secret");
         pruned += prune_map(&store.config_maps, &live_names(&self.config_maps), "ConfigMap");

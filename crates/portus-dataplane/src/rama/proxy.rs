@@ -39,6 +39,7 @@ use portus_dataplane_core::types::BackendProtocol;
 use super::body::scan_body;
 use super::client::{Upstream, UpstreamTarget};
 use super::usage::{observe, RequestSide};
+use portus_dataplane_core::ai::budget::{exhausted_reply, now_micros, Scope, Verdict};
 use portus_dataplane_core::ai::keys::{authorize, Refusal};
 use portus_dataplane_core::ai::ledger::LedgerReporter;
 use super::tls::{client_auth_for, upstream_tls_for};
@@ -242,14 +243,18 @@ impl ProxyService {
         // snapshot. The client's credential never reaches the provider; the
         // route's mutations set the provider's own.
         let mut key_id = 0;
+        let mut tenant: Option<Arc<str>> = None;
+        let model = body_fields.as_ref().and_then(|f| f.iter().find(|(k, _)| *k == "model")).map(|(_, v)| v.as_str());
         if let Some(ai) = plan.ai.as_ref().filter(|ai| ai.key_required) {
-            let model = body_fields.as_ref().and_then(|f| f.iter().find(|(k, _)| *k == "model")).map(|(_, v)| v.as_str());
             let verdict = match self.ledger.as_ref() {
-                Some(ledger) => authorize(&ledger.keys.load(), &Headers(req.headers()), model),
+                Some(ledger) => authorize(&ledger.keys.load(), &Headers(req.headers()), model).map(|k| (k.id, Arc::clone(&k.tenant))),
                 None => Err(Refusal::Unauthenticated),
             };
             match verdict {
-                Ok(id) => key_id = id,
+                Ok((id, t)) => {
+                    key_id = id;
+                    tenant = Some(t);
+                }
                 Err(refusal) => {
                     let reply = refusal.reply(ai.dialect, model);
                     let status = reply.status;
@@ -263,11 +268,52 @@ impl ProxyService {
             req.headers_mut().remove("x-api-key");
             req.headers_mut().remove("authorization");
         }
+        // Token budget: two atomics against the subject's local allowance;
+        // the ledger is asked for the next grant in the background.
+        let mut allowance = None;
+        if let (Some(ai), Some(budget)) = (plan.ai.as_ref(), plan.ai.as_ref().and_then(|ai| ai.budget.as_ref())) {
+            let subject: Arc<str> = match budget.per {
+                Scope::Key if key_id != 0 => Arc::from(key_id.to_string()),
+                Scope::Key => Arc::from("anonymous"),
+                Scope::Tenant => tenant.clone().unwrap_or_else(|| Arc::from("anonymous")),
+                Scope::Route => Arc::from("route"),
+            };
+            let (verdict, held) = match self.ledger.as_ref() {
+                Some(ledger) => {
+                    let (mut v, a) = ledger.budgets.check(budget, &subject, now_micros());
+                    if v == Verdict::Unknown {
+                        // A subject this pod has never seen in this window:
+                        // give the ledger one bounded chance to answer before
+                        // the fail-open/closed knob decides.
+                        a.wait_for_grant(Duration::from_millis(250)).await;
+                        v = ledger.budgets.check(budget, &subject, now_micros()).0;
+                    }
+                    (v, Some(a))
+                }
+                None => (Verdict::Unknown, None),
+            };
+            let refuse = match verdict {
+                Verdict::Allow => None,
+                Verdict::Exhausted { retry_after_secs } => Some(retry_after_secs),
+                Verdict::Unknown if budget.fail_open => None,
+                Verdict::Unknown => Some(1),
+            };
+            if let Some(retry) = refuse {
+                let reply = exhausted_reply(ai.dialect, retry);
+                let status = reply.status;
+                self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
+                if let Some((method, path)) = &logged {
+                    access_log(peer_ip, method, path, plan.service_name.as_ref(), status, start);
+                }
+                return reply_response(reply);
+            }
+            allowance = held;
+        }
         let mut response = self.forward(req, &plan, peer_ip, authority).await;
 
         let status = response.status().as_u16();
         if let (Some(ai), Some(ledger)) = (plan.ai.as_ref(), self.ledger.as_ref()) {
-            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id };
+            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, allowance };
             let body = std::mem::replace(response.body_mut(), Body::empty());
             *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring));
         }

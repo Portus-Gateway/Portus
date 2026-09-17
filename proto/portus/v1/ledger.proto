@@ -42,6 +42,31 @@ message ReportAck {
   uint64 accepted = 1;
 }
 
+// Token budgets. A data plane never decides a budget on its own: it spends
+// from grants the ledger hands out for one subject in one window, asking for
+// the next one before the current runs dry. The ledger stops granting when
+// the window's budget is out.
+service Budget {
+  rpc Grant(GrantRequest) returns (GrantResponse);
+}
+
+message GrantRequest {
+  string node = 1;
+  string policy = 2;          // namespace/name of the AIUsagePolicy
+  string subject = 3;         // key id, tenant or "route", per the policy
+  uint64 budget_tokens = 4;   // the policy's budget, so the ledger needs no CRD access
+  string window = 5;          // HOURLY | DAILY | MONTHLY
+  // Tokens the data plane spent from its previous grant, for accounting.
+  uint64 spent = 6;
+}
+
+message GrantResponse {
+  // Tokens the data plane may spend before asking again; 0 when exhausted.
+  uint64 tokens = 1;
+  uint64 window_end_unix_micros = 2;
+  bool exhausted = 3;
+}
+
 // API keys, pushed from the ledger to every data plane as whole snapshots.
 // The data plane only ever sees hashes; the ledger keeps hashes too. A key's
 // plaintext exists once, in the response that issued it.

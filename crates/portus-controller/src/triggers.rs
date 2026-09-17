@@ -118,6 +118,13 @@ impl RouteRefs for HTTPRoute {
     }
 }
 
+impl PolicyRefs for crate::ai_types::AIUsagePolicy {
+    const KIND: &'static str = "AIUsagePolicy";
+    fn target_ref(&self) -> &PolicyTargetRef {
+        &self.spec.target_ref
+    }
+}
+
 impl RouteRefs for crate::ai_types::AIRoute {
     fn parent_refs(&self) -> &[ParentReference] {
         &self.spec.parent_refs

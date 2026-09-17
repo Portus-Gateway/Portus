@@ -859,9 +859,33 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         .filter(|e| e.value().require_api_key)
         .map(|e| (e.key().namespace.clone(), format!("airoute/{}", e.key().name)))
         .collect();
+    // AIUsagePolicy budgets: one accepted policy per AIRoute, attached to
+    // every RouteConfig synthesized from it.
+    let budgets: HashMap<(String, String), portus_types::AiBudget> = store
+        .ai_usage_policies
+        .iter()
+        .filter(|e| e.value().accepted && e.value().target.kind == "AIRoute")
+        .map(|e| {
+            let p = e.value();
+            (
+                (p.target.namespace.clone(), format!("airoute/{}", p.target.name)),
+                portus_types::AiBudget {
+                    policy: format!("{}/{}", e.key().namespace, e.key().name),
+                    tokens: p.tokens,
+                    window: p.window.clone(),
+                    per: p.per.clone(),
+                    fail_open: p.fail_open,
+                },
+            )
+        })
+        .collect();
     for (route, source) in routes.iter_mut().zip(route_sources.iter()) {
-        if key_required.contains(&(source.namespace.clone(), source.name.clone())) {
+        let key = (source.namespace.clone(), source.name.clone());
+        if key_required.contains(&key) {
             route.ai_key_required = true;
+        }
+        if let Some(b) = budgets.get(&key) {
+            route.ai_budget = Some(b.clone());
         }
     }
 
@@ -2334,10 +2358,26 @@ mod tests {
             },
         );
 
+        store.ai_usage_policies.insert(
+            NamespacedName { namespace: "default".into(), name: "cap".into() },
+            crate::store::AIUsagePolicyState {
+                target: crate::store::PolicyTargetKey { group: "portus-gateway.dev".into(), kind: "AIRoute".into(), namespace: "default".into(), name: "claude".into(), section_name: None },
+                tokens: 1_000_000,
+                window: "DAILY".into(),
+                per: "KEY".into(),
+                fail_open: false,
+                generation: 1,
+                creation_timestamp: None,
+                accepted: true,
+            },
+        );
+
         let config = compile_config(&store);
         assert_eq!(config.routes.len(), 1);
         let route = &config.routes[0];
         assert!(route.ai_key_required);
+        let budget = route.ai_budget.as_ref().expect("budget attached");
+        assert_eq!((budget.policy.as_str(), budget.tokens, budget.window.as_str(), budget.per.as_str(), budget.fail_open), ("default/cap", 1_000_000, "DAILY", "KEY", false));
         assert_eq!(route.host, "llm.example.com");
         assert_eq!(route.service_name, "aiprovider/default/anthropic");
         assert_eq!(route.port, 443);

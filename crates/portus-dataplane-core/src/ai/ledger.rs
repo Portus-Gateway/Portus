@@ -16,6 +16,7 @@ use portus_types::proto::portus::ledger::v1::key_distribution_client::KeyDistrib
 use portus_types::proto::portus::ledger::v1::ledger_ingest_client::LedgerIngestClient;
 use portus_types::proto::portus::ledger::v1::{KeyWatchRequest, UsageBatch, UsageRecord as WireRecord};
 
+use super::budget::Budgets;
 use super::keys::KeySet;
 use super::usage::{UsageRecord, UsageRing};
 
@@ -47,6 +48,8 @@ pub struct LedgerReporter {
     /// Replaced whole on every snapshot; empty until the first arrives, so
     /// key-requiring routes fail closed while the ledger is unreachable.
     pub keys: Arc<ArcSwap<KeySet>>,
+    /// Token allowances per policy and subject, refilled by ledger grants.
+    pub budgets: Arc<Budgets>,
 }
 
 impl LedgerReporter {
@@ -58,12 +61,13 @@ impl LedgerReporter {
     }
 
     pub fn start(addr: String) -> Arc<Self> {
+        let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
         let reporter = Arc::new(Self {
             ring: Arc::new(UsageRing::new(RING_CAPACITY)),
             stats: Arc::new(LedgerStats::default()),
             keys: Arc::new(ArcSwap::from_pointee(KeySet::default())),
+            budgets: Budgets::start(addr.clone(), node.clone()),
         });
-        let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
         tokio::spawn(drain_loop(addr.clone(), node.clone(), Arc::clone(&reporter.ring), Arc::clone(&reporter.stats)));
         tokio::spawn(watch_keys_loop(addr, node, Arc::clone(&reporter.keys)));
         log::info!("usage records are reported to the ledger at {}", reporter_addr_for_log());
@@ -183,11 +187,16 @@ async fn watch_keys_loop(addr: String, node: String, keys: Arc<ArcSwap<KeySet>>)
             Ok(response) => {
                 backoff = Duration::from_secs(1);
                 let mut inbound = response.into_inner();
+                // The first message of a stream is the ledger's current truth,
+                // whatever version number it carries (the ledger may have
+                // restarted); later messages must move forward.
+                let mut first = true;
                 loop {
                     match inbound.message().await {
                         Ok(Some(snapshot)) => {
                             let current = keys.load();
-                            if snapshot.version > current.version || current.is_empty() {
+                            if first || snapshot.version > current.version || current.is_empty() {
+                                first = false;
                                 let set = KeySet::from_snapshot(&snapshot);
                                 log::info!("API key snapshot v{} applied: {} keys", set.version, set.len());
                                 keys.store(Arc::new(set));

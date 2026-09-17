@@ -12,6 +12,7 @@ use rama::error::BoxError;
 use rama::http::body::{Frame, SizeHint};
 use rama::http::{Body, StreamingBody};
 
+use portus_dataplane_core::ai::budget::Allowance;
 use portus_dataplane_core::ai::usage::{UsageRecord, UsageRing, UsageTracker};
 use portus_dataplane_core::router::{AiBackend, BodyFields};
 
@@ -24,6 +25,8 @@ pub struct RequestSide<'a> {
     pub start: Instant,
     /// The Portus API key that authenticated the request; 0 when none.
     pub key_id: u64,
+    /// The budget allowance to debit with the response's tokens.
+    pub allowance: Option<Arc<Allowance>>,
 }
 
 /// Wrap `body` so its usage is recorded into `ring` when it completes.
@@ -53,6 +56,7 @@ pub fn observe(body: Body, status: u16, req: RequestSide<'_>, ring: Arc<UsageRin
         record,
         start: req.start,
         ring,
+        allowance: req.allowance,
     })
 }
 
@@ -62,6 +66,7 @@ struct Observed {
     record: UsageRecord,
     start: Instant,
     ring: Arc<UsageRing>,
+    allowance: Option<Arc<Allowance>>,
 }
 
 impl Observed {
@@ -71,6 +76,9 @@ impl Observed {
         let mut record = self.record.clone();
         record.duration_micros = self.start.elapsed().as_micros() as u64;
         record.tokens = usage.tokens;
+        if let (Some(allowance), Some(tokens)) = (&self.allowance, &usage.tokens) {
+            allowance.debit(tokens);
+        }
         if let Some(m) = usage.model {
             record.served_model = UsageRecord::name(&m);
         }
@@ -122,13 +130,13 @@ mod tests {
     use rama::http::body::util::{BodyExt, Full};
 
     fn side<'a>(ai: &'a AiBackend, fields: &'a BodyFields) -> RequestSide<'a> {
-        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9 }
+        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, allowance: None }
     }
 
     #[tokio::test]
     async fn a_consumed_anthropic_response_produces_one_record_with_tokens() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true };
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None };
         let fields: BodyFields = vec![("model", "claude-opus-5".into())];
         let body = Body::new(Full::new(Bytes::from_static(
             br#"{"id":"m","model":"claude-opus-5-served","usage":{"input_tokens":10,"output_tokens":4}}"#,
@@ -149,7 +157,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_stream_is_still_recorded_once() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false };
+        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false, budget: None };
         let fields: BodyFields = vec![("model", "gpt-5".into()), ("stream", "true".into())];
         let body = Body::new(Full::new(Bytes::from_static(b"data: {\"model\":\"gpt-5\",\"usage\":null}\n\n")));
         let mut observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring));

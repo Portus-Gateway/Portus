@@ -110,12 +110,12 @@ impl Refusal {
     }
 }
 
-/// Check a request against the key set. `Ok(id)` is the key to charge.
-pub fn authorize(
-    keys: &KeySet,
+/// Check a request against the key set. `Ok` is the key to charge.
+pub fn authorize<'k>(
+    keys: &'k KeySet,
     headers: &(impl RequestHeaders + ?Sized),
     model: Option<&str>,
-) -> Result<u64, Refusal> {
+) -> Result<&'k KeyInfo, Refusal> {
     let presented = presented_key(headers).ok_or(Refusal::Unauthenticated)?;
     let info = keys.lookup(presented).ok_or(Refusal::Unauthenticated)?;
     if !info.allowed_models.is_empty() {
@@ -124,7 +124,7 @@ pub fn authorize(
             return Err(Refusal::ModelNotAllowed);
         }
     }
-    Ok(info.id)
+    Ok(info)
 }
 
 #[cfg(test)]
@@ -181,14 +181,16 @@ mod tests {
     #[test]
     fn authorize_charges_the_key_and_enforces_its_model_list() {
         let set = KeySet::from_snapshot(&snapshot());
-        assert_eq!(authorize(&set, &headers(&[("x-api-key", "portus_sk_any")]), Some("claude-opus-5")), Ok(1));
-        assert_eq!(authorize(&set, &headers(&[("x-api-key", "portus_sk_any")]), None), Ok(1), "no model list: any model, even unknown");
-        assert_eq!(authorize(&set, &headers(&[("authorization", "Bearer portus_sk_haiku")]), Some("claude-haiku-4-5")), Ok(2));
-        assert_eq!(authorize(&set, &headers(&[("x-api-key", "portus_sk_haiku")]), Some("claude-opus-5")), Err(Refusal::ModelNotAllowed));
-        assert_eq!(authorize(&set, &headers(&[("x-api-key", "portus_sk_haiku")]), None), Err(Refusal::ModelNotAllowed));
-        assert_eq!(authorize(&set, &headers(&[("x-api-key", "portus_sk_stolen")]), Some("claude-opus-5")), Err(Refusal::Unauthenticated));
-        assert_eq!(authorize(&set, &headers(&[]), Some("claude-opus-5")), Err(Refusal::Unauthenticated));
-        assert_eq!(authorize(&KeySet::default(), &headers(&[("x-api-key", "portus_sk_any")]), None), Err(Refusal::Unauthenticated), "no snapshot yet: fail closed");
+        let id = |r: Result<&KeyInfo, Refusal>| r.map(|k| k.id);
+        assert_eq!(id(authorize(&set, &headers(&[("x-api-key", "portus_sk_any")]), Some("claude-opus-5"))), Ok(1));
+        assert_eq!(id(authorize(&set, &headers(&[("x-api-key", "portus_sk_any")]), None)), Ok(1), "no model list: any model, even unknown");
+        assert_eq!(id(authorize(&set, &headers(&[("authorization", "Bearer portus_sk_haiku")]), Some("claude-haiku-4-5"))), Ok(2));
+        assert_eq!(authorize(&set, &headers(&[("x-api-key", "portus_sk_haiku")]), Some("claude-haiku-4-5")).map(|k| k.tenant.as_ref()), Ok("team-b"));
+        assert_eq!(id(authorize(&set, &headers(&[("x-api-key", "portus_sk_haiku")]), Some("claude-opus-5"))), Err(Refusal::ModelNotAllowed));
+        assert_eq!(id(authorize(&set, &headers(&[("x-api-key", "portus_sk_haiku")]), None)), Err(Refusal::ModelNotAllowed));
+        assert_eq!(id(authorize(&set, &headers(&[("x-api-key", "portus_sk_stolen")]), Some("claude-opus-5"))), Err(Refusal::Unauthenticated));
+        assert_eq!(id(authorize(&set, &headers(&[]), Some("claude-opus-5"))), Err(Refusal::Unauthenticated));
+        assert_eq!(id(authorize(&KeySet::default(), &headers(&[("x-api-key", "portus_sk_any")]), None)), Err(Refusal::Unauthenticated), "no snapshot yet: fail closed");
     }
 
     #[test]

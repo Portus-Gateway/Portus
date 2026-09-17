@@ -37,6 +37,7 @@ pub struct ConfigStore {
     /// AI gateway: LLM providers and the routes that pick between them.
     pub ai_providers: DashMap<NamespacedName, AIProviderState>,
     pub ai_routes: DashMap<NamespacedName, AIRouteState>,
+    pub ai_usage_policies: DashMap<NamespacedName, AIUsagePolicyState>,
     pub secrets: DashMap<NamespacedName, SecretState>,
     /// ConfigMap data, keyed by namespace/name. Used by BackendTLSPolicy and
     /// Gateway frontend validation to resolve CA certificate references.
@@ -187,6 +188,7 @@ impl ConfigStore {
             backend_tls_policies: DashMap::new(),
             ai_providers: DashMap::new(),
             ai_routes: DashMap::new(),
+            ai_usage_policies: DashMap::new(),
             secrets: DashMap::new(),
             config_maps: DashMap::new(),
             gateway_tls: DashMap::new(),
@@ -559,6 +561,21 @@ pub struct AIRouteState {
     pub rules: Vec<AIRouteRuleState>,
     pub require_api_key: bool,
     pub generation: i64,
+}
+
+/// An `AIUsagePolicy`: a token budget on an AIRoute.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AIUsagePolicyState {
+    pub target: PolicyTargetKey,
+    pub tokens: u64,
+    /// HOURLY | DAILY | MONTHLY
+    pub window: String,
+    /// KEY | TENANT | ROUTE
+    pub per: String,
+    pub fail_open: bool,
+    pub generation: i64,
+    pub creation_timestamp: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
+    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1085,6 +1102,7 @@ impl_policy_state!(HealthCheckPolicyState);
 impl_policy_state!(CORSPolicyState);
 impl_policy_state!(TimeoutPolicyState);
 impl_policy_state!(BackendTLSPolicyState);
+impl_policy_state!(AIUsagePolicyState);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecretState {

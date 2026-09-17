@@ -165,6 +165,8 @@ message RouteConfig {
   // Requests must carry a Portus API key the ledger issued (validated
   // locally against the key snapshot the ledger pushes).
   bool ai_key_required = 38;
+  // Token budget from an AIUsagePolicy targeting the route.
+  optional AiBudget ai_budget = 39;
 
   // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
   // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.
@@ -236,6 +238,19 @@ message SubjectAltName {
 message BackendEndpoint {
   string address = 1;
   uint32 port = 2;
+}
+
+// AI gateway: a token budget the data plane enforces with grants from the
+// ledger. `window` is HOURLY | DAILY | MONTHLY (fixed, UTC); `per` is
+// KEY | TENANT | ROUTE, the subject each counter belongs to.
+message AiBudget {
+  string policy = 1;        // namespace/name of the AIUsagePolicy
+  uint64 tokens = 2;
+  string window = 3;
+  string per = 4;
+  // When the ledger cannot be reached and no allowance is held: let the
+  // request through (true) or refuse it (false).
+  bool fail_open = 5;
 }
 
 // Phase 7: Gateway API Core matching types

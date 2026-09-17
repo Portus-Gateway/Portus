@@ -1,0 +1,97 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: aiusagepolicies.portus-gateway.dev
+  labels:
+    gateway.networking.k8s.io/policy: direct
+spec:
+  group: portus-gateway.dev
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Target
+          type: string
+          jsonPath: .spec.targetRef.name
+        - name: Tokens
+          type: integer
+          jsonPath: .spec.budget.tokens
+        - name: Window
+          type: string
+          jsonPath: .spec.budget.window
+        - name: Per
+          type: string
+          jsonPath: .spec.budget.per
+        - name: Accepted
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [targetRef, budget]
+              properties:
+                targetRef:
+                  type: object
+                  required: [group, kind, name]
+                  properties:
+                    group:
+                      type: string
+                    kind:
+                      type: string
+                      enum: [AIRoute]
+                    name:
+                      type: string
+                    sectionName:
+                      type: string
+                budget:
+                  type: object
+                  required: [tokens, window]
+                  properties:
+                    tokens:
+                      type: integer
+                      minimum: 1
+                      description: "Tokens per window: input + output + cache read + cache creation"
+                    window:
+                      type: string
+                      enum: [Hourly, Daily, Monthly]
+                    per:
+                      type: string
+                      enum: [Key, Tenant, Route]
+                      description: "Whose counter the request spends from; default Key"
+                onLedgerUnavailable:
+                  type: string
+                  enum: [Open, Closed]
+                  description: "With no allowance held and the ledger unreachable: Open lets requests through (default), Closed refuses them"
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+  scope: Namespaced
+  names:
+    plural: aiusagepolicies
+    singular: aiusagepolicy
+    kind: AIUsagePolicy
+    shortNames: [aiup]

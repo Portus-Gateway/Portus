@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use portus_types::proto::portus::ledger::v1::{KeySnapshot, UsageRecord};
 
+use crate::budget::{self, Granted};
 use crate::keys::{self, KeyRow};
 
 pub struct Store {
@@ -66,6 +67,10 @@ CREATE TABLE IF NOT EXISTS usage (
 );
 CREATE INDEX IF NOT EXISTS usage_ts ON usage (ts_unix_micros);
 CREATE INDEX IF NOT EXISTS usage_key_ts ON usage (key_id, ts_unix_micros);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+);
 ";
 
 impl Store {
@@ -86,7 +91,34 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         conn.execute_batch(keys::SCHEMA)?;
+        conn.execute_batch(budget::SCHEMA)?;
         Ok(Self { conn })
+    }
+
+    /// The next budget slice for a subject; `None` for an unknown window.
+    pub fn grant(&self, policy: &str, subject: &str, budget_tokens: u64, window: &str, spent: u64, now_micros: u64) -> rusqlite::Result<Option<Granted>> {
+        budget::grant(&self.conn, policy, subject, budget_tokens, window, spent, now_micros)
+    }
+
+    pub fn prune_grants(&self, now_micros: u64) -> rusqlite::Result<usize> {
+        budget::prune(&self.conn, now_micros)
+    }
+
+    /// The key snapshot version last published; survives restarts so data
+    /// planes never see the counter go backwards.
+    pub fn key_version(&self) -> rusqlite::Result<u64> {
+        let v: Option<i64> = self.conn.query_row("SELECT value FROM meta WHERE key = 'key_version'", [], |r| r.get(0)).optional()?;
+        Ok(v.unwrap_or(1) as u64)
+    }
+
+    /// Advance and persist the key snapshot version.
+    pub fn bump_key_version(&self) -> rusqlite::Result<u64> {
+        let next = self.key_version()? + 1;
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('key_version', ?1) ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![next as i64],
+        )?;
+        Ok(next)
     }
 
     pub fn issue_key(&self, tenant: &str, name: &str, models: &[String], plaintext: Option<&str>) -> rusqlite::Result<(KeyRow, String)> {
@@ -230,6 +262,23 @@ mod tests {
         assert_eq!(store.export(0, 1).unwrap().len(), 1);
         let line = serde_json::to_string(&all[2]).unwrap();
         assert!(line.contains("\"requested_model\":\"claude-opus-5\""), "{line}");
+    }
+
+    #[test]
+    fn the_key_version_survives_reopening_the_store() {
+        let dir = std::env::temp_dir().join(format!("portus-ledger-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.db");
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.key_version().unwrap(), 1);
+            assert_eq!(store.bump_key_version().unwrap(), 2);
+            assert_eq!(store.bump_key_version().unwrap(), 3);
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.key_version().unwrap(), 3, "a restart continues the count");
+        assert_eq!(store.bump_key_version().unwrap(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -653,6 +653,7 @@ pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::Com
                     ai_dialect: String::new(),
                     ai_provider: String::new(),
                     ai_key_required: false,
+                    ai_budget: None,
                 });
             }
         }

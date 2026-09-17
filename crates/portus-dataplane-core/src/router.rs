@@ -265,6 +265,8 @@ pub struct AiBackend {
     pub provider: Arc<str>,
     /// Requests must present a valid Portus API key.
     pub key_required: bool,
+    /// Token budget from an AIUsagePolicy, enforced with ledger grants.
+    pub budget: Option<crate::ai::budget::BudgetPolicy>,
 }
 
 impl PathRoute {

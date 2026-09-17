@@ -12,6 +12,7 @@
 //! - `GRPC_TLS_CERT`, `GRPC_TLS_KEY`: serve TLS; with `GRPC_TLS_CA` require
 //!   client certificates (the data planes present the config-stream cert).
 
+mod budget;
 mod keys;
 mod store;
 
@@ -25,9 +26,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use portus_types::proto::portus::ledger::v1::budget_server::{Budget, BudgetServer};
 use portus_types::proto::portus::ledger::v1::key_distribution_server::{KeyDistribution, KeyDistributionServer};
 use portus_types::proto::portus::ledger::v1::ledger_ingest_server::{LedgerIngest, LedgerIngestServer};
-use portus_types::proto::portus::ledger::v1::{KeySnapshot, KeyWatchRequest, ReportAck, UsageBatch};
+use portus_types::proto::portus::ledger::v1::{GrantRequest, GrantResponse, KeySnapshot, KeyWatchRequest, ReportAck, UsageBatch};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::{Stream, StreamExt};
@@ -41,6 +43,8 @@ struct Stats {
     batches: AtomicU64,
     records: AtomicU64,
     write_errors: AtomicU64,
+    grants: AtomicU64,
+    granted_tokens: AtomicU64,
     /// Sum of the data planes' own drop counters, as last reported per node.
     dataplane_dropped: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
@@ -55,7 +59,10 @@ enum Op {
     IssueKey { tenant: String, name: String, models: Vec<String>, plaintext: Option<String>, done: Done<(KeyRow, String)> },
     RevokeKey { id: u64, done: Done<bool> },
     ListKeys(Done<Vec<KeyRow>>),
-    KeySnapshot { version: u64, done: Done<KeySnapshot> },
+    /// Advance the persisted version and build the snapshot at it.
+    NextKeySnapshot(Done<KeySnapshot>),
+    Grant { req: GrantRequest, now_micros: u64, done: Done<Option<budget::Granted>> },
+    PruneGrants { now_micros: u64, done: Done<usize> },
 }
 
 fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
@@ -79,8 +86,14 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
             Op::ListKeys(done) => {
                 let _ = done.send(store.list_keys());
             }
-            Op::KeySnapshot { version, done } => {
-                let _ = done.send(store.key_snapshot(version));
+            Op::NextKeySnapshot(done) => {
+                let _ = done.send(store.bump_key_version().and_then(|v| store.key_snapshot(v)));
+            }
+            Op::Grant { req, now_micros, done } => {
+                let _ = done.send(store.grant(&req.policy, &req.subject, req.budget_tokens, &req.window, req.spent, now_micros));
+            }
+            Op::PruneGrants { now_micros, done } => {
+                let _ = done.send(store.prune_grants(now_micros));
             }
         }
     }
@@ -107,11 +120,13 @@ impl Shared {
         }
     }
 
-    /// Rebuild and publish the key snapshot after a change.
+    /// Rebuild and publish the key snapshot after a change. The version is
+    /// persisted by the store, so a restarted ledger never republishes a
+    /// number a data plane has already seen.
     async fn publish_keys(&self) -> Result<(), String> {
-        let version = self.key_version.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot = self.run(|done| Op::KeySnapshot { version, done }).await?;
-        log::info!("key snapshot v{version}: {} live keys", snapshot.keys.len());
+        let snapshot = self.run(Op::NextKeySnapshot).await?;
+        self.key_version.store(snapshot.version, Ordering::Relaxed);
+        log::info!("key snapshot v{}: {} live keys", snapshot.version, snapshot.keys.len());
         // send_replace, not send: `send` leaves the value untouched when no
         // data plane is connected, and the next one to connect would get a
         // stale snapshot.
@@ -145,6 +160,39 @@ impl LedgerIngest for Ingest {
             }
         }
     }
+}
+
+struct Grants(Arc<Shared>);
+
+#[tonic::async_trait]
+impl Budget for Grants {
+    async fn grant(&self, request: Request<GrantRequest>) -> Result<tonic::Response<GrantResponse>, Status> {
+        let req = request.into_inner();
+        if req.policy.is_empty() || req.subject.is_empty() {
+            return Err(Status::invalid_argument("policy and subject are required"));
+        }
+        let now = now_micros();
+        let (policy, subject) = (req.policy.clone(), req.subject.clone());
+        match self.0.run(|done| Op::Grant { req, now_micros: now, done }).await {
+            Ok(Some(g)) => {
+                self.0.stats.grants.fetch_add(1, Ordering::Relaxed);
+                self.0.stats.granted_tokens.fetch_add(g.tokens, Ordering::Relaxed);
+                if g.exhausted {
+                    log::info!("budget {policy} exhausted for {subject} until {}", g.window_end_unix_micros);
+                }
+                Ok(tonic::Response::new(GrantResponse { tokens: g.tokens, window_end_unix_micros: g.window_end_unix_micros, exhausted: g.exhausted }))
+            }
+            Ok(None) => Err(Status::invalid_argument("unknown budget window")),
+            Err(e) => {
+                log::error!("grant failed: {e}");
+                Err(Status::internal("grant failed"))
+            }
+        }
+    }
+}
+
+fn now_micros() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
 }
 
 struct Keys(Arc<Shared>);
@@ -227,7 +275,9 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> Response {
          # TYPE ledger_records_stored gauge\nledger_records_stored {}\n\
          # TYPE ledger_dataplane_dropped_total gauge\nledger_dataplane_dropped_total {}\n\
          # TYPE ledger_api_keys_live gauge\nledger_api_keys_live {}\n\
-         # TYPE ledger_key_snapshot_version gauge\nledger_key_snapshot_version {}\n",
+         # TYPE ledger_key_snapshot_version gauge\nledger_key_snapshot_version {}\n\
+         # TYPE ledger_grants_total counter\nledger_grants_total {}\n\
+         # TYPE ledger_granted_tokens_total counter\nledger_granted_tokens_total {}\n",
         shared.stats.batches.load(Ordering::Relaxed),
         shared.stats.records.load(Ordering::Relaxed),
         shared.stats.write_errors.load(Ordering::Relaxed),
@@ -235,6 +285,8 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> Response {
         dropped,
         live_keys,
         shared.key_version.load(Ordering::Relaxed),
+        shared.stats.grants.load(Ordering::Relaxed),
+        shared.stats.granted_tokens.load(Ordering::Relaxed),
     );
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
@@ -352,13 +404,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::create_dir_all(dir)?;
     }
     let store = Store::open(&db_path)?;
-    let initial = store.key_snapshot(1)?;
-    log::info!("ledger store at {} ({} live API keys)", db_path.display(), initial.keys.len());
+    let initial = store.key_snapshot(store.key_version()?)?;
+    log::info!("ledger store at {} ({} live API keys, key snapshot v{})", db_path.display(), initial.keys.len(), initial.version);
 
     let (ops_tx, ops_rx) = mpsc::channel::<Op>(1024);
     std::thread::Builder::new().name("ledger-storage".into()).spawn(move || storage_thread(store, ops_rx))?;
     let (keys_tx, _keys_rx) = watch::channel(Arc::new(initial));
-    let shared = Arc::new(Shared { ops: ops_tx, stats: Stats::default(), keys: keys_tx, key_version: AtomicU64::new(1), admin_token });
+    let initial_version = keys_tx.borrow().version;
+    let shared = Arc::new(Shared { ops: ops_tx, stats: Stats::default(), keys: keys_tx, key_version: AtomicU64::new(initial_version), admin_token });
     if shared.admin_token.is_none() {
         log::warn!("LEDGER_ADMIN_TOKEN is not set; the key admin API is disabled");
     }
@@ -366,6 +419,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&http_addr).await?;
     log::info!("ledger HTTP endpoint listening on {http_addr}");
     tokio::spawn(axum::serve(listener, router(Arc::clone(&shared))).into_future());
+    // Closed budget windows are dead weight; sweep them hourly.
+    let sweeper = Arc::clone(&shared);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+        loop {
+            tick.tick().await;
+            if let Ok(n) = sweeper.run(|done| Op::PruneGrants { now_micros: now_micros(), done }).await
+                && n > 0
+            {
+                log::info!("pruned {n} closed budget windows");
+            }
+        }
+    });
 
     let mut builder = tonic::transport::Server::builder()
         .http2_keepalive_interval(Some(std::time::Duration::from_secs(15)))
@@ -380,7 +446,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("ledger gRPC listening on {grpc_addr}");
     builder
         .add_service(LedgerIngestServer::new(Ingest(Arc::clone(&shared))).max_decoding_message_size(16 * 1024 * 1024))
-        .add_service(KeyDistributionServer::new(Keys(shared)))
+        .add_service(KeyDistributionServer::new(Keys(Arc::clone(&shared))))
+        .add_service(BudgetServer::new(Grants(shared)))
         .serve(grpc_addr)
         .await?;
     Ok(())
@@ -395,7 +462,7 @@ mod tests {
 
     async fn app() -> (Router, Arc<Shared>) {
         let store = Store::in_memory().unwrap();
-        let initial = store.key_snapshot(1).unwrap();
+        let initial = store.key_snapshot(store.key_version().unwrap()).unwrap();
         let (ops_tx, ops_rx) = mpsc::channel::<Op>(64);
         std::thread::spawn(move || storage_thread(store, ops_rx));
         let (keys_tx, _rx) = watch::channel(Arc::new(initial));
