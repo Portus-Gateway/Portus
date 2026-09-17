@@ -41,3 +41,30 @@ message UsageRecord {
 message ReportAck {
   uint64 accepted = 1;
 }
+
+// API keys, pushed from the ledger to every data plane as whole snapshots.
+// The data plane only ever sees hashes; the ledger keeps hashes too. A key's
+// plaintext exists once, in the response that issued it.
+service KeyDistribution {
+  rpc WatchKeys(KeyWatchRequest) returns (stream KeySnapshot);
+}
+
+message KeyWatchRequest {
+  string node = 1;
+}
+
+message KeySnapshot {
+  // Monotonic per ledger process; a data plane applies a snapshot only when
+  // its version is higher than what it holds.
+  uint64 version = 1;
+  repeated KeyEntry keys = 2;
+}
+
+message KeyEntry {
+  uint64 id = 1;
+  bytes hash_sha256 = 2;
+  string tenant = 3;
+  string name = 4;
+  // Empty: any model.
+  repeated string allowed_models = 5;
+}

@@ -120,6 +120,7 @@ pub fn reconcile_inner(route: &AIRoute, store: &ConfigStore) -> Result<(AIRouteS
         hostnames: route.spec.hostnames.clone(),
         parent_refs,
         rules,
+        require_api_key: route.spec.require_api_key,
         generation,
     };
 
@@ -247,6 +248,7 @@ mod tests {
             spec: AIRouteSpec {
                 parent_refs: vec![ParentReference { name: "gw".into(), ..Default::default() }],
                 hostnames: vec!["llm.example.com".into()],
+                require_api_key: false,
                 rules,
             },
             status: None,

@@ -589,6 +589,7 @@ pub fn build_listener_buckets_from_proto(
                     ai: crate::ai::usage::Dialect::parse(&spec.ai_dialect).map(|dialect| crate::router::AiBackend {
                         dialect,
                         provider: Arc::from(spec.ai_provider.as_str()),
+                        key_required: spec.ai_key_required,
                     }),
                 }
             };

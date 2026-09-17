@@ -11,9 +11,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+use portus_types::proto::portus::ledger::v1::key_distribution_client::KeyDistributionClient;
 use portus_types::proto::portus::ledger::v1::ledger_ingest_client::LedgerIngestClient;
-use portus_types::proto::portus::ledger::v1::{UsageBatch, UsageRecord as WireRecord};
+use portus_types::proto::portus::ledger::v1::{KeyWatchRequest, UsageBatch, UsageRecord as WireRecord};
 
+use super::keys::KeySet;
 use super::usage::{UsageRecord, UsageRing};
 
 /// Records held per pod between drains.
@@ -36,10 +39,14 @@ pub struct LedgerStats {
     pub records_discarded: AtomicU64,
 }
 
-/// The pod's ring and the drain task feeding the ledger.
+/// The pod's ring and the drain task feeding the ledger, plus the API key
+/// snapshot the ledger pushes back.
 pub struct LedgerReporter {
     pub ring: Arc<UsageRing>,
     pub stats: Arc<LedgerStats>,
+    /// Replaced whole on every snapshot; empty until the first arrives, so
+    /// key-requiring routes fail closed while the ledger is unreachable.
+    pub keys: Arc<ArcSwap<KeySet>>,
 }
 
 impl LedgerReporter {
@@ -51,9 +58,14 @@ impl LedgerReporter {
     }
 
     pub fn start(addr: String) -> Arc<Self> {
-        let reporter = Arc::new(Self { ring: Arc::new(UsageRing::new(RING_CAPACITY)), stats: Arc::new(LedgerStats::default()) });
+        let reporter = Arc::new(Self {
+            ring: Arc::new(UsageRing::new(RING_CAPACITY)),
+            stats: Arc::new(LedgerStats::default()),
+            keys: Arc::new(ArcSwap::from_pointee(KeySet::default())),
+        });
         let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string());
-        tokio::spawn(drain_loop(addr, node, Arc::clone(&reporter.ring), Arc::clone(&reporter.stats)));
+        tokio::spawn(drain_loop(addr.clone(), node.clone(), Arc::clone(&reporter.ring), Arc::clone(&reporter.stats)));
+        tokio::spawn(watch_keys_loop(addr, node, Arc::clone(&reporter.keys)));
         log::info!("usage records are reported to the ledger at {}", reporter_addr_for_log());
         reporter
     }
@@ -147,6 +159,52 @@ async fn drain_loop(addr: String, node: String, ring: Arc<UsageRing>, stats: Arc
                 backoff = (backoff * 2).min(RETRY_MAX);
             }
         }
+    }
+}
+
+/// Hold a key-snapshot stream open to the ledger, applying each newer
+/// snapshot; reconnect with backoff when it drops.
+async fn watch_keys_loop(addr: String, node: String, keys: Arc<ArcSwap<KeySet>>) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let endpoint = match crate::config_receiver::grpc_client_endpoint(&addr) {
+            Ok(e) => e,
+            Err(e) => {
+                log::error!("ledger endpoint {addr} is invalid: {e}; API keys cannot be validated");
+                tokio::time::sleep(RETRY_MAX).await;
+                continue;
+            }
+        };
+        let stream = match endpoint.connect().await {
+            Ok(channel) => KeyDistributionClient::new(channel).watch_keys(KeyWatchRequest { node: node.clone() }).await,
+            Err(e) => Err(tonic::Status::unavailable(e.to_string())),
+        };
+        match stream {
+            Ok(response) => {
+                backoff = Duration::from_secs(1);
+                let mut inbound = response.into_inner();
+                loop {
+                    match inbound.message().await {
+                        Ok(Some(snapshot)) => {
+                            let current = keys.load();
+                            if snapshot.version > current.version || current.is_empty() {
+                                let set = KeySet::from_snapshot(&snapshot);
+                                log::info!("API key snapshot v{} applied: {} keys", set.version, set.len());
+                                keys.store(Arc::new(set));
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            log::warn!("key snapshot stream from the ledger ended: {e}");
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => log::warn!("cannot watch API keys at {addr}: {e}; retrying in {backoff:?}"),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(RETRY_MAX);
     }
 }
 

@@ -98,6 +98,9 @@ aiGateway:
       pullPolicy: IfNotPresent
     grpcPort: 9444
     httpPort: 8083
+    # Bring your own Secret (key `token`) for the key admin API; empty
+    # generates one on first install.
+    adminTokenSecretName: ""
     # Persistent volume for the SQLite ledger. Empty storageClassName uses
     # the cluster default.
     storage:

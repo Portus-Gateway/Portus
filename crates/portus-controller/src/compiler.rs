@@ -851,6 +851,20 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         }
     }
 
+    // AI routes that require a Portus API key: the synthesized routes are
+    // recognised by their source name.
+    let key_required: std::collections::HashSet<(String, String)> = store
+        .ai_routes
+        .iter()
+        .filter(|e| e.value().require_api_key)
+        .map(|e| (e.key().namespace.clone(), format!("airoute/{}", e.key().name)))
+        .collect();
+    for (route, source) in routes.iter_mut().zip(route_sources.iter()) {
+        if key_required.contains(&(source.namespace.clone(), source.name.clone())) {
+            route.ai_key_required = true;
+        }
+    }
+
     // AI providers: TLS to the provider host with its name as SNI. The route
     // carries the provider's synthetic Service name.
     for route in &mut routes {
@@ -2315,6 +2329,7 @@ mod tests {
                     backend_refs: vec![],
                     provider: NamespacedName { namespace: "default".into(), name: "anthropic".into() },
                 }],
+                require_api_key: true,
                 generation: 1,
             },
         );
@@ -2322,6 +2337,7 @@ mod tests {
         let config = compile_config(&store);
         assert_eq!(config.routes.len(), 1);
         let route = &config.routes[0];
+        assert!(route.ai_key_required);
         assert_eq!(route.host, "llm.example.com");
         assert_eq!(route.service_name, "aiprovider/default/anthropic");
         assert_eq!(route.port, 443);

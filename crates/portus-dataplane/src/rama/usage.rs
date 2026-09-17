@@ -22,6 +22,8 @@ pub struct RequestSide<'a> {
     pub body_fields: Option<&'a BodyFields>,
     pub request_bytes: u64,
     pub start: Instant,
+    /// The Portus API key that authenticated the request; 0 when none.
+    pub key_id: u64,
 }
 
 /// Wrap `body` so its usage is recorded into `ring` when it completes.
@@ -42,7 +44,7 @@ pub fn observe(body: Body, status: u16, req: RequestSide<'_>, ring: Arc<UsageRin
         tokens: None,
         request_bytes: req.request_bytes,
         response_bytes: 0,
-        key_id: 0,
+        key_id: req.key_id,
         request_id: rand::random(),
     };
     Body::new(Observed {
@@ -120,13 +122,13 @@ mod tests {
     use rama::http::body::util::{BodyExt, Full};
 
     fn side<'a>(ai: &'a AiBackend, fields: &'a BodyFields) -> RequestSide<'a> {
-        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now() }
+        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9 }
     }
 
     #[tokio::test]
     async fn a_consumed_anthropic_response_produces_one_record_with_tokens() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic") };
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true };
         let fields: BodyFields = vec![("model", "claude-opus-5".into())];
         let body = Body::new(Full::new(Bytes::from_static(
             br#"{"id":"m","model":"claude-opus-5-served","usage":{"input_tokens":10,"output_tokens":4}}"#,
@@ -141,12 +143,13 @@ mod tests {
         assert_eq!((r.requested_model.as_str(), r.served_model.as_str()), ("claude-opus-5", "claude-opus-5-served"));
         assert_eq!(r.tokens, Some(Tokens { input: 10, output: 4, cache_read: 0, cache_creation: 0 }));
         assert_eq!((r.request_bytes, r.response_bytes), (321, 87));
+        assert_eq!(r.key_id, 9);
     }
 
     #[tokio::test]
     async fn an_abandoned_stream_is_still_recorded_once() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo") };
+        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false };
         let fields: BodyFields = vec![("model", "gpt-5".into()), ("stream", "true".into())];
         let body = Body::new(Full::new(Bytes::from_static(b"data: {\"model\":\"gpt-5\",\"usage\":null}\n\n")));
         let mut observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring));

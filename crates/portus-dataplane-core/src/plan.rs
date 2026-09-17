@@ -86,7 +86,7 @@ pub struct Reply {
 }
 
 impl Reply {
-    fn empty(status: u16) -> Self {
+    pub fn empty(status: u16) -> Self {
         Self {
             status,
             headers: vec![(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"))],
@@ -104,7 +104,7 @@ impl Reply {
         }
     }
 
-    fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
+    pub fn with_header(mut self, name: HeaderName, value: HeaderValue) -> Self {
         self.headers.push((name, value));
         self
     }

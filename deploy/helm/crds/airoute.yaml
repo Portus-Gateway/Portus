@@ -50,6 +50,9 @@ spec:
                   type: array
                   items:
                     type: string
+                requireApiKey:
+                  type: boolean
+                  description: "Requests must present a Portus API key (x-api-key or Authorization: Bearer) issued by the ledger"
                 rules:
                   type: array
                   items:

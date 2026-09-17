@@ -88,6 +88,10 @@ generates (templates/grpc-tls-secret.yaml).
 {{- printf "%s-ledger" (include "portus-gateway.fullname" .) }}
 {{- end }}
 
+{{- define "portus-gateway.ledgerAdminSecretName" -}}
+{{- default (printf "%s-admin" (include "portus-gateway.ledgerServiceName" .)) .Values.aiGateway.ledger.adminTokenSecretName }}
+{{- end }}
+
 {{- define "portus-gateway.ledgerImage" -}}
 {{- printf "%s:%s" .Values.aiGateway.ledger.image.repository (default .Chart.AppVersion .Values.aiGateway.ledger.image.tag) }}
 {{- end }}

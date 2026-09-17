@@ -39,6 +39,7 @@ use portus_dataplane_core::types::BackendProtocol;
 use super::body::scan_body;
 use super::client::{Upstream, UpstreamTarget};
 use super::usage::{observe, RequestSide};
+use portus_dataplane_core::ai::keys::{authorize, Refusal};
 use portus_dataplane_core::ai::ledger::LedgerReporter;
 use super::tls::{client_auth_for, upstream_tls_for};
 
@@ -237,11 +238,36 @@ impl ProxyService {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
+        // Portus API key: one hash and one lookup against the ledger's
+        // snapshot. The client's credential never reaches the provider; the
+        // route's mutations set the provider's own.
+        let mut key_id = 0;
+        if let Some(ai) = plan.ai.as_ref().filter(|ai| ai.key_required) {
+            let model = body_fields.as_ref().and_then(|f| f.iter().find(|(k, _)| *k == "model")).map(|(_, v)| v.as_str());
+            let verdict = match self.ledger.as_ref() {
+                Some(ledger) => authorize(&ledger.keys.load(), &Headers(req.headers()), model),
+                None => Err(Refusal::Unauthenticated),
+            };
+            match verdict {
+                Ok(id) => key_id = id,
+                Err(refusal) => {
+                    let reply = refusal.reply(ai.dialect, model);
+                    let status = reply.status;
+                    self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
+                    if let Some((method, path)) = &logged {
+                        access_log(peer_ip, method, path, plan.service_name.as_ref(), status, start);
+                    }
+                    return reply_response(reply);
+                }
+            }
+            req.headers_mut().remove("x-api-key");
+            req.headers_mut().remove("authorization");
+        }
         let mut response = self.forward(req, &plan, peer_ip, authority).await;
 
         let status = response.status().as_u16();
         if let (Some(ai), Some(ledger)) = (plan.ai.as_ref(), self.ledger.as_ref()) {
-            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start };
+            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id };
             let body = std::mem::replace(response.body_mut(), Body::empty());
             *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring));
         }

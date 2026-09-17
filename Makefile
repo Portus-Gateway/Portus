@@ -83,16 +83,19 @@ disk-report:
 # image it provisions (`PORTUS_DATAPLANE_IMAGE`), plus the runner and bench
 # tools tags the Makefile targets use, so an idle cluster with no Gateway does
 # not lose the dataplane image it will need for the next one.
-OUR_IMAGES := ^(portus-gateway|portus)/gateway-?(controller|dataplane)|^portus/(conformance|bench-tools)
+OUR_IMAGES := ^portus-gateway/(controller|dataplane|ledger)|^portus/(conformance|bench-tools)
 disk-prune:
-	@keep="$$($(MISE) kubectl get deploy -n $(NAMESPACE) -o jsonpath='{.items[*].spec.template.spec.containers[*].image} {.items[*].spec.template.spec.containers[*].env[?(@.name=="PORTUS_DATAPLANE_IMAGE")].value}' 2>/dev/null) $(CONTROLLER_IMAGE) $(DATAPLANE_IMAGE) $(CONFORMANCE_IMAGE) $(BENCH_TOOLS_IMAGE)"; \
+	@keep="$$($(MISE) kubectl get deploy -n $(NAMESPACE) -o jsonpath='{.items[*].spec.template.spec.containers[*].image} {.items[*].spec.template.spec.containers[*].env[?(@.name=="PORTUS_DATAPLANE_IMAGE")].value}' 2>/dev/null) $(CONTROLLER_IMAGE) $(DATAPLANE_IMAGE) $(LEDGER_IMAGE) $(CONFORMANCE_IMAGE) $(BENCH_TOOLS_IMAGE)"; \
 	echo "keeping: $$keep"; \
-	for img in $$(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | awk '$$0 ~ "$(OUR_IMAGES)"'); do \
-	  case " $$keep " in *" $$img "*) ;; *) docker rmi "$$img" >/dev/null 2>&1 && echo "removed $$img";; esac; done; \
+	for img in $$($(DOCKER) images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | awk '$$0 ~ "$(OUR_IMAGES)"'); do \
+	  case " $$keep " in *" $$img "*) ;; *) $(DOCKER) rmi "$$img" >/dev/null 2>&1 && echo "removed $$img";; esac; done
+ifeq ($(PLATFORM),k3d)
+	@keep="$$($(MISE) kubectl get deploy -n $(NAMESPACE) -o jsonpath='{.items[*].spec.template.spec.containers[*].image} {.items[*].spec.template.spec.containers[*].env[?(@.name=="PORTUS_DATAPLANE_IMAGE")].value}' 2>/dev/null) $(CONTROLLER_IMAGE) $(DATAPLANE_IMAGE) $(LEDGER_IMAGE) $(CONFORMANCE_IMAGE) $(BENCH_TOOLS_IMAGE)"; \
 	for img in $$(docker exec $(K3D_NODE) crictl images -o json 2>/dev/null | python3 -c 'import sys,json; [print(t) for i in json.load(sys.stdin)["images"] for t in i["repoTags"]]' | sed 's#^docker.io/##' | awk '$$0 ~ "$(OUR_IMAGES)"'); do \
 	  case " $$keep " in *" $$img "*) ;; *) docker exec $(K3D_NODE) crictl rmi "docker.io/$$img" >/dev/null 2>&1 && echo "removed $$img from $(K3D_NODE)";; esac; done
-	@docker image prune -f >/dev/null 2>&1 || true
-	@docker builder prune -f --filter until=72h >/dev/null 2>&1 || true
+endif
+	@$(DOCKER) image prune -f >/dev/null 2>&1 || true
+	@$(DOCKER) builder prune -f --filter until=72h >/dev/null 2>&1 || true
 	@$(MAKE) --no-print-directory disk-report
 
 # ── Cluster ────────────────────────────────────────────────────────────────────

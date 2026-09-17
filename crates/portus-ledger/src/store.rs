@@ -8,7 +8,9 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
-use portus_types::proto::portus::ledger::v1::UsageRecord;
+use portus_types::proto::portus::ledger::v1::{KeySnapshot, UsageRecord};
+
+use crate::keys::{self, KeyRow};
 
 pub struct Store {
     conn: Connection,
@@ -83,7 +85,24 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        conn.execute_batch(keys::SCHEMA)?;
         Ok(Self { conn })
+    }
+
+    pub fn issue_key(&self, tenant: &str, name: &str, models: &[String], plaintext: Option<&str>) -> rusqlite::Result<(KeyRow, String)> {
+        keys::issue(&self.conn, tenant, name, models, plaintext)
+    }
+
+    pub fn revoke_key(&self, id: u64) -> rusqlite::Result<bool> {
+        keys::revoke(&self.conn, id)
+    }
+
+    pub fn list_keys(&self) -> rusqlite::Result<Vec<KeyRow>> {
+        keys::list(&self.conn)
+    }
+
+    pub fn key_snapshot(&self, version: u64) -> rusqlite::Result<KeySnapshot> {
+        keys::snapshot(&self.conn, version)
     }
 
     /// Append a batch atomically. Returns how many rows were written.

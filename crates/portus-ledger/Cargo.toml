@@ -18,3 +18,11 @@ env_logger = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
+sha2 = { workspace = true }
+rand = "0.10"
+axum = { workspace = true }
+tokio-stream = { workspace = true }
+subtle = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

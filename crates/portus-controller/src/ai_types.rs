@@ -74,6 +74,9 @@ pub struct AIRouteSpec {
     pub parent_refs: Vec<ParentReference>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hostnames: Vec<String>,
+    /// Requests must present a Portus API key issued by the ledger.
+    #[serde(rename = "requireApiKey", default)]
+    pub require_api_key: bool,
     #[serde(default)]
     pub rules: Vec<AIRouteRule>,
 }

@@ -32,6 +32,8 @@ hashbrown = { workspace = true }
 dashmap = "6"
 memchr = { workspace = true }
 crossbeam-queue = { workspace = true }
+sha2 = { workspace = true }
+tokio-stream = { workspace = true }
 arrayvec = { workspace = true }
 bcrypt = "0.19"
 subtle = "2"

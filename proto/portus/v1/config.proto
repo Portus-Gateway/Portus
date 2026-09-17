@@ -162,6 +162,9 @@ message RouteConfig {
   // usage out of responses; `ai_provider` names the provider for the ledger.
   string ai_dialect = 36;
   string ai_provider = 37;
+  // Requests must carry a Portus API key the ledger issued (validated
+  // locally against the key snapshot the ledger pushes).
+  bool ai_key_required = 38;
 
   // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
   // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.

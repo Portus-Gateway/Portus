@@ -557,6 +557,7 @@ pub struct AIRouteState {
     pub hostnames: Vec<String>,
     pub parent_refs: Vec<ParentRefState>,
     pub rules: Vec<AIRouteRuleState>,
+    pub require_api_key: bool,
     pub generation: i64,
 }
 

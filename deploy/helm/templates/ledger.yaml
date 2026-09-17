@@ -88,6 +88,11 @@ spec:
               value: "0.0.0.0:{{ .Values.aiGateway.ledger.httpPort }}"
             - name: LEDGER_DB_PATH
               value: /data/ledger.db
+            - name: LEDGER_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "portus-gateway.ledgerAdminSecretName" . }}
+                  key: token
             {{- if .Values.grpcTls.enabled }}
             - name: GRPC_TLS_CERT
               value: /etc/grpc-tls/tls.crt

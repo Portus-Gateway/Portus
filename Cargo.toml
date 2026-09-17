@@ -55,6 +55,8 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 dashmap = "6.1"
 memchr = "2"
 crossbeam-queue = "0.3"
+sha2 = "0.10"
+axum = "0.8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 arrayvec = "0.7"
 regex = "1"

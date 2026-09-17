@@ -263,6 +263,8 @@ pub struct PathRoute {
 pub struct AiBackend {
     pub dialect: crate::ai::usage::Dialect,
     pub provider: Arc<str>,
+    /// Requests must present a valid Portus API key.
+    pub key_required: bool,
 }
 
 impl PathRoute {
