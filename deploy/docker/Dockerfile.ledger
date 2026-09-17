@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+FROM rust:1.98-alpine AS builder
+
+RUN apk add --no-cache musl-dev cmake make perl build-base protoc
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+
+RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=cargo-target-ledger-release,target=/src/target \
+    cargo build --release -p portus-ledger \
+    && mkdir -p /out && cp /src/target/release/portus-ledger /out/portus-ledger
+
+FROM scratch
+
+COPY --from=builder /out/portus-ledger /ledger
+
+USER 1000
+
+EXPOSE 9444 8083
+ENTRYPOINT ["/ledger"]

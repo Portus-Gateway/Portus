@@ -214,6 +214,9 @@ pub struct Forward {
     pub connection_limiter: Option<Arc<ConnectionLimiter>>,
     /// Pre-resolved latency histogram for this route's labels.
     pub duration_histogram: prometheus::Histogram,
+    /// The AI provider behind the route, when there is one: the adapter
+    /// reads token usage from the response and records the request.
+    pub ai: Option<crate::router::AiBackend>,
 }
 
 impl Forward {
@@ -515,6 +518,7 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
         circuit_breaker,
         connection_limiter,
         duration_histogram,
+        ai: pr.ai.clone(),
     }))
 }
 

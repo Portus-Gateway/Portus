@@ -75,6 +75,9 @@ pub struct DataplaneTemplate {
     /// `pingora` (the release stack) or an experimental alternative built into
     /// the dataplane image. Passed through verbatim; the dataplane validates it.
     pub network_stack: String,
+    /// `host:port` of the AI gateway ledger's gRPC ingest, when the AI
+    /// gateway is enabled (`PORTUS_LEDGER_ADDR` on the pods).
+    pub ledger_addr: Option<String>,
     /// ServiceAccount for dataplane pods. Must exist in every Gateway's
     /// namespace, so it is normally unset (default SA, token automount off).
     pub service_account: Option<String>,
@@ -116,6 +119,7 @@ impl DataplaneTemplate {
             access_log: var("PORTUS_DATAPLANE_ACCESS_LOG").is_some_and(|v| parse_bool(&v)),
             threads: var("PORTUS_DATAPLANE_THREADS").and_then(|v| v.trim().parse().ok()).filter(|n: &usize| *n > 0),
             network_stack: network_stack_value(var("PORTUS_DATAPLANE_NETWORK_STACK").as_deref()),
+            ledger_addr: var("PORTUS_DATAPLANE_LEDGER_ADDR"),
             service_account: var("PORTUS_DATAPLANE_SERVICE_ACCOUNT"),
             cpu_request: var("PORTUS_DATAPLANE_CPU_REQUEST").unwrap_or_else(|| "250m".into()),
             memory_request: var("PORTUS_DATAPLANE_MEMORY_REQUEST").unwrap_or_else(|| "256Mi".into()),
@@ -380,6 +384,9 @@ pub fn desired_deployment(gw: &GatewayRef, tpl: &DataplaneTemplate) -> Deploymen
     ];
     if let Some(threads) = tpl.threads {
         envs.push(env("DATAPLANE_THREADS", &threads.to_string()));
+    }
+    if let Some(ledger) = &tpl.ledger_addr {
+        envs.push(env("PORTUS_LEDGER_ADDR", ledger));
     }
     let mut volumes = Vec::new();
     let mut mounts = Vec::new();
@@ -705,6 +712,7 @@ mod tests {
             log_level: "info".into(),
             access_log: false,
             network_stack: "pingora".into(),
+            ledger_addr: None,
             threads: None,
             service_account: Some("portus-dataplane".into()),
             cpu_request: "250m".into(),

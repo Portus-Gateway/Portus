@@ -81,6 +81,11 @@ spec:
             {{- end }}
             - name: PORTUS_DATAPLANE_NETWORK_STACK
               value: {{ .Values.dataplane.networkStack | default "pingora" | quote }}
+            {{- if .Values.aiGateway.enabled }}
+            # Data planes report AI usage records here.
+            - name: PORTUS_DATAPLANE_LEDGER_ADDR
+              value: {{ include "portus-gateway.ledgerAddr" . | quote }}
+            {{- end }}
             # Per-Gateway dataplane pods run under their namespace's default
             # ServiceAccount with token automount disabled; they need no API access.
             - name: PORTUS_DATAPLANE_CPU_REQUEST

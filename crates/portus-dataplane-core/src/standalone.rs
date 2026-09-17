@@ -650,6 +650,8 @@ pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::Com
                     weighted_backends: Vec::new(),
                                     gateway_namespace: String::new(),
                     gateway_name: String::new(),
+                    ai_dialect: String::new(),
+                    ai_provider: String::new(),
                 });
             }
         }

@@ -35,6 +35,9 @@ CONTROLLER_IMAGE := $(CONTROLLER_REPO):$(CONTROLLER_TAG)
 DATAPLANE_REPO   := portus-gateway/dataplane
 DATAPLANE_TAG    ?= dev
 DATAPLANE_IMAGE  := $(DATAPLANE_REPO):$(DATAPLANE_TAG)
+LEDGER_REPO      := portus-gateway/ledger
+LEDGER_TAG       ?= dev
+LEDGER_IMAGE     := $(LEDGER_REPO):$(LEDGER_TAG)
 PROXY_IMAGE      := portus/proxy:dev
 NODES       ?= 10
 RPS         ?= 1000
@@ -117,6 +120,10 @@ build-controller: disk-check
 DATAPLANE_FEATURES ?=
 build-dataplane: disk-check
 	$(DOCKER) build -t $(DATAPLANE_IMAGE) --build-arg DATAPLANE_FEATURES="$(DATAPLANE_FEATURES)" -f deploy/docker/Dockerfile.dataplane .
+
+# The AI gateway ledger (deployed by the chart when aiGateway.enabled).
+build-ledger: disk-check
+	$(DOCKER) build -t $(LEDGER_IMAGE) -f deploy/docker/Dockerfile.ledger .
 
 build-proxy: disk-check
 	$(DOCKER) build -t $(PROXY_IMAGE) -f deploy/docker/Dockerfile.proxy .

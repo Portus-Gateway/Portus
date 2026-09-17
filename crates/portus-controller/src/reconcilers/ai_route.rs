@@ -160,6 +160,7 @@ pub async fn reconcile_ai_route(route: Arc<AIRoute>, ctx: Arc<ReconcileContext>)
         return Ok(Action::await_change());
     }
     let (state, desired_conditions) = reconcile_inner(&route, &ctx.store)?;
+    let resolved = desired_conditions.iter().any(|c| c.type_ == "ResolvedRefs" && c.status == "True");
     super::store_route(&ctx.store, &ctx.store.ai_routes, RouteKind::Ai, key, state);
 
     let current_conditions: Vec<Condition> = route.status.as_ref().map(|s| s.conditions.clone()).unwrap_or_default();
@@ -181,7 +182,9 @@ pub async fn reconcile_ai_route(route: Arc<AIRoute>, ctx: Arc<ReconcileContext>)
         log::warn!("failed to write AIRoute status for {namespace}/{name}: {e}; retrying");
         return Err(e.into());
     }
-    Ok(Action::await_change())
+    // Providers are not Services, so no store event announces one arriving;
+    // an unresolved route polls until its provider shows up.
+    Ok(if resolved { Action::await_change() } else { Action::requeue(std::time::Duration::from_secs(15)) })
 }
 
 #[cfg(test)]

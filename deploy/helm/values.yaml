@@ -79,3 +79,33 @@ serviceAccount:
   create: true
   name: ""
   annotations: {}
+
+# AI gateway. Off by default. When enabled the chart deploys the ledger, the
+# companion service that receives usage records from the data planes (and,
+# in later releases, issues API keys and holds budgets). The data planes
+# report to it over the same mTLS CA as the config stream; on a fresh install
+# the generated certificate also names the ledger Service. An existing
+# install that turns this on must delete the generated grpc-tls Secret so it
+# is regenerated with the ledger's names, and upgrade with
+# --reset-then-reuse-values (plain --reuse-values ignores the new defaults
+# this block needs).
+aiGateway:
+  enabled: false
+  ledger:
+    image:
+      repository: ghcr.io/portus-gateway/ledger
+      tag: ""  # defaults to the chart's appVersion
+      pullPolicy: IfNotPresent
+    grpcPort: 9444
+    httpPort: 8083
+    # Persistent volume for the SQLite ledger. Empty storageClassName uses
+    # the cluster default.
+    storage:
+      size: 1Gi
+      storageClassName: ""
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        memory: 512Mi

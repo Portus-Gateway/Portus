@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/portus-types", "crates/portus-controller", "crates/portus-dataplane-core", "crates/portus-dataplane", "crates/pingora-core-patch"]
+members = ["crates/portus-types", "crates/portus-controller", "crates/portus-dataplane-core", "crates/portus-dataplane", "crates/portus-ledger", "crates/pingora-core-patch"]
 resolver = "3"
 
 [workspace.package]
@@ -54,6 +54,9 @@ prost-types = "0.14"
 tokio-stream = { version = "0.1", features = ["sync"] }
 dashmap = "6.1"
 memchr = "2"
+crossbeam-queue = "0.3"
+rusqlite = { version = "0.37", features = ["bundled"] }
+arrayvec = "0.7"
 regex = "1"
 hashbrown = "0.17"
 arcstr = "1"

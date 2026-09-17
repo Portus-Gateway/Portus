@@ -43,7 +43,7 @@ bytes = { workspace = true }
 http = { workspace = true }
 rustls = { workspace = true }
 hashbrown = { workspace = true }
-arrayvec = "0.7"
+arrayvec = { workspace = true }
 rand = "0.10"
 
 [dev-dependencies]

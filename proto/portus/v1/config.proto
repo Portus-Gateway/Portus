@@ -157,6 +157,12 @@ message RouteConfig {
   // (up to max_retries more attempts) before the response is passed through.
   repeated uint32 retry_codes = 35;
 
+  // AI gateway: set when the backend is an AIProvider. `ai_dialect` is the
+  // API shape the provider speaks (anthropic | openai), used to read token
+  // usage out of responses; `ai_provider` names the provider for the ledger.
+  string ai_dialect = 36;
+  string ai_provider = 37;
+
   // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
   // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.
   // Exact hostname otherwise. Used to scope which routes are eligible for a request

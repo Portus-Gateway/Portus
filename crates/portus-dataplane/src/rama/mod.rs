@@ -6,6 +6,7 @@
 
 mod body;
 mod client;
+mod usage;
 mod health;
 mod proxy;
 mod serve;
@@ -67,7 +68,9 @@ pub fn run(boot: Bootstrap) -> ! {
             server
         };
 
-        let proxy = Arc::new(ProxyService::new(snapshot, metrics, outliers, client::Upstream::new(exec.clone())));
+        // Usage records for AI routes go to the ledger when one is configured.
+        let ledger = portus_dataplane_core::ai::ledger::LedgerReporter::from_env();
+        let proxy = Arc::new(ProxyService::new(snapshot, metrics, outliers, client::Upstream::new(exec.clone()), ledger));
 
         let http = http_server(exec.clone()).service(proxy.clone());
         let https = PortTlsAcceptor::new(Arc::new(tls), http_server(exec.clone()).service(proxy));

@@ -83,3 +83,18 @@ generates (templates/grpc-tls-secret.yaml).
 {{- define "portus-gateway.grpcTlsSecretName" -}}
 {{- default (printf "%s-grpc-tls" (include "portus-gateway.fullname" .)) .Values.grpcTls.secretName }}
 {{- end }}
+
+{{- define "portus-gateway.ledgerServiceName" -}}
+{{- printf "%s-ledger" (include "portus-gateway.fullname" .) }}
+{{- end }}
+
+{{- define "portus-gateway.ledgerImage" -}}
+{{- printf "%s:%s" .Values.aiGateway.ledger.image.repository (default .Chart.AppVersion .Values.aiGateway.ledger.image.tag) }}
+{{- end }}
+
+{{/*
+host:port the data planes report usage to.
+*/}}
+{{- define "portus-gateway.ledgerAddr" -}}
+{{- printf "%s.%s:%d" (include "portus-gateway.ledgerServiceName" .) .Release.Namespace (.Values.aiGateway.ledger.grpcPort | int) }}
+{{- end }}

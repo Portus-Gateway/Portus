@@ -586,6 +586,10 @@ pub fn build_listener_buckets_from_proto(
                     },
                     // PERF-10: Pre-compute total weight to avoid per-request summation
                     total_weight: spec.weighted_backends.iter().map(|wb| wb.weight).sum(),
+                    ai: crate::ai::usage::Dialect::parse(&spec.ai_dialect).map(|dialect| crate::router::AiBackend {
+                        dialect,
+                        provider: Arc::from(spec.ai_provider.as_str()),
+                    }),
                 }
             };
 
@@ -1633,16 +1637,13 @@ pub struct AppliedConfig {
     pub version: u64,
 }
 
-async fn connect_and_stream(
-    controller_addr: &str,
-    state: &Arc<ProxyState>,
-    readiness: &Readiness,
-    metrics: &Arc<crate::metrics::ProxyMetrics>,
-    applied: &mut AppliedConfig,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
+/// A tonic endpoint for `addr` (`host:port`) with the TLS policy the
+/// `GRPC_TLS_*` variables define: CA set → TLS (client cert when
+/// `GRPC_TLS_CERT`/`GRPC_TLS_KEY` are set), else plaintext only with
+/// `GRPC_TLS_INSECURE=true`. Shared by the config stream and the ledger
+/// reporter, which trust the same CA.
+pub fn grpc_client_endpoint(addr: &str) -> Result<tonic::transport::Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    use std::time::Duration;
     // SEC-2: TLS on gRPC config stream (carries TLS private keys and auth credentials).
     // Set GRPC_TLS_CA to enable server certificate verification (TLS).
     // Set GRPC_TLS_CERT and GRPC_TLS_KEY to additionally present a client certificate (mTLS).
@@ -1662,7 +1663,7 @@ async fn connect_and_stream(
         );
         return Err("gRPC TLS is required: set GRPC_TLS_CA or GRPC_TLS_INSECURE=true".into());
     };
-    let mut endpoint = tonic::transport::Endpoint::from_shared(format!("{}://{}", scheme, controller_addr))?
+    let mut endpoint = tonic::transport::Endpoint::from_shared(format!("{}://{}", scheme, addr))?
         .keep_alive_while_idle(true)
         .http2_keep_alive_interval(Duration::from_secs(15))
         .keep_alive_timeout(Duration::from_secs(60))
@@ -1693,14 +1694,28 @@ async fn connect_and_stream(
         }
 
         // Use the controller service name as the TLS domain for certificate verification.
-        // The controller_addr is typically "service-name:port", so extract just the host.
-        let domain = controller_addr.split(':').next().unwrap_or(controller_addr);
+        // The addr is typically "service-name:port", so extract just the host.
+        let domain = addr.split(':').next().unwrap_or(addr);
         tls_config = tls_config.domain_name(domain);
 
         endpoint = endpoint.tls_config(tls_config)
             .map_err(|e| format!("failed to configure gRPC client TLS: {}", e))?;
         log::info!("gRPC client TLS enabled (verifying server cert)");
     }
+    Ok(endpoint)
+}
+
+async fn connect_and_stream(
+    controller_addr: &str,
+    state: &Arc<ProxyState>,
+    readiness: &Readiness,
+    metrics: &Arc<crate::metrics::ProxyMetrics>,
+    applied: &mut AppliedConfig,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    let endpoint = grpc_client_endpoint(controller_addr)?;
 
     let mut client =
         portus_types::proto::portus::config::v1::config_distribution_client::ConfigDistributionClient::connect(endpoint)

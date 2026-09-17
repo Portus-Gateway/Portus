@@ -5,6 +5,11 @@ pub mod proto {
                 tonic::include_proto!("portus.config.v1");
             }
         }
+        pub mod ledger {
+            pub mod v1 {
+                tonic::include_proto!("portus.ledger.v1");
+            }
+        }
     }
 }
 

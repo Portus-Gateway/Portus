@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+package portus.ledger.v1;
+
+// Usage reporting from data planes to the ledger. One unary call per batch:
+// the data plane drains its ring into a batch, sends it, and only forgets
+// the records once the ledger has acknowledged them.
+service LedgerIngest {
+  rpc Report(UsageBatch) returns (ReportAck);
+}
+
+message UsageBatch {
+  // Data plane pod identity, for de-duplication and diagnostics.
+  string node = 1;
+  repeated UsageRecord records = 2;
+  // Records the data plane dropped because its ring was full, since start.
+  uint64 dropped_total = 3;
+}
+
+message UsageRecord {
+  uint64 ts_unix_micros = 1;
+  uint64 duration_micros = 2;
+  uint32 status = 3;
+  string dialect = 4;          // anthropic | openai
+  bool stream = 5;
+  string provider = 6;         // AIProvider name
+  string route_host = 7;       // request Host the route matched on
+  string requested_model = 8;  // body `model`
+  string served_model = 9;     // response `model`, when reported
+  bool has_usage = 10;         // false: the response carried no usage block
+  uint32 input_tokens = 11;
+  uint32 output_tokens = 12;
+  uint32 cache_read_tokens = 13;
+  uint32 cache_creation_tokens = 14;
+  uint64 request_bytes = 15;
+  uint64 response_bytes = 16;
+  uint64 key_id = 17;          // 0 until API keys exist
+  uint64 request_id = 18;
+}
+
+message ReportAck {
+  uint64 accepted = 1;
+}

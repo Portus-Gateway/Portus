@@ -184,12 +184,16 @@ pub async fn reconcile_ai_provider(provider: Arc<AIProvider>, ctx: Arc<Reconcile
             "lastTransitionTime": c.last_transition_time.0.to_string(),
         })).collect::<Vec<_>>() }
     });
+    let accepted = desired_conditions.iter().any(|c| c.type_ == "Accepted" && c.status == "True");
     let api: Api<AIProvider> = Api::namespaced(ctx.client.clone(), namespace);
     if let Err(e) = status::patch_status_if_changed(&api, name, desired_status, &current_conditions, &desired_conditions).await {
         log::warn!("failed to write AIProvider status for {namespace}/{name}: {e}; retrying");
         return Err(e.into());
     }
-    Ok(Action::await_change())
+    // A provider rejected for a Secret that has not been seen yet (the
+    // Secret cache may fill after the provider on a cold start) is looked
+    // at again shortly; nothing else re-triggers it.
+    Ok(if accepted { Action::await_change() } else { Action::requeue(std::time::Duration::from_secs(10)) })
 }
 
 /// Resolve every provider host once and record the addresses that changed.

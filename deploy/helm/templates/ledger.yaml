@@ -1,0 +1,130 @@
+{{- if .Values.aiGateway.enabled }}
+{{- /*
+The AI gateway ledger: one replica (it is the single writer of its SQLite
+file and, later, the budget authority), Recreate so two never share the
+volume, the config-stream mTLS material for its gRPC ingest.
+*/ -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "portus-gateway.ledgerServiceName" . }}
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ledger
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- with .Values.aiGateway.ledger.storage.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.aiGateway.ledger.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "portus-gateway.ledgerServiceName" . }}
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ledger
+spec:
+  type: ClusterIP
+  ports:
+    - name: grpc
+      port: {{ .Values.aiGateway.ledger.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+    - name: http
+      port: {{ .Values.aiGateway.ledger.httpPort }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "portus-gateway.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ledger
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "portus-gateway.ledgerServiceName" . }}
+  labels:
+    {{- include "portus-gateway.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ledger
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "portus-gateway.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ledger
+  template:
+    metadata:
+      labels:
+        {{- include "portus-gateway.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ledger
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: ledger
+          image: {{ include "portus-gateway.ledgerImage" . | quote }}
+          imagePullPolicy: {{ .Values.aiGateway.ledger.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: {{ .Values.aiGateway.ledger.grpcPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.aiGateway.ledger.httpPort }}
+              protocol: TCP
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.controller.logLevel }}
+            - name: LEDGER_GRPC_ADDR
+              value: "0.0.0.0:{{ .Values.aiGateway.ledger.grpcPort }}"
+            - name: LEDGER_HTTP_ADDR
+              value: "0.0.0.0:{{ .Values.aiGateway.ledger.httpPort }}"
+            - name: LEDGER_DB_PATH
+              value: /data/ledger.db
+            {{- if .Values.grpcTls.enabled }}
+            - name: GRPC_TLS_CERT
+              value: /etc/grpc-tls/tls.crt
+            - name: GRPC_TLS_KEY
+              value: /etc/grpc-tls/tls.key
+            - name: GRPC_TLS_CA
+              value: /etc/grpc-tls/ca.crt
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          resources:
+            {{- toYaml .Values.aiGateway.ledger.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            {{- if .Values.grpcTls.enabled }}
+            - name: grpc-tls
+              mountPath: /etc/grpc-tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "portus-gateway.ledgerServiceName" . }}
+        {{- if .Values.grpcTls.enabled }}
+        - name: grpc-tls
+          secret:
+            secretName: {{ include "portus-gateway.grpcTlsSecretName" . }}
+        {{- end }}
+{{- end }}

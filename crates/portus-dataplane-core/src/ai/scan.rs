@@ -26,6 +26,9 @@ pub enum Scalar {
     Num(String),
     /// The value was an object or array; it was skipped, not captured.
     Compound,
+    /// The raw bytes of an object or array value, when the scanner was built
+    /// with [`FieldScanner::capturing_compounds`].
+    Raw(Vec<u8>),
 }
 
 impl Scalar {
@@ -95,6 +98,10 @@ pub struct FieldScanner {
     current: Option<usize>,
     /// Total bytes consumed, for the memory guard the caller enforces.
     consumed: usize,
+    /// Copy the raw bytes of a wanted key's object or array value.
+    capture_compound: bool,
+    /// The wanted key whose compound value is being copied into `token`.
+    capturing: Option<usize>,
 }
 
 impl FieldScanner {
@@ -107,7 +114,17 @@ impl FieldScanner {
             token: Vec::new(),
             current: None,
             consumed: 0,
+            capture_compound: false,
+            capturing: None,
         }
+    }
+
+    /// Keep the raw bytes of wanted keys whose values are objects or arrays
+    /// ([`Scalar::Raw`]) instead of reporting [`Scalar::Compound`]. For a
+    /// response's `usage` object, which is small; never for a request body.
+    pub fn capturing_compounds(mut self) -> Self {
+        self.capture_compound = true;
+        self
     }
 
     /// The value extracted for `key`, if it has been seen.
@@ -195,10 +212,15 @@ impl FieldScanner {
                             self.state = State::InString { escaped: false, wanted };
                         }
                         b'{' | b'[' => {
-                            i += 1;
-                            if let Some(w) = wanted {
-                                self.record(w, Scalar::Compound);
+                            match wanted {
+                                Some(w) if self.capture_compound => {
+                                    self.token.push(chunk[i]);
+                                    self.capturing = Some(w);
+                                }
+                                Some(w) => self.record(w, Scalar::Compound),
+                                None => {}
                             }
+                            i += 1;
                             self.state = State::InNested { depth: 1, in_string: false, escaped: false };
                         }
                         b',' | b'}' | b']' | b':' => return self.finish(Progress::Invalid),
@@ -253,10 +275,22 @@ impl FieldScanner {
                 }
                 State::InNested { depth, in_string, escaped } => {
                     let (next, state) = skip_nested_part(chunk, i, depth, in_string, escaped);
+                    if self.capturing.is_some() {
+                        self.token.extend_from_slice(&chunk[i..next]);
+                    }
                     i = next;
                     self.state = match state {
                         Some((depth, in_string, escaped)) => State::InNested { depth, in_string, escaped },
-                        None => State::AfterValue,
+                        None => {
+                            if let Some(w) = self.capturing.take() {
+                                let raw = std::mem::take(&mut self.token);
+                                self.record(w, Scalar::Raw(raw));
+                                if self.found == self.keys.len() {
+                                    return self.finish(Progress::Complete);
+                                }
+                            }
+                            State::AfterValue
+                        }
                     };
                 }
                 State::AfterValue => {
@@ -569,6 +603,29 @@ mod tests {
         assert_eq!(p, Progress::Complete);
         assert_eq!(s.get("model"), Some(&Scalar::Compound));
         assert_eq!(s.get("stream"), Some(&Scalar::Compound));
+    }
+
+    #[test]
+    fn compound_values_can_be_captured_raw_across_chunks() {
+        const KEYS: &[&str] = &["usage", "model"];
+        let body = r#"{"id":"msg_1","model":"claude-opus-5","content":[{"type":"text","text":"}{"}],"usage":{"input_tokens":25,"output_tokens":12,"nested":{"a":[1,2]}}}"#;
+        for split in [1usize, 7, 40, body.len()] {
+            let mut s = FieldScanner::new(KEYS).capturing_compounds();
+            let mut p = Progress::NeedMore;
+            for c in body.as_bytes().chunks(split) {
+                p = s.feed(c);
+                if p != Progress::NeedMore {
+                    break;
+                }
+            }
+            assert_eq!(p, Progress::Complete, "split {split}");
+            assert_eq!(s.get("model").unwrap().as_str(), Some("claude-opus-5"));
+            assert_eq!(
+                s.get("usage"),
+                Some(&Scalar::Raw(br#"{"input_tokens":25,"output_tokens":12,"nested":{"a":[1,2]}}"#.to_vec())),
+                "split {split}"
+            );
+        }
     }
 
     #[test]

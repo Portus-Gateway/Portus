@@ -860,10 +860,15 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         let Some((ns, name)) = rest.split_once('/') else {
             continue;
         };
-        if let Some(provider) = store.ai_providers.get(&NamespacedName { namespace: ns.to_string(), name: name.to_string() })
-            && provider.tls
-        {
-            route.upstream_tls = Some(UpstreamTlsConfig { enabled: true, verify_cert: true, sni: provider.host.clone() });
+        if let Some(provider) = store.ai_providers.get(&NamespacedName { namespace: ns.to_string(), name: name.to_string() }) {
+            route.ai_dialect = match provider.kind.as_str() {
+                "anthropic" => "anthropic".to_string(),
+                _ => "openai".to_string(),
+            };
+            route.ai_provider = provider.name.clone();
+            if provider.tls {
+                route.upstream_tls = Some(UpstreamTlsConfig { enabled: true, verify_cert: true, sni: provider.host.clone() });
+            }
         }
     }
 
@@ -1634,6 +1639,22 @@ fn ai_routes_as_http_routes(store: &ConfigStore) -> Vec<(NamespacedName, HTTPRou
                             }
                         }
                     }
+                    // The provider is resolved here, at compile time, so a
+                    // provider that appeared after the route reconciled still
+                    // gets traffic; the reconcile-time refs only drive status.
+                    let backend_refs = store
+                        .ai_providers
+                        .get(&rule.provider)
+                        .map(|p| {
+                            vec![crate::store::BackendRefState {
+                                namespace: p.namespace.clone(),
+                                name: p.service_name(),
+                                port: p.port,
+                                weight: 1,
+                                filters: Vec::new(),
+                            }]
+                        })
+                        .unwrap_or_default();
                     HTTPRouteRuleState {
                         matches: rule.matches.clone(),
                         filters: if set.is_empty() {
@@ -1641,7 +1662,7 @@ fn ai_routes_as_http_routes(store: &ConfigStore) -> Vec<(NamespacedName, HTTPRou
                         } else {
                             vec![HTTPFilterState::RequestHeaderModifier { add: Vec::new(), set, remove: Vec::new() }]
                         },
-                        backend_refs: rule.backend_refs.clone(),
+                        backend_refs,
                         request_timeout_ms: None,
                         backend_request_timeout_ms: None,
                         retry: None,
@@ -2289,13 +2310,9 @@ mod tests {
                         method: None,
                         query_params: vec![],
                     }],
-                    backend_refs: vec![BackendRefState {
-                        namespace: "default".into(),
-                        name: provider.service_name(),
-                        port: 443,
-                        weight: 1,
-                        filters: vec![],
-                    }],
+                    // Empty on purpose: the route reconciled before its
+                    // provider existed; the compiler must still find it.
+                    backend_refs: vec![],
                     provider: NamespacedName { namespace: "default".into(), name: "anthropic".into() },
                 }],
                 generation: 1,
@@ -2316,6 +2333,7 @@ mod tests {
         let tls = route.upstream_tls.as_ref().unwrap();
         assert!(tls.enabled && tls.verify_cert);
         assert_eq!(tls.sni, "api.anthropic.com");
+        assert_eq!((route.ai_dialect.as_str(), route.ai_provider.as_str()), ("anthropic", "anthropic"));
         let group = config.backends.iter().find(|b| b.service_name == "aiprovider/default/anthropic").expect("provider backend group");
         assert_eq!(group.port, 443);
         assert_eq!(group.endpoints.len(), 1);

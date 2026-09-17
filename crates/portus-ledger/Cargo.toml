@@ -1,0 +1,20 @@
+[package]
+name = "portus-ledger"
+version = "0.2.3"
+edition = "2024"
+rust-version.workspace = true
+description = "Portus AI gateway ledger: receives usage records from data planes, stores them, exports them"
+license = "Apache-2.0"
+repository = "https://github.com/Portus-Gateway/Portus"
+keywords = ["proxy", "gateway-api", "llm"]
+categories = ["network-programming"]
+
+[dependencies]
+portus-types = { path = "../portus-types" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }

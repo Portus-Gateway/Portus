@@ -38,6 +38,8 @@ use portus_dataplane_core::types::BackendProtocol;
 
 use super::body::scan_body;
 use super::client::{Upstream, UpstreamTarget};
+use super::usage::{observe, RequestSide};
+use portus_dataplane_core::ai::ledger::LedgerReporter;
 use super::tls::{client_auth_for, upstream_tls_for};
 
 /// Request bodies up to this size are buffered when the route allows retries,
@@ -94,11 +96,19 @@ pub struct ProxyService {
     metrics: Arc<ProxyMetrics>,
     outliers: Arc<Outliers>,
     client: Upstream,
+    /// Set when a ledger is configured: AI route responses are recorded.
+    ledger: Option<Arc<LedgerReporter>>,
 }
 
 impl ProxyService {
-    pub fn new(snapshot: SnapshotSlot, metrics: Arc<ProxyMetrics>, outliers: Arc<Outliers>, client: Upstream) -> Self {
-        Self { snapshot, metrics, outliers, client }
+    pub fn new(
+        snapshot: SnapshotSlot,
+        metrics: Arc<ProxyMetrics>,
+        outliers: Arc<Outliers>,
+        client: Upstream,
+        ledger: Option<Arc<LedgerReporter>>,
+    ) -> Self {
+        Self { snapshot, metrics, outliers, client, ledger }
     }
 }
 
@@ -221,9 +231,20 @@ impl ProxyService {
             req.uri().authority().map(|a| a.to_string())
         };
 
-        let response = self.forward(req, &plan, peer_ip, authority).await;
+        let request_bytes: u64 = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        let mut response = self.forward(req, &plan, peer_ip, authority).await;
 
         let status = response.status().as_u16();
+        if let (Some(ai), Some(ledger)) = (plan.ai.as_ref(), self.ledger.as_ref()) {
+            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start };
+            let body = std::mem::replace(response.body_mut(), Body::empty());
+            *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring));
+        }
         let host_label = plan.service_name.as_ref();
         self.metrics.request_total.with_label_values(&[host_label, status_label(status).as_str(), plan.protocol_label()]).inc();
         plan.duration_histogram.observe(start.elapsed().as_secs_f64());

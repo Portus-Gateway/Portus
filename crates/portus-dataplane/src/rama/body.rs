@@ -60,7 +60,7 @@ pub async fn scan_body(mut body: Body, need: BodyNeed) -> Result<(BodyFields, Bo
             Some(Scalar::Bool(b)) => b.to_string(),
             Some(Scalar::Num(n)) => n.clone(),
             Some(Scalar::Null) => "null".to_string(),
-            Some(Scalar::Compound) | None => continue,
+            Some(Scalar::Compound | Scalar::Raw(_)) | None => continue,
         };
         fields.push((key, value));
     }

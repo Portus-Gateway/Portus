@@ -254,6 +254,15 @@ pub struct PathRoute {
     pub connection_limiter: Option<Arc<ConnectionLimiter>>,
     // PERF-10: Pre-computed total weight for weighted backend selection
     pub total_weight: u32,
+    /// Set when the backend is an AIProvider: usage is read from responses.
+    pub ai: Option<AiBackend>,
+}
+
+/// The AI provider behind a route, for usage accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiBackend {
+    pub dialect: crate::ai::usage::Dialect,
+    pub provider: Arc<str>,
 }
 
 impl PathRoute {
@@ -1226,6 +1235,7 @@ pub fn build_route_map(
                     circuit_breaker: None,
                     connection_limiter: None,
                     total_weight: 0,
+                    ai: None,
                 }
             };
 
@@ -1327,6 +1337,7 @@ pub mod test_support {
             circuit_breaker: None,
             connection_limiter: None,
             total_weight: 0,
+            ai: None,
         }
     }
 }
