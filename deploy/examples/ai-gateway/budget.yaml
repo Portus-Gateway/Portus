@@ -1,0 +1,19 @@
+# One million tokens per API key per UTC day on the `claude` route. Tokens
+# are input + output + cache read + cache creation as Anthropic reports
+# them. Every response carries x-portus-tokens-remaining; a request that
+# does not fit is a 429 with Retry-After to midnight UTC.
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIUsagePolicy
+metadata:
+  name: daily-cap
+  namespace: llm
+spec:
+  targetRef:
+    group: portus-gateway.dev
+    kind: AIRoute
+    name: claude
+  budget:
+    tokens: 1000000
+    window: Daily
+    per: Key
+  onLedgerUnavailable: Open

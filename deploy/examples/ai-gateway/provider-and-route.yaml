@@ -1,0 +1,44 @@
+# An AI gateway in front of Anthropic: clients speak the Anthropic Messages
+# API to llm.example.com with a Portus API key, the gateway swaps in the
+# provider credential and records usage in the ledger.
+#
+# Needs: dataplane.networkStack=rama, aiGateway.enabled=true, the CRDs in
+# deploy/helm/crds/ai*.yaml applied, and a Gateway named `gateway` in this
+# namespace with an HTTP or HTTPS listener.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: anthropic-key
+  namespace: llm
+stringData:
+  api-key: sk-ant-REPLACE_ME
+---
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIProvider
+metadata:
+  name: anthropic
+  namespace: llm
+spec:
+  kind: anthropic
+  url: https://api.anthropic.com
+  credential:
+    secretRef:
+      name: anthropic-key
+---
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIRoute
+metadata:
+  name: claude
+  namespace: llm
+spec:
+  parentRefs:
+    - name: gateway
+  hostnames: [llm.example.com]
+  requireApiKey: true
+  rules:
+    - matches:
+        - model:
+            type: Prefix
+            value: claude-
+      providerRefs:
+        - name: anthropic
