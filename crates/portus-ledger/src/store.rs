@@ -17,6 +17,23 @@ pub struct Store {
     conn: Connection,
 }
 
+/// Totals for one API key over a period; key 0 is unauthenticated traffic.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct KeySummary {
+    pub key_id: u64,
+    pub tenant: String,
+    pub name: String,
+    /// Requests forwarded to a provider.
+    pub requests: u64,
+    /// Requests the gateway refused (401, 403, 429).
+    pub refusals: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub last_seen_unix_micros: u64,
+}
+
 /// One stored record, as exported.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Row {
@@ -40,6 +57,8 @@ pub struct Row {
     pub response_bytes: u64,
     pub key_id: u64,
     pub request_id: u64,
+    /// Empty when the request was forwarded.
+    pub refusal: String,
 }
 
 const SCHEMA: &str = "
@@ -63,7 +82,8 @@ CREATE TABLE IF NOT EXISTS usage (
     request_bytes INTEGER NOT NULL,
     response_bytes INTEGER NOT NULL,
     key_id INTEGER NOT NULL,
-    request_id INTEGER NOT NULL
+    request_id INTEGER NOT NULL,
+    refusal TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS usage_ts ON usage (ts_unix_micros);
 CREATE INDEX IF NOT EXISTS usage_key_ts ON usage (key_id, ts_unix_micros);
@@ -90,6 +110,13 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        // Ledgers created before refusals were recorded lack the column.
+        let has_refusal: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('usage') WHERE name = 'refusal'")?
+            .exists([])?;
+        if !has_refusal {
+            conn.execute_batch("ALTER TABLE usage ADD COLUMN refusal TEXT NOT NULL DEFAULT ''")?;
+        }
         conn.execute_batch(keys::SCHEMA)?;
         conn.execute_batch(budget::SCHEMA)?;
         Ok(Self { conn })
@@ -145,8 +172,8 @@ impl Store {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO usage (node, ts_unix_micros, duration_micros, status, dialect, stream, provider, route_host,
                  requested_model, served_model, has_usage, input_tokens, output_tokens, cache_read_tokens,
-                 cache_creation_tokens, request_bytes, response_bytes, key_id, request_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+                 cache_creation_tokens, request_bytes, response_bytes, key_id, request_id, refusal)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             )?;
             for r in records {
                 stmt.execute(params![
@@ -169,6 +196,7 @@ impl Store {
                     r.response_bytes as i64,
                     r.key_id as i64,
                     r.request_id as i64,
+                    r.refusal,
                 ])?;
             }
         }
@@ -181,7 +209,7 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, node, ts_unix_micros, duration_micros, status, dialect, stream, provider, route_host,
              requested_model, served_model, has_usage, input_tokens, output_tokens, cache_read_tokens,
-             cache_creation_tokens, request_bytes, response_bytes, key_id, request_id
+             cache_creation_tokens, request_bytes, response_bytes, key_id, request_id, refusal
              FROM usage WHERE ts_unix_micros >= ?1 ORDER BY ts_unix_micros, id LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![since as i64, limit as i64], |r| {
@@ -206,6 +234,36 @@ impl Store {
                 response_bytes: r.get::<_, i64>(17)? as u64,
                 key_id: r.get::<_, i64>(18)? as u64,
                 request_id: r.get::<_, i64>(19)? as u64,
+                refusal: r.get(20)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Per-key totals since `since` (unix µs): what an operator asks first.
+    pub fn summary(&self, since: u64) -> rusqlite::Result<Vec<KeySummary>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT u.key_id, COALESCE(k.tenant, ''), COALESCE(k.name, ''),
+                    SUM(CASE WHEN u.refusal = '' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN u.refusal <> '' THEN 1 ELSE 0 END),
+                    SUM(u.input_tokens), SUM(u.output_tokens), SUM(u.cache_read_tokens), SUM(u.cache_creation_tokens),
+                    MAX(u.ts_unix_micros)
+             FROM usage u LEFT JOIN api_keys k ON k.id = u.key_id
+             WHERE u.ts_unix_micros >= ?1
+             GROUP BY u.key_id ORDER BY SUM(u.input_tokens) + SUM(u.output_tokens) DESC",
+        )?;
+        let rows = stmt.query_map(params![since as i64], |r| {
+            Ok(KeySummary {
+                key_id: r.get::<_, i64>(0)? as u64,
+                tenant: r.get(1)?,
+                name: r.get(2)?,
+                requests: r.get::<_, i64>(3)? as u64,
+                refusals: r.get::<_, i64>(4)? as u64,
+                input_tokens: r.get::<_, i64>(5)? as u64,
+                output_tokens: r.get::<_, i64>(6)? as u64,
+                cache_read_tokens: r.get::<_, i64>(7)? as u64,
+                cache_creation_tokens: r.get::<_, i64>(8)? as u64,
+                last_seen_unix_micros: r.get::<_, i64>(9)? as u64,
             })
         })?;
         rows.collect()
@@ -242,7 +300,66 @@ mod tests {
             response_bytes: 20,
             key_id: 0,
             request_id: ts,
+            refusal: String::new(),
         }
+    }
+
+    #[test]
+    fn refusals_are_stored_and_exported_with_their_reason() {
+        let mut store = Store::in_memory().unwrap();
+        let mut r = record(5, "claude-opus-5", None);
+        r.status = 429;
+        r.key_id = 77;
+        r.refusal = "budget_exhausted".into();
+        store.insert_batch("pod", &[r]).unwrap();
+        let rows = store.export(0, 10).unwrap();
+        assert_eq!((rows[0].status, rows[0].key_id, rows[0].refusal.as_str(), rows[0].has_usage), (429, 77, "budget_exhausted", false));
+    }
+
+    #[test]
+    fn the_summary_totals_per_key_and_counts_refusals_separately() {
+        let mut store = Store::in_memory().unwrap();
+        let (row, _) = store.issue_key("team-a", "ci", &[], None).unwrap();
+        let mut ok1 = record(10, "claude-opus-5", Some((100, 20)));
+        ok1.key_id = row.id;
+        let mut ok2 = record(20, "claude-opus-5", Some((50, 5)));
+        ok2.key_id = row.id;
+        ok2.cache_read_tokens = 300;
+        let mut refused = record(30, "claude-opus-5", None);
+        refused.key_id = row.id;
+        refused.status = 429;
+        refused.refusal = "budget_exhausted".into();
+        let anon = record(40, "gpt-5", None);
+        store.insert_batch("pod", &[ok1, ok2, refused, anon]).unwrap();
+
+        let s = store.summary(0).unwrap();
+        assert_eq!(s.len(), 2);
+        let mine = s.iter().find(|k| k.key_id == row.id).unwrap();
+        assert_eq!((mine.tenant.as_str(), mine.name.as_str()), ("team-a", "ci"));
+        assert_eq!((mine.requests, mine.refusals), (2, 1));
+        assert_eq!((mine.input_tokens, mine.output_tokens, mine.cache_read_tokens), (150, 25, 300));
+        assert_eq!(mine.last_seen_unix_micros, 30);
+        let anon = s.iter().find(|k| k.key_id == 0).unwrap();
+        assert_eq!((anon.name.as_str(), anon.requests), ("", 1));
+        assert_eq!(store.summary(25).unwrap().iter().find(|k| k.key_id == row.id).unwrap().requests, 0, "since filters");
+    }
+
+    #[test]
+    fn an_old_ledger_file_gains_the_refusal_column() {
+        let dir = std::env::temp_dir().join(format!("portus-ledger-migrate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(&SCHEMA.replace(",
+    refusal TEXT NOT NULL DEFAULT ''", "")).unwrap();
+            c.execute("INSERT INTO usage (node, ts_unix_micros, duration_micros, status, dialect, stream, provider, route_host, requested_model, served_model, has_usage, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, request_bytes, response_bytes, key_id, request_id) VALUES ('p',1,1,200,'anthropic',0,'a','h','m','m',1,1,1,0,0,0,0,0,1)", []).unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let rows = store.export(0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].refusal, "", "pre-existing rows read as forwarded");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

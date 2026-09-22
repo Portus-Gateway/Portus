@@ -28,7 +28,7 @@ spec:
                       type: string
                     kind:
                       type: string
-                      enum: [HTTPRoute, GRPCRoute, Gateway]
+                      enum: [HTTPRoute, GRPCRoute, AIRoute, Gateway]
                     name:
                       type: string
                     sectionName:

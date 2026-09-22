@@ -88,6 +88,13 @@ pub enum Refusal {
 }
 
 impl Refusal {
+    pub fn kind(self) -> crate::ai::usage::RefusalKind {
+        match self {
+            Refusal::Unauthenticated => crate::ai::usage::RefusalKind::Unauthenticated,
+            Refusal::ModelNotAllowed => crate::ai::usage::RefusalKind::ModelNotAllowed,
+        }
+    }
+
     /// The error body in the dialect the client speaks, so SDKs surface it
     /// the way they would the provider's own error.
     pub fn reply(self, dialect: Dialect, model: Option<&str>) -> Reply {

@@ -213,6 +213,22 @@ Resources over the same round, summed across the three dataplane pods (CPU in mi
 
 The Rama adapter uses Rama 0.4 unpatched for TCP, TLS, the HTTP/1 and HTTP/2 client connections and the server. The upstream connection pool is Portus's own: one shard of idle HTTP/1 connections per backend, TLS policy and protocol, a rotating set of HTTP/2 connections per gRPC or h2c backend, the client read buffer capped at 64 KiB, and TCP_NODELAY on every socket. Its decisions are exported as `proxy_upstream_pool_events_total{event}` on the metrics port.
 
+## AI gateway
+
+Portus can front LLM providers as well as ordinary backends. Three CRDs turn a Gateway into an AI gateway; clients keep speaking the provider's native API (Anthropic Messages, OpenAI chat) and the gateway routes on the request body, swaps the client's key for the provider's, meters tokens and enforces budgets. It needs the Rama network stack (`dataplane.networkStack: rama`) and `aiGateway.enabled: true`, which also deploys the ledger, the small companion service that keeps everything with state so the data plane never calls out on the request path.
+
+| Resource | What it does |
+|---|---|
+| `AIProvider` | An LLM API: `kind` (`anthropic`, `openai`, `openai-compatible`), `url` (scheme and host), the provider credential from a Secret. Resolved to endpoints by the controller. |
+| `AIRoute` | An HTTPRoute-shaped route whose matches include the body's `model` (exact, prefix or regex) and `stream`. `requireApiKey: true` demands a Portus API key. |
+| `AIUsagePolicy` | A token budget on an AIRoute per key, tenant or route, per UTC hour, day or month, with a fail-open or fail-closed choice when the ledger is unreachable. |
+
+The ordinary policies (TimeoutPolicy, RateLimitPolicy, RetryPolicy and the rest) target an AIRoute the same way they target an HTTPRoute.
+
+How it stays fast: the body is scanned as it streams with a memchr-driven JSON field scanner that stops at the first sight of `model` and `stream`, and the held bytes are replayed to the provider unchanged; keys are one SHA-256 and a hash-map lookup against a snapshot the ledger pushes; budgets are a local counter per subject that reserves an estimate before the request and settles to the provider's real token count after, syncing with the ledger once a second; usage records go into a lock-free ring drained by a background task. Every budgeted response carries `x-portus-tokens-remaining`; refusals are 401, 403 or 429 in the provider's own error shape with `Retry-After`.
+
+The ledger issues and revokes keys (`POST`/`GET`/`DELETE /v1/keys`, bearer token in the generated `<release>-portus-gateway-ledger-admin` Secret), answers `GET /v1/summary?hours=24` with requests, refusals and tokens per key, exports every record as JSON lines (`GET /export.jsonl`) and exposes `/metrics`. Example manifests and a walk-through, including pointing Claude Code at the gateway with `ANTHROPIC_BASE_URL`, are in [`deploy/examples/ai-gateway/`](deploy/examples/ai-gateway/).
+
 ## Configuration
 
 ### Helm Values
@@ -242,6 +258,9 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
 | `grpcTls.enabled` | `true` | mTLS on the config stream. The chart generates a CA and controller certificate on first install and keeps them across upgrades; the controller copies the Secret into each Gateway's namespace |
 | `grpcTls.secretName` | `""` | Bring your own Secret (`ca.crt`, `tls.crt`, `tls.key`) instead of the generated one |
+| `aiGateway.enabled` | `false` | Deploy the ledger and enable AI routes; needs `dataplane.networkStack: rama`. On an existing install upgrade with `--reset-then-reuse-values` and delete the generated grpc-tls Secret once so it is regenerated with the ledger's names |
+| `aiGateway.ledger.storage.size` | `1Gi` | PersistentVolumeClaim for the ledger's SQLite file |
+| `aiGateway.ledger.adminTokenSecretName` | `""` | Bring your own admin token Secret (key `token`) for the key API |
 
 Full reference: [`docs/deployment.md`](docs/deployment.md).
 

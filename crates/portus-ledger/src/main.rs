@@ -55,6 +55,7 @@ type Done<T> = oneshot::Sender<rusqlite::Result<T>>;
 enum Op {
     Write { node: String, records: Vec<portus_types::proto::portus::ledger::v1::UsageRecord>, done: Done<usize> },
     Export { since: u64, limit: usize, done: Done<Vec<store::Row>> },
+    Summary { since: u64, done: Done<Vec<store::KeySummary>> },
     Count(Done<u64>),
     IssueKey { tenant: String, name: String, models: Vec<String>, plaintext: Option<String>, done: Done<(KeyRow, String)> },
     RevokeKey { id: u64, done: Done<bool> },
@@ -73,6 +74,9 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
             }
             Op::Export { since, limit, done } => {
                 let _ = done.send(store.export(since, limit));
+            }
+            Op::Summary { since, done } => {
+                let _ = done.send(store.summary(since));
             }
             Op::Count(done) => {
                 let _ = done.send(store.count());
@@ -305,6 +309,22 @@ async fn export(State(shared): State<Arc<Shared>>, Query(p): Query<ExportParams>
     }
 }
 
+/// Per-key totals over the last `hours` (default 24), newest spenders first.
+/// Read-only, so no admin token: it names keys and tenants, never plaintext.
+async fn summary(State(shared): State<Arc<Shared>>, Query(p): Query<SummaryParams>) -> Response {
+    let hours = p.hours.unwrap_or(24).clamp(1, 24 * 366);
+    let since = now_micros().saturating_sub(hours * 3_600_000_000);
+    match shared.run(|done| Op::Summary { since, done }).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => storage_error(e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct SummaryParams {
+    hours: Option<u64>,
+}
+
 async fn issue_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Json(req): Json<IssueKeyRequest>) -> Response {
     if let Err(r) = admin_ok(&shared, &headers) {
         return *r;
@@ -366,6 +386,7 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/readyz", get(health))
         .route("/metrics", get(metrics))
         .route("/export.jsonl", get(export))
+        .route("/v1/summary", get(summary))
         .route("/v1/keys", get(list_keys).post(issue_key))
         .route("/v1/keys/{id}", axum::routing::delete(revoke_key))
         .with_state(shared)
@@ -533,5 +554,8 @@ mod tests {
         let (status, body) = call(&app, "GET", "/metrics", None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("ledger_api_keys_live 1"), "{body}");
+        let (status, body) = call(&app, "GET", "/v1/summary?hours=1", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "[]", "no usage yet");
     }
 }

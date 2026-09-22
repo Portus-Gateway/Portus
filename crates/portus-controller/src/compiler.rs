@@ -526,10 +526,17 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
                                     route.port = 0;
                                 }
                             }
+                            // AIRoutes travel through this loop under a
+                            // marked key; their source is the AIRoute itself,
+                            // so policies with targetRef kind AIRoute match.
+                            let (kind, name) = match route_key.name.strip_prefix(AI_ROUTE_KEY_PREFIX) {
+                                Some(ai_name) => ("AIRoute", ai_name.to_string()),
+                                None => ("HTTPRoute", route_key.name.clone()),
+                            };
                             route_sources.push(RouteSource {
-                                kind: "HTTPRoute".to_string(),
+                                kind: kind.to_string(),
                                 namespace: route_key.namespace.clone(),
-                                name: route_key.name.clone(),
+                                name,
                                 gateway_refs: gateway_refs.clone(),
                             });
                             routes.push(route);
@@ -857,7 +864,7 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         .ai_routes
         .iter()
         .filter(|e| e.value().require_api_key)
-        .map(|e| (e.key().namespace.clone(), format!("airoute/{}", e.key().name)))
+        .map(|e| (e.key().namespace.clone(), e.key().name.clone()))
         .collect();
     // AIUsagePolicy budgets: one accepted policy per AIRoute, attached to
     // every RouteConfig synthesized from it.
@@ -868,7 +875,7 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         .map(|e| {
             let p = e.value();
             (
-                (p.target.namespace.clone(), format!("airoute/{}", p.target.name)),
+                (p.target.namespace.clone(), p.target.name.clone()),
                 portus_types::AiBudget {
                     policy: format!("{}/{}", e.key().namespace, e.key().name),
                     tokens: p.tokens,
@@ -880,6 +887,9 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         })
         .collect();
     for (route, source) in routes.iter_mut().zip(route_sources.iter()) {
+        if source.kind != "AIRoute" {
+            continue;
+        }
         let key = (source.namespace.clone(), source.name.clone());
         if key_required.contains(&key) {
             route.ai_key_required = true;
@@ -1653,6 +1663,10 @@ fn apply_policies(
 /// each rule sets the provider's Host and credential header and points at
 /// the provider's synthetic Service. Rules whose provider is gone compile
 /// with no backend and answer 500, like an HTTPRoute with a missing Service.
+/// Marks an AIRoute's synthesized HTTPRouteState in the compile loop; the
+/// prefix contains a slash so no real HTTPRoute name can collide with it.
+const AI_ROUTE_KEY_PREFIX: &str = "airoute/";
+
 fn ai_routes_as_http_routes(store: &ConfigStore) -> Vec<(NamespacedName, HTTPRouteState)> {
     let ai_routes: Vec<(NamespacedName, crate::store::AIRouteState)> =
         store.ai_routes.iter().map(|e| (e.key().clone(), e.value().clone())).collect();
@@ -1708,7 +1722,7 @@ fn ai_routes_as_http_routes(store: &ConfigStore) -> Vec<(NamespacedName, HTTPRou
                 })
                 .collect();
             (
-                NamespacedName { namespace: key.namespace, name: format!("airoute/{}", key.name) },
+                NamespacedName { namespace: key.namespace, name: format!("{AI_ROUTE_KEY_PREFIX}{}", key.name) },
                 HTTPRouteState {
                     namespace: ar.namespace,
                     hostnames: ar.hostnames,
@@ -2372,10 +2386,49 @@ mod tests {
             },
         );
 
+        // Ordinary policies target the AIRoute by its own kind and name.
+        store.timeout_policies.insert(
+            NamespacedName { namespace: "default".into(), name: "slow-llm".into() },
+            crate::store::TimeoutPolicyState {
+                target: crate::store::PolicyTargetKey { group: "portus-gateway.dev".into(), kind: "AIRoute".into(), namespace: "default".into(), name: "claude".into(), section_name: None },
+                request_timeout_ms: 600_000,
+                backend_request_timeout_ms: 0,
+                connect_timeout_ms: 0,
+                generation: 1,
+                creation_timestamp: None,
+                accepted: true,
+            },
+        );
+        store.rate_limit_policies.insert(
+            NamespacedName { namespace: "default".into(), name: "rpm".into() },
+            crate::store::RateLimitPolicyState {
+                target: crate::store::PolicyTargetKey { group: "portus-gateway.dev".into(), kind: "AIRoute".into(), namespace: "default".into(), name: "claude".into(), section_name: None },
+                requests_per_second: 5,
+                per_client: true,
+                generation: 1,
+                creation_timestamp: None,
+                accepted: true,
+            },
+        );
+        // An HTTPRoute policy with the same name must not leak onto the AIRoute.
+        store.rate_limit_policies.insert(
+            NamespacedName { namespace: "default".into(), name: "other".into() },
+            crate::store::RateLimitPolicyState {
+                target: crate::store::PolicyTargetKey { group: "gateway.networking.k8s.io".into(), kind: "HTTPRoute".into(), namespace: "default".into(), name: "claude".into(), section_name: None },
+                requests_per_second: 99,
+                per_client: false,
+                generation: 1,
+                creation_timestamp: None,
+                accepted: true,
+            },
+        );
+
         let config = compile_config(&store);
         assert_eq!(config.routes.len(), 1);
         let route = &config.routes[0];
         assert!(route.ai_key_required);
+        assert_eq!(route.request_timeout_ms, 600_000, "TimeoutPolicy targeting the AIRoute applies");
+        assert_eq!(route.rate_limit.as_ref().map(|r| (r.requests_per_second, r.per_client)), Some((5, true)), "RateLimitPolicy targeting the AIRoute applies, the HTTPRoute one does not");
         let budget = route.ai_budget.as_ref().expect("budget attached");
         assert_eq!((budget.policy.as_str(), budget.tokens, budget.window.as_str(), budget.per.as_str(), budget.fail_open), ("default/cap", 1_000_000, "DAILY", "KEY", false));
         assert_eq!(route.host, "llm.example.com");

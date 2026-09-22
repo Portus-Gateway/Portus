@@ -36,6 +36,9 @@ message UsageRecord {
   uint64 response_bytes = 16;
   uint64 key_id = 17;          // 0 until API keys exist
   uint64 request_id = 18;
+  // Why the gateway refused the request before forwarding it; empty when
+  // it was forwarded. unauthenticated | model_not_allowed | budget_exhausted
+  string refusal = 19;
 }
 
 message ReportAck {

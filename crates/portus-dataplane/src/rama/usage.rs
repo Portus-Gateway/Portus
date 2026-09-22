@@ -13,7 +13,7 @@ use rama::http::body::{Frame, SizeHint};
 use rama::http::{Body, StreamingBody};
 
 use portus_dataplane_core::ai::budget::Reservation;
-use portus_dataplane_core::ai::usage::{UsageRecord, UsageRing, UsageTracker};
+use portus_dataplane_core::ai::usage::{RefusalKind, UsageRecord, UsageRing, UsageTracker};
 use portus_dataplane_core::router::{AiBackend, BodyFields};
 
 /// What the handler knows about the request before the response body runs.
@@ -29,11 +29,19 @@ pub struct RequestSide<'a> {
     pub reservation: Option<Reservation>,
 }
 
-/// Wrap `body` so its usage is recorded into `ring` when it completes.
-pub fn observe(body: Body, status: u16, req: RequestSide<'_>, ring: Arc<UsageRing>) -> Body {
+/// Record a request the gateway refused itself: no tokens, the key when
+/// one was recognised, and why.
+pub fn record_refusal(status: u16, kind: RefusalKind, req: RequestSide<'_>, ring: &UsageRing) {
+    let mut record = base_record(status, &req);
+    record.duration_micros = req.start.elapsed().as_micros() as u64;
+    record.refusal = Some(kind);
+    ring.push(record);
+}
+
+fn base_record(status: u16, req: &RequestSide<'_>) -> UsageRecord {
     let field = |key: &str| req.body_fields.and_then(|f| f.iter().find(|(k, _)| *k == key)).map(|(_, v)| v.as_str());
     let stream = field("stream") == Some("true");
-    let record = UsageRecord {
+    UsageRecord {
         ts_unix_micros: SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
             - req.start.elapsed().as_micros() as u64,
         duration_micros: 0,
@@ -49,7 +57,14 @@ pub fn observe(body: Body, status: u16, req: RequestSide<'_>, ring: Arc<UsageRin
         response_bytes: 0,
         key_id: req.key_id,
         request_id: rand::random(),
-    };
+        refusal: None,
+    }
+}
+
+/// Wrap `body` so its usage is recorded into `ring` when it completes.
+pub fn observe(body: Body, status: u16, req: RequestSide<'_>, ring: Arc<UsageRing>) -> Body {
+    let stream = req.body_fields.and_then(|f| f.iter().find(|(k, _)| *k == "stream")).is_some_and(|(_, v)| v == "true");
+    let record = base_record(status, &req);
     Body::new(Observed {
         inner: body,
         tracker: Some(UsageTracker::new(req.ai.dialect, stream)),
@@ -168,5 +183,18 @@ mod tests {
         assert!(out[0].stream);
         assert_eq!(out[0].tokens, None, "no usage chunk was seen");
         assert_eq!(out[0].served_model.as_str(), "gpt-5");
+    }
+
+    #[test]
+    fn a_refusal_is_recorded_with_its_reason_and_no_tokens() {
+        let ring = UsageRing::new(8);
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None };
+        let fields: BodyFields = vec![("model", "claude-opus-5".into())];
+        record_refusal(429, RefusalKind::BudgetExhausted, side(&ai, &fields), &ring);
+        let mut out = Vec::new();
+        assert_eq!(ring.drain_into(&mut out, 10), 1);
+        let r = &out[0];
+        assert_eq!((r.status, r.key_id, r.refusal, r.tokens), (429, 9, Some(RefusalKind::BudgetExhausted), None));
+        assert_eq!((r.requested_model.as_str(), r.provider.as_str()), ("claude-opus-5", "anthropic"));
     }
 }

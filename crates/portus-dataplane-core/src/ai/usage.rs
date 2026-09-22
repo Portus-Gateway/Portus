@@ -306,6 +306,26 @@ pub struct UsageRecord {
     /// The API key the request authenticated with; 0 until keys exist.
     pub key_id: u64,
     pub request_id: u64,
+    /// Set when the gateway refused the request instead of forwarding it.
+    pub refusal: Option<RefusalKind>,
+}
+
+/// Why the gateway refused a request itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusalKind {
+    Unauthenticated,
+    ModelNotAllowed,
+    BudgetExhausted,
+}
+
+impl RefusalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthenticated => "unauthenticated",
+            Self::ModelNotAllowed => "model_not_allowed",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
 }
 
 impl UsageRecord {
@@ -481,6 +501,7 @@ mod tests {
             response_bytes: 0,
             key_id: 0,
             request_id: id,
+            refusal: None,
         }
     }
 

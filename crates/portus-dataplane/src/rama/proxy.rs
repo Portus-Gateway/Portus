@@ -38,7 +38,8 @@ use portus_dataplane_core::types::BackendProtocol;
 
 use super::body::scan_body;
 use super::client::{Upstream, UpstreamTarget};
-use super::usage::{observe, RequestSide};
+use super::usage::{observe, record_refusal, RequestSide};
+use portus_dataplane_core::ai::usage::RefusalKind;
 use portus_dataplane_core::ai::budget::{estimate, exhausted_reply, now_micros, Scope, Verdict, REMAINING_HEADER};
 use portus_dataplane_core::ai::keys::{authorize, Refusal};
 use portus_dataplane_core::ai::ledger::LedgerReporter;
@@ -259,6 +260,16 @@ impl ProxyService {
                     let reply = refusal.reply(ai.dialect, model);
                     let status = reply.status;
                     self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
+                    if let Some(ledger) = self.ledger.as_ref() {
+                        // A model refusal knows its key; an authentication one does not.
+                        let key_id = if refusal == Refusal::ModelNotAllowed {
+                            authorize(&ledger.keys.load(), &Headers(req.headers()), None).map(|k| k.id).unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation: None };
+                        record_refusal(status, refusal.kind(), side, &ledger.ring);
+                    }
                     if let Some((method, path)) = &logged {
                         access_log(peer_ip, method, path, plan.service_name.as_ref(), status, start);
                     }
@@ -313,6 +324,10 @@ impl ProxyService {
                 let reply = exhausted_reply(ai.dialect, retry, remaining, needed);
                 let status = reply.status;
                 self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
+                if let Some(ledger) = self.ledger.as_ref() {
+                    let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation: None };
+                    record_refusal(status, RefusalKind::BudgetExhausted, side, &ledger.ring);
+                }
                 if let Some((method, path)) = &logged {
                     access_log(peer_ip, method, path, plan.service_name.as_ref(), status, start);
                 }

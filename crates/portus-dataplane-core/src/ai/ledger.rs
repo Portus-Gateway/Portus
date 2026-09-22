@@ -100,6 +100,7 @@ pub fn to_wire(r: &UsageRecord) -> WireRecord {
         response_bytes: r.response_bytes,
         key_id: r.key_id,
         request_id: r.request_id,
+        refusal: r.refusal.map_or("", |k| k.as_str()).to_string(),
     }
 }
 
@@ -240,15 +241,19 @@ mod tests {
             response_bytes: 200,
             key_id: 7,
             request_id: 42,
+            refusal: None,
         };
         let w = to_wire(&r);
+        assert_eq!(w.refusal, "");
         assert_eq!((w.status, w.dialect.as_str(), w.stream, w.has_usage), (200, "openai", true, true));
         assert_eq!((w.input_tokens, w.output_tokens, w.cache_read_tokens), (9, 12, 3));
         assert_eq!((w.provider.as_str(), w.route_host.as_str(), w.requested_model.as_str(), w.served_model.as_str()), ("echo", "llm.bench", "gpt-5", ""));
         assert_eq!((w.request_bytes, w.response_bytes, w.key_id, w.request_id), (100, 200, 7, 42));
         r.tokens = None;
+        r.refusal = Some(crate::ai::usage::RefusalKind::BudgetExhausted);
         let w = to_wire(&r);
         assert!(!w.has_usage);
+        assert_eq!(w.refusal, "budget_exhausted");
         assert_eq!((w.input_tokens, w.output_tokens), (0, 0));
     }
 }
