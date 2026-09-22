@@ -80,7 +80,7 @@ spec:
               value: {{ .Values.dataplane.threads | quote }}
             {{- end }}
             - name: PORTUS_DATAPLANE_NETWORK_STACK
-              value: {{ .Values.dataplane.networkStack | default "pingora" | quote }}
+              value: {{ .Values.dataplane.networkStack | default "rama" | quote }}
             {{- if .Values.aiGateway.enabled }}
             # Data planes report AI usage records here.
             - name: PORTUS_DATAPLANE_LEDGER_ADDR

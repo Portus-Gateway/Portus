@@ -15,6 +15,9 @@ pub struct Readiness {
     pub config_received: AtomicBool,
     /// Unix seconds of the last applied config.
     pub last_config_time: AtomicU64,
+    /// SIGTERM received: report not ready so the Service stops sending new
+    /// connections while the ones in flight finish.
+    pub draining: AtomicBool,
 }
 
 impl Readiness {
@@ -25,13 +28,19 @@ impl Readiness {
         self.last_config_time.store(unix_now(), Ordering::Release);
     }
 
+    /// Stop reporting ready; the pod is shutting down.
+    pub fn start_draining(&self) {
+        self.draining.store(true, Ordering::Release);
+    }
+
     /// Readiness logic:
+    /// - Not ready once draining (SIGTERM received)
     /// - Not ready if config has NEVER been received (cold start)
     /// - Ready if config has been received AND stream is connected
     /// - Ready if stream disconnected but last config is less than 120s old (stale grace period)
     /// - Not ready if stream disconnected AND last config is older than 120s
     pub fn is_ready(&self) -> bool {
-        if !self.config_received.load(Ordering::Relaxed) {
+        if self.draining.load(Ordering::Relaxed) || !self.config_received.load(Ordering::Relaxed) {
             return false;
         }
         if self.grpc_connected.load(Ordering::Relaxed) {
@@ -58,7 +67,16 @@ mod tests {
             grpc_connected: AtomicBool::new(connected),
             config_received: AtomicBool::new(received),
             last_config_time: AtomicU64::new(unix_now().saturating_sub(last_config_secs_ago)),
+            draining: AtomicBool::new(false),
         }
+    }
+
+    #[test]
+    fn draining_makes_a_configured_connected_pod_not_ready() {
+        let r = readiness(true, true, 5);
+        assert!(r.is_ready());
+        r.start_draining();
+        assert!(!r.is_ready());
     }
 
     #[test]

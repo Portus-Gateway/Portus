@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7
 FROM rust:1.98-alpine AS builder
-# Cargo features for the dataplane binary, e.g. "rama" to build the experimental stack in.
-ARG DATAPLANE_FEATURES=""
+# Cargo features for the dataplane binary. The release image carries both
+# network stacks (Pingora is a default feature, Rama is added here) so
+# `dataplane.networkStack` switches between them at run time.
+ARG DATAPLANE_FEATURES="rama"
 
 RUN apk add --no-cache musl-dev cmake make perl build-base protoc
 

@@ -252,7 +252,7 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `dataplane.replicasPerGateway` | `2` | Pods per Gateway |
 | `dataplane.resources` | 250m / 256Mi requests, 512Mi limit | No CPU limit |
 | `dataplane.threads` | `""` | Proxy worker threads per pod; empty sizes from the cgroup CPU limit, else the node's CPU count |
-| `dataplane.networkStack` | `pingora` | Network stack the dataplane pods serve on; other values select an experimental stack built into the image, for comparison only |
+| `dataplane.networkStack` | `rama` | Network stack the dataplane pods serve on: `rama` (default) or `pingora`, both in the release image |
 | `dataplane.accessLog` | `false` | One log line per request (`portus_dataplane::access`) |
 | `dataplane.service.type` | `LoadBalancer` | Per-Gateway Service type; use `ClusterIP` on k3d |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |

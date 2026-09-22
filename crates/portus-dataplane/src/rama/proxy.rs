@@ -132,6 +132,7 @@ struct Incoming {
     uri: Uri,
 }
 
+#[derive(Debug, PartialEq)]
 enum AttemptError {
     /// Nothing reached the backend (dial, TLS handshake).
     Connect(String),
@@ -139,6 +140,8 @@ enum AttemptError {
     Timeout,
     /// The exchange failed after the connection was up.
     Exchange(String),
+    /// The request body grew past the route's limit while streaming.
+    BodyTooLarge,
 }
 
 impl ProxyService {
@@ -392,6 +395,13 @@ impl ProxyService {
         let downstream_upgrade = is_upgrade.then(|| handle_upgrade(&req));
 
         let (parts, body) = req.into_parts();
+        // Content-Length bodies were checked when planning; this bounds the
+        // chunked and streamed ones as they flow to the backend.
+        let body = if plan.max_request_body_bytes > 0 {
+            body.limited(usize::try_from(plan.max_request_body_bytes).unwrap_or(usize::MAX))
+        } else {
+            body
+        };
         let method = parts.method;
         let version = parts.version;
         let uri = parts.uri;
@@ -496,6 +506,13 @@ impl ProxyService {
                 Err(AttemptError::Exchange(why)) => {
                     warn!("upstream exchange with {} failed: {why}", plan.service_name);
                     break status_response(StatusCode::BAD_GATEWAY);
+                }
+                Err(AttemptError::BodyTooLarge) => {
+                    let mut resp = status_response(StatusCode::PAYLOAD_TOO_LARGE);
+                    // The unread remainder of the body would otherwise be
+                    // parsed as the next request on this connection.
+                    resp.headers_mut().insert("connection", HeaderValue::from_static("close"));
+                    break resp;
                 }
             }
         };
@@ -659,6 +676,9 @@ fn classify(err: &BoxError) -> AttemptError {
         if e.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
             return AttemptError::Timeout;
         }
+        if e.downcast_ref::<rama::http::body::util::LengthLimitError>().is_some() {
+            return AttemptError::BodyTooLarge;
+        }
         cur = e.source();
     }
     AttemptError::Exchange(err.to_string())
@@ -683,4 +703,33 @@ fn status_response(status: StatusCode) -> Response {
     *resp.status_mut() = status;
     resp.headers_mut().insert("content-length", HeaderValue::from_static("0"));
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_body_over_the_route_limit_is_classified_as_too_large_wherever_it_sits_in_the_chain() {
+        let over = Body::new(Full::new(Bytes::from_static(b"0123456789"))).limited(4);
+        let direct: BoxError = Box::new(over.collect().await.expect_err("the limited body errors"));
+        assert_eq!(classify(&direct), AttemptError::BodyTooLarge);
+        #[derive(Debug)]
+        struct Wrapped(BoxError);
+        impl std::fmt::Display for Wrapped {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "sending request body")
+            }
+        }
+        impl std::error::Error for Wrapped {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self.0.as_ref())
+            }
+        }
+        let inner: BoxError = Box::new(Body::new(Full::new(Bytes::from_static(b"0123456789"))).limited(4).collect().await.err().unwrap());
+        let nested: BoxError = Box::new(Wrapped(inner));
+        assert_eq!(classify(&nested), AttemptError::BodyTooLarge);
+        let other: BoxError = "connection reset".into();
+        assert!(matches!(classify(&other), AttemptError::Exchange(_)));
+    }
 }

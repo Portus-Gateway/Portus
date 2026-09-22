@@ -118,9 +118,10 @@ build: build-controller build-dataplane
 build-controller: disk-check
 	$(DOCKER) build -t $(CONTROLLER_IMAGE) -f deploy/docker/Dockerfile.controller .
 
-# DATAPLANE_FEATURES=rama builds the experimental Rama stack into the image
-# (select it at run time with dataplane.networkStack=rama).
-DATAPLANE_FEATURES ?=
+# Cargo features for the dataplane image. The release image carries both
+# network stacks (pingora is a default feature, rama is added here); select
+# one at run time with dataplane.networkStack.
+DATAPLANE_FEATURES ?= rama
 build-dataplane: disk-check
 	$(DOCKER) build -t $(DATAPLANE_IMAGE) --build-arg DATAPLANE_FEATURES="$(DATAPLANE_FEATURES)" -f deploy/docker/Dockerfile.dataplane .
 

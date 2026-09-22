@@ -71,7 +71,7 @@ The stream between controller and dataplanes carries the compiled routing config
 | `dataplane.replicasPerGateway` | `2` | Pods per Gateway; the PDB keeps one available |
 | `dataplane.resources` | 250m / 256Mi requests, 512Mi memory limit | No CPU limit |
 | `dataplane.threads` | `""` | Proxy worker threads per pod (`DATAPLANE_THREADS`); empty sizes from the cgroup CPU limit if one is set, else the node's CPU count |
-| `dataplane.networkStack` | `pingora` | Network stack the dataplane pods serve on (`PORTUS_NETWORK_STACK`). `pingora` is the release stack; any other value selects an experimental stack built into the image and exists for side-by-side comparison, not production. A value the image does not carry fails the pod at start with a log line naming it |
+| `dataplane.networkStack` | `rama` | Network stack the dataplane pods serve on (`PORTUS_NETWORK_STACK`). The release image carries `rama` (default since 0.2.4) and `pingora`; a value the image does not carry fails the pod at start with a log line naming it |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
 | `dataplane.accessLog` | `false` | One line per request on the `portus_dataplane::access` target (`PORTUS_ACCESS_LOG`) |
 | `dataplane.controllerUrl` | `""` | `host:port` the dataplanes dial; empty means the controller Service (`<release>-portus-gateway-controller.<namespace>:<grpcPort>`) |
@@ -180,6 +180,7 @@ The controller hardcodes the gRPC listen address to `[::]:50051`. This is not co
 | `CONTROLLER_ADDR` | `portus-controller:50051` | gRPC address of the controller. The Helm chart auto-generates this from the controller Service name and port. |
 | `L4_IDLE_TIMEOUT_SECS` | `3600` | Idle timeout for L4 sessions (SNI mux passthrough/terminate, TCPRoute). A session is closed only when neither direction has carried bytes for this long, so long-lived protocols such as MQTT stay up as long as they exchange keepalives. |
 | `UDP_IDLE_TIMEOUT_SECS` | `60` | Idle timeout for UDPRoute client sessions (one per client source address per listener port). A client that stays quiet this long gets a fresh backend choice on its next datagram. |
+| `PORTUS_DRAIN_SECONDS` | `25` | Rama stack: how long a pod keeps serving requests already in flight after SIGTERM. The provisioner sets the pod's `terminationGracePeriodSeconds` to 30, so raise both together. |
 
 ## Health Checks
 
@@ -189,6 +190,8 @@ The dataplane exposes health and readiness endpoints on port 8081:
 - **`/readyz`** -- returns 200 if the dataplane has received at least one config from the controller AND either the gRPC stream is connected or the last config was received within the last 120 seconds (stale grace period). Returns 503 otherwise.
 
 The readiness probe has a 120-second grace period for gRPC disconnects. This means a brief controller restart or network blip won't cause the dataplane to go unready and stop receiving traffic -- it will keep serving with its last known config. If the stream stays down for more than 2 minutes, the pod goes unready.
+
+On SIGTERM (a rollout, a scale-down, a node drain) a Rama-stack pod stops accepting connections, reports 503 on `/readyz` so the Service stops sending it new ones, lets idle keep-alive connections close and requests in flight finish, and exits 0 once they have, or 1 after `PORTUS_DRAIN_SECONDS`. Rollouts therefore lose no requests that had already reached the pod.
 
 On cold start, the dataplane waits up to 60 seconds for the first config from the controller. If no config arrives within that deadline, the process exits with an error. This prevents the dataplane from starting with an empty route table.
 

@@ -12,11 +12,12 @@ pub enum NetworkStack {
 impl NetworkStack {
     pub const ENV: &str = "PORTUS_NETWORK_STACK";
 
-    /// Parse the env value; unset or empty means Pingora.
+    /// Parse the env value; unset or empty means Rama, the release stack
+    /// since 0.2.4.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-            None | Some("") | Some("pingora") => Ok(Self::Pingora),
-            Some("rama") => Ok(Self::Rama),
+            None | Some("") | Some("rama") => Ok(Self::Rama),
+            Some("pingora") => Ok(Self::Pingora),
             Some(other) => Err(format!("{}={other:?} is not a network stack (pingora, rama)", Self::ENV)),
         }
     }
@@ -38,9 +39,9 @@ mod tests {
     use super::NetworkStack;
 
     #[test]
-    fn unset_and_pingora_select_pingora_case_insensitively() {
-        assert_eq!(NetworkStack::parse(None), Ok(NetworkStack::Pingora));
-        assert_eq!(NetworkStack::parse(Some("")), Ok(NetworkStack::Pingora));
+    fn unset_selects_rama_and_names_are_case_insensitive() {
+        assert_eq!(NetworkStack::parse(None), Ok(NetworkStack::Rama));
+        assert_eq!(NetworkStack::parse(Some("")), Ok(NetworkStack::Rama));
         assert_eq!(NetworkStack::parse(Some(" Pingora ")), Ok(NetworkStack::Pingora));
         assert_eq!(NetworkStack::parse(Some("RAMA")), Ok(NetworkStack::Rama));
     }

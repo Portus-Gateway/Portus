@@ -342,7 +342,7 @@ pub fn parse_bool(v: &str) -> bool {
 pub fn network_stack_value(value: Option<&str>) -> String {
     match value.map(|v| v.trim().to_ascii_lowercase()) {
         Some(v) if !v.is_empty() => v,
-        _ => "pingora".to_string(),
+        _ => "rama".to_string(),
     }
 }
 
@@ -497,9 +497,10 @@ pub fn desired_deployment(gw: &GatewayRef, tpl: &DataplaneTemplate) -> Deploymen
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
-                    // The dataplane has no long-lived work to flush; a short
-                    // grace period gets terminating pods out of the way fast.
-                    termination_grace_period_seconds: Some(5),
+                    // Long enough for the dataplane to drain in-flight
+                    // requests (it stops accepting at once and waits up to
+                    // 25 s for responses, LLM streams included).
+                    termination_grace_period_seconds: Some(30),
                     service_account_name: tpl.service_account.clone(),
                     automount_service_account_token: Some(false),
                     security_context: Some(PodSecurityContext {
@@ -834,7 +835,7 @@ mod tests {
         assert_eq!(ru.max_unavailable, Some(IntOrString::Int(0)));
         let pod = spec.template.spec.unwrap();
         assert_eq!(pod.automount_service_account_token, Some(false));
-        assert_eq!(pod.termination_grace_period_seconds, Some(5));
+        assert_eq!(pod.termination_grace_period_seconds, Some(30));
         assert_eq!(pod.service_account_name.as_deref(), Some("portus-dataplane"));
         let c = &pod.containers[0];
         let readiness = c.readiness_probe.as_ref().unwrap();
@@ -977,8 +978,8 @@ mod tests {
 
         // The chart value is normalised the way the dataplane compares it.
         assert_eq!(network_stack_value(Some(" Rama ")), "rama");
-        assert_eq!(network_stack_value(Some("")), "pingora");
-        assert_eq!(network_stack_value(None), "pingora");
+        assert_eq!(network_stack_value(Some("")), "rama");
+        assert_eq!(network_stack_value(None), "rama");
     }
 
     #[test]
