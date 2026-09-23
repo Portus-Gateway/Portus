@@ -4,6 +4,18 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **MCP gateway.** `AIProvider` accepts `kind: mcp` (a Model Context Protocol server over Streamable HTTP). `AIRoute` matches gain `method` (the JSON-RPC method) and `tool` (`params.name` of a `tools/call`), read from the body like `model` and `stream`. Keys carry `allowed_tools` (exact or `prefix.*`) next to `allowed_models`; `AIUsagePolicy.budget.calls` counts requests instead of tokens (`x-portus-calls-remaining`). Sessions stay on the server pod that created them: requests carrying `Mcp-Session-Id` pick the endpoint by rendezvous hashing over the provider's ready endpoints (`AIProvider.sessionAffinity`, default `header` for `mcp`), the same answer on every gateway pod; `proxy_mcp_session_rehomed_total{provider}` counts sessions a server no longer knew. MCP refusals are JSON-RPC errors: 401 for a missing or unknown key, 200 with `-32002` (tool not allowed) or `-32003` (budget spent, with `Retry-After`) echoing the request's `id`, so clients keep their session. Usage rows for MCP carry the method and tool where LLM rows carry the model.
+- An `AIProvider` whose `url` names a Service in the cluster (`name`, `name.ns.svc`, `name.ns.svc.cluster.local`) takes the Service's ready pod endpoints from the EndpointSlice watcher instead of resolving the ClusterIP, so session affinity, health checks and outlier ejection see pods.
+- `docs/ai-gateway.md`: field reference for the three AI CRDs, the key API, refusal shapes and the MCP transport handling. `deploy/examples/ai-gateway/mcp.yaml`.
+
+### Changed
+
+- The ledger's `api_keys` table gains `allowed_tools` (migrated in place on start); `AiBudget` on the wire carries `limit` and `unit` instead of `tokens`.
+
 ## [0.2.4] - 2026-09-23
 
 ### Added

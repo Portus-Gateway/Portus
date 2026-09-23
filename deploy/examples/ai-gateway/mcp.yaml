@@ -1,0 +1,50 @@
+# An MCP gateway: tools/call for the github.* tools goes to one server, every
+# other message (initialize, tools/list, the GET event stream, DELETE) to the
+# same or another. Clients need a Portus key allowed to call the tools they
+# use; sessions stay on the server pod that created them.
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIProvider
+metadata:
+  name: github-mcp
+  namespace: tools
+spec:
+  kind: mcp
+  url: http://github-mcp.tools.svc.cluster.local:3001
+---
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIRoute
+metadata:
+  name: mcp
+  namespace: tools
+spec:
+  parentRefs:
+    - name: gateway
+  hostnames: [mcp.example.com]
+  requireApiKey: true
+  rules:
+    - matches:
+        - method: {type: Exact, value: tools/call}
+          tool: {type: Prefix, value: github.}
+      providerRefs:
+        - name: github-mcp
+    - matches:
+        - path: {type: PathPrefix, value: /mcp}
+      providerRefs:
+        - name: github-mcp
+---
+# 2,000 tool calls per key per day. A spent budget answers a JSON-RPC error
+# (-32003) with Retry-After; every response carries x-portus-calls-remaining.
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIUsagePolicy
+metadata:
+  name: daily-calls
+  namespace: tools
+spec:
+  targetRef:
+    group: portus-gateway.dev
+    kind: AIRoute
+    name: mcp
+  budget:
+    calls: 2000
+    window: Daily
+    per: Key
