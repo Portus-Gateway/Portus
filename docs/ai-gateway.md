@@ -111,8 +111,10 @@ interval. Every budgeted response carries `x-portus-tokens-remaining` or
 ## Keys
 
 The ledger issues and imports keys; only SHA-256 hashes are stored and pushed to the
-data planes. Admin calls need the bearer token in the `<release>-portus-gateway-ledger-admin`
-Secret (key `token`).
+data planes. Every call below except `/metrics` needs the bearer token in the
+`<release>-portus-gateway-ledger-admin` Secret (key `token`): the usage reads name keys,
+tenants and subjects. `aiGateway.ledger.openReads: true` serves `/export.jsonl` and
+`/v1/summary` without it, for a ledger nothing but operators can reach.
 
 | Call | Body / result |
 |---|---|
@@ -121,7 +123,7 @@ Secret (key `token`).
 | `DELETE /v1/keys/{id}` | Revoke; data planes drop the key within a second |
 | `GET /v1/summary?hours=N` | Requests, refusals and tokens per subject: a key's tenant and name, or an OAuth token's tenant claim and `sub` |
 | `GET /export.jsonl?since_us=&limit=` | One JSON row per request: status, dialect, provider, model or method, tool, tokens, bytes, key id, tenant, subject, refusal |
-| `GET /metrics` | Prometheus |
+| `GET /metrics` | Prometheus; no token |
 
 `allowed_models` applies to LLM requests (empty: any model). `allowed_tools` applies to
 MCP `tools/call` requests, exact names or `prefix.*` (empty: any tool); other MCP

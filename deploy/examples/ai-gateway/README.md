@@ -26,7 +26,7 @@ Clients keep speaking the provider's native API.
    keys without plaintext; `DELETE /v1/keys/{id}` revokes within a second.
 4. Point a client at the gateway. Claude Code:
    `ANTHROPIC_BASE_URL=https://llm.example.com ANTHROPIC_API_KEY=portus_sk_… claude`
-5. Read usage: `curl localhost:8083/export.jsonl?limit=100` (one JSON row
+5. Read usage: `curl -H "Authorization: Bearer $TOKEN" 'localhost:8083/export.jsonl?limit=100'` (one JSON row
    per request: model, tokens, key id, status, latency) and `/metrics`.
 
 6. MCP: `mcp.yaml` puts an MCP server behind the same gateway. Issue a key

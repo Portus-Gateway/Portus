@@ -88,6 +88,10 @@ spec:
               value: "0.0.0.0:{{ .Values.aiGateway.ledger.httpPort }}"
             - name: LEDGER_DB_PATH
               value: /data/ledger.db
+            {{- if .Values.aiGateway.ledger.openReads }}
+            - name: LEDGER_OPEN_READS
+              value: "true"
+            {{- end }}
             {{- with .Values.aiGateway.jwt }}
             {{- with .issuers }}
             - name: LEDGER_JWT_ISSUERS

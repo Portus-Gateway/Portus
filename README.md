@@ -377,7 +377,8 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `grpcTls.secretName` | `""` | Bring your own Secret (`ca.crt`, `tls.crt`, `tls.key`) instead of the generated one |
 | `aiGateway.enabled` | `false` | Deploy the ledger and enable AI routes (Rama stack). Upgrade with your values in a file (`-f`), not a reuse flag; installs first created before 0.2.6 delete the generated grpc-tls Secret once |
 | `aiGateway.ledger.storage.size` | `1Gi` | PersistentVolumeClaim for the ledger's SQLite file |
-| `aiGateway.ledger.adminTokenSecretName` | `""` | Bring your own admin token Secret (key `token`) for the key API |
+| `aiGateway.ledger.adminTokenSecretName` | `""` | Bring your own admin token Secret (key `token`) for the key API and the usage reads |
+| `aiGateway.ledger.openReads` | `false` | Serve `/export.jsonl` and `/v1/summary` without the token |
 | `aiGateway.jwt.issuers` | `[]` | OAuth issuers whose tokens `AIRoute.auth.jwt` may accept; the ledger fetches their JWKS every 5 minutes |
 
 Full reference: [`docs/deployment.md`](docs/deployment.md). Policies: [`docs/policies.md`](docs/policies.md).

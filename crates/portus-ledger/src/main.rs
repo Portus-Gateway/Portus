@@ -5,9 +5,13 @@
 //!
 //! Configuration (environment):
 //! - `LEDGER_GRPC_ADDR` (default `0.0.0.0:9444`): ingest + key distribution.
-//! - `LEDGER_HTTP_ADDR` (default `0.0.0.0:8083`): `/healthz`, `/readyz`,
-//!   `/metrics`, `/export.jsonl?since_us=<µs>&limit=<n>`, and the admin API
-//!   `/v1/keys` (bearer `LEDGER_ADMIN_TOKEN`; disabled when unset).
+//! - `LEDGER_HTTP_ADDR` (default `0.0.0.0:8083`): `/healthz`, `/readyz` and
+//!   `/metrics` open; `/export.jsonl?since_us=<µs>&limit=<n>`, `/v1/summary`
+//!   and the key API `/v1/keys` behind bearer `LEDGER_ADMIN_TOKEN` (the
+//!   admin API is disabled when it is unset).
+//! - `LEDGER_OPEN_READS=true`: serve `/export.jsonl` and `/v1/summary`
+//!   without the token (usage rows name keys, tenants and subjects; only for
+//!   a ledger nothing but operators can reach).
 //! - `LEDGER_DB_PATH` (default `/data/ledger.db`).
 //! - `GRPC_TLS_CERT`, `GRPC_TLS_KEY`: serve TLS; with `GRPC_TLS_CA` require
 //!   client certificates (the data planes present the config-stream cert).
@@ -112,6 +116,8 @@ struct Shared {
     keys: watch::Sender<Arc<KeySnapshot>>,
     key_version: AtomicU64,
     admin_token: Option<String>,
+    /// Serve the usage reads without the admin token.
+    open_reads: bool,
     /// OAuth issuers' JWKS as last fetched, attached to every key snapshot.
     jwks: std::sync::Mutex<Vec<portus_types::proto::portus::ledger::v1::JwksEntry>>,
 }
@@ -299,7 +305,16 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> Response {
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
 
-async fn export(State(shared): State<Arc<Shared>>, Query(p): Query<ExportParams>) -> Response {
+/// Usage rows name keys, tenants and subjects, so they are behind the admin
+/// token unless the operator opened them on purpose.
+fn reads_ok(shared: &Shared, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    if shared.open_reads { Ok(()) } else { admin_ok(shared, headers) }
+}
+
+async fn export(State(shared): State<Arc<Shared>>, headers: HeaderMap, Query(p): Query<ExportParams>) -> Response {
+    if let Err(r) = reads_ok(&shared, &headers) {
+        return *r;
+    }
     let limit = p.limit.unwrap_or(10_000).clamp(1, 100_000);
     match shared.run(|done| Op::Export { since: p.since_us, limit, done }).await {
         Ok(rows) => {
@@ -317,8 +332,10 @@ async fn export(State(shared): State<Arc<Shared>>, Query(p): Query<ExportParams>
 }
 
 /// Per-key totals over the last `hours` (default 24), newest spenders first.
-/// Read-only, so no admin token: it names keys and tenants, never plaintext.
-async fn summary(State(shared): State<Arc<Shared>>, Query(p): Query<SummaryParams>) -> Response {
+async fn summary(State(shared): State<Arc<Shared>>, headers: HeaderMap, Query(p): Query<SummaryParams>) -> Response {
+    if let Err(r) = reads_ok(&shared, &headers) {
+        return *r;
+    }
     let hours = p.hours.unwrap_or(24).clamp(1, 24 * 366);
     let since = now_micros().saturating_sub(hours * 3_600_000_000);
     match shared.run(|done| Op::Summary { since, done }).await {
@@ -427,6 +444,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let grpc_addr: std::net::SocketAddr = env_or("LEDGER_GRPC_ADDR", "0.0.0.0:9444").parse()?;
     let http_addr = env_or("LEDGER_HTTP_ADDR", "0.0.0.0:8083");
     let admin_token = std::env::var("LEDGER_ADMIN_TOKEN").ok().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    let open_reads = std::env::var("LEDGER_OPEN_READS").ok().is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
+    if open_reads {
+        log::warn!("LEDGER_OPEN_READS is set: /export.jsonl and /v1/summary answer without the admin token");
+    }
 
     if let Some(dir) = db_path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -439,7 +460,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::Builder::new().name("ledger-storage".into()).spawn(move || storage_thread(store, ops_rx))?;
     let (keys_tx, _keys_rx) = watch::channel(Arc::new(initial));
     let initial_version = keys_tx.borrow().version;
-    let shared = Arc::new(Shared { ops: ops_tx, stats: Stats::default(), keys: keys_tx, key_version: AtomicU64::new(initial_version), admin_token, jwks: std::sync::Mutex::new(Vec::new()) });
+    let shared = Arc::new(Shared { ops: ops_tx, stats: Stats::default(), keys: keys_tx, key_version: AtomicU64::new(initial_version), admin_token, open_reads, jwks: std::sync::Mutex::new(Vec::new()) });
     if shared.admin_token.is_none() {
         log::warn!("LEDGER_ADMIN_TOKEN is not set; the key admin API is disabled");
     }
@@ -524,9 +545,28 @@ mod tests {
             keys: keys_tx,
             key_version: AtomicU64::new(1),
             admin_token: Some("secret-admin".into()),
+            open_reads: false,
             jwks: std::sync::Mutex::new(Vec::new()),
         });
         (router(Arc::clone(&shared)), shared)
+    }
+
+    #[tokio::test]
+    async fn usage_reads_need_the_admin_token_unless_opened_on_purpose() {
+        let (app, shared) = app().await;
+        for uri in ["/export.jsonl?limit=10", "/v1/summary?hours=1"] {
+            assert_eq!(call(&app, "GET", uri, None, None).await.0, StatusCode::UNAUTHORIZED, "{uri} without a token");
+            assert_eq!(call(&app, "GET", uri, Some("Bearer wrong"), None).await.0, StatusCode::UNAUTHORIZED, "{uri} with a wrong token");
+            assert_eq!(call(&app, "GET", uri, Some("Bearer secret-admin"), None).await.0, StatusCode::OK, "{uri} with the token");
+        }
+        assert_eq!(call(&app, "GET", "/metrics", None, None).await.0, StatusCode::OK, "metrics stay open");
+        assert_eq!(call(&app, "GET", "/healthz", None, None).await.0, StatusCode::OK);
+        // No admin token configured: the reads are closed, not open.
+        let closed = Arc::new(Shared { ops: shared.ops.clone(), stats: Stats::default(), keys: watch::channel(Arc::new(KeySnapshot::default())).0, key_version: AtomicU64::new(1), admin_token: None, open_reads: false, jwks: std::sync::Mutex::new(Vec::new()) });
+        assert_eq!(call(&router(closed), "GET", "/v1/summary", None, None).await.0, StatusCode::FORBIDDEN);
+        // The explicit opt-out serves them to anyone.
+        let open = Arc::new(Shared { ops: shared.ops.clone(), stats: Stats::default(), keys: watch::channel(Arc::new(KeySnapshot::default())).0, key_version: AtomicU64::new(1), admin_token: None, open_reads: true, jwks: std::sync::Mutex::new(Vec::new()) });
+        assert_eq!(call(&router(open), "GET", "/export.jsonl", None, None).await.0, StatusCode::OK);
     }
 
     async fn call(app: &Router, method: &str, uri: &str, auth: Option<&str>, body: Option<&str>) -> (StatusCode, String) {
@@ -590,7 +630,7 @@ mod tests {
         let (status, body) = call(&app, "GET", "/metrics", None, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("ledger_api_keys_live 1"), "{body}");
-        let (status, body) = call(&app, "GET", "/v1/summary?hours=1", None, None).await;
+        let (status, body) = call(&app, "GET", "/v1/summary?hours=1", Some("Bearer secret-admin"), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "[]", "no usage yet");
     }

@@ -4,6 +4,12 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The ledger's usage reads need the admin token.** `/export.jsonl` (every request row with key id, tenant and subject) and `/v1/summary` answered without authentication; only `/v1/keys` was protected. Both now require the bearer token like the key API, `/metrics`, `/healthz` and `/readyz` stay open, and `aiGateway.ledger.openReads: true` (`LEDGER_OPEN_READS`) restores the old behaviour on purpose. Reported by the first fleet on 0.2.5.
+
 ## [0.2.6] - 2026-09-23
 
 ### Fixed
