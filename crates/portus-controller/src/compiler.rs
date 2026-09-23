@@ -915,6 +915,7 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
                 _ => "openai".to_string(),
             };
             route.ai_provider = provider.name.clone();
+            route.ai_session_affinity = provider.session_affinity;
             if provider.tls {
                 route.upstream_tls = Some(UpstreamTlsConfig { enabled: true, verify_cert: true, sni: provider.host.clone() });
             }
@@ -2343,6 +2344,7 @@ mod tests {
                 header: "x-api-key".into(),
                 prefix: String::new(),
             }),
+            session_affinity: false,
             generation: 1,
         };
         store.endpoints.insert(

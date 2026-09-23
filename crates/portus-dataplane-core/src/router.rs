@@ -267,6 +267,8 @@ pub struct AiBackend {
     pub key_required: bool,
     /// Token budget from an AIUsagePolicy, enforced with ledger grants.
     pub budget: Option<crate::ai::budget::BudgetPolicy>,
+    /// MCP: pin a session (`Mcp-Session-Id`) to the endpoint that created it.
+    pub session_affinity: bool,
 }
 
 impl PathRoute {

@@ -167,6 +167,9 @@ message RouteConfig {
   bool ai_key_required = 38;
   // Token budget from an AIUsagePolicy targeting the route.
   optional AiBudget ai_budget = 39;
+  // MCP providers: requests carrying an Mcp-Session-Id go to the endpoint
+  // the session hashes to (rendezvous hashing over the ready endpoints).
+  bool ai_session_affinity = 40;
 
   // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
   // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.

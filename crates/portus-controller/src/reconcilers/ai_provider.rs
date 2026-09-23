@@ -15,7 +15,7 @@ use kube::runtime::controller::Action;
 use serde_json::json;
 
 use super::{ReconcileContext, ReconcileError};
-use crate::ai_types::AIProvider;
+use crate::ai_types::{AIProvider, AIProviderSpec};
 use crate::status;
 use crate::store::{AICredentialState, AIProviderState, ConfigStore, NamespacedName};
 use portus_types::BackendEndpoint;
@@ -67,6 +67,17 @@ pub fn parse_provider_url(url: &str) -> Result<(bool, String, u16), String> {
     Ok((tls, host, port))
 }
 
+/// `spec.sessionAffinity`: `header` pins `Mcp-Session-Id` sessions to an
+/// endpoint, `none` load-balances every request. Defaults to `header` for
+/// MCP providers and `none` for LLM ones (those are stateless).
+fn session_affinity(spec: &AIProviderSpec) -> bool {
+    match spec.session_affinity.as_deref() {
+        Some("header") => true,
+        Some(_) => false,
+        None => spec.kind == "mcp",
+    }
+}
+
 /// Header and prefix a provider kind authenticates with unless overridden.
 fn default_credential_header(kind: &str) -> (&'static str, &'static str) {
     match kind {
@@ -89,6 +100,11 @@ pub fn reconcile_inner(provider: &AIProvider, store: &ConfigStore) -> Result<Vec
     let mut problems = Vec::new();
     if !KINDS.contains(&spec.kind.as_str()) {
         problems.push(format!("kind must be one of {}", KINDS.join(", ")));
+    }
+    if let Some(a) = spec.session_affinity.as_deref()
+        && !matches!(a, "header" | "none")
+    {
+        problems.push(format!("sessionAffinity must be header or none, not {a:?}"));
     }
     let parsed = parse_provider_url(&spec.url);
     if let Err(e) = &parsed {
@@ -120,6 +136,7 @@ pub fn reconcile_inner(provider: &AIProvider, store: &ConfigStore) -> Result<Vec
             host,
             port,
             credential,
+            session_affinity: session_affinity(spec),
             generation,
         };
         store.insert_and_notify(&store.ai_providers, key, state);
@@ -249,7 +266,7 @@ mod tests {
                 generation: Some(1),
                 ..Default::default()
             },
-            spec: AIProviderSpec { kind: kind.into(), url: url.into(), credential },
+            spec: AIProviderSpec { kind: kind.into(), url: url.into(), credential, session_affinity: None },
             status: None,
         }
     }
@@ -311,6 +328,18 @@ mod tests {
         let state = store.ai_providers.get(&NamespacedName { namespace: "llm".into(), name: "anthropic".into() }).unwrap().clone();
         assert_eq!((state.kind.as_str(), state.tls, state.host.as_str(), state.port), ("mcp", false, "github-mcp.tools", 8080));
         assert_eq!(state.credential.unwrap().header, "authorization");
+        assert!(state.session_affinity, "MCP providers pin sessions by default");
+        let llm = store.ai_providers.get(&NamespacedName { namespace: "llm".into(), name: "anthropic".into() });
+        drop(llm);
+        let mut off = provider("mcp", "http://github-mcp.tools:8080", None);
+        off.spec.session_affinity = Some("none".into());
+        reconcile_inner(&off, &store).unwrap();
+        assert!(!store.ai_providers.get(&NamespacedName { namespace: "llm".into(), name: "anthropic".into() }).unwrap().session_affinity);
+        let mut bad = provider("mcp", "http://github-mcp.tools:8080", None);
+        bad.spec.session_affinity = Some("cookie".into());
+        let conditions = reconcile_inner(&bad, &store).unwrap();
+        assert_eq!(conditions[0].status, "False");
+        assert!(conditions[0].message.contains("sessionAffinity"), "{}", conditions[0].message);
     }
 
     #[test]

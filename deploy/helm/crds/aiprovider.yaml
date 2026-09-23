@@ -34,6 +34,10 @@ spec:
                 url:
                   type: string
                   description: "Base URL, scheme and host only: https://api.anthropic.com"
+                sessionAffinity:
+                  type: string
+                  enum: [header, none]
+                  description: "header pins Mcp-Session-Id sessions to one endpoint (default for mcp); none load-balances every request"
                 credential:
                   type: object
                   required: [secretRef]

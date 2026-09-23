@@ -453,9 +453,20 @@ impl ProxyService {
         let retrying = buffered.is_some();
         let mut retries_left = if retrying { plan.max_retries } else { 0 };
         let incoming = Incoming { method, version, uri };
+        // An MCP session stays on the endpoint that created it.
+        let session_key: Option<Vec<u8>> = plan
+            .ai
+            .as_ref()
+            .filter(|ai| ai.session_affinity)
+            .and_then(|_| headers.get("mcp-session-id"))
+            .map(|v| v.as_bytes().to_vec());
 
         let mut response = loop {
-            let Some(backend) = pool.select() else {
+            let picked = match &session_key {
+                Some(key) => pool.select_by_key(key),
+                None => pool.select(),
+            };
+            let Some(backend) = picked else {
                 return status_response(StatusCode::INTERNAL_SERVER_ERROR);
             };
             let body = match (&buffered, streaming.take()) {
@@ -473,6 +484,12 @@ impl ProxyService {
             match self.attempt(upstream, deadline).await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
+                    if status == 404
+                        && session_key.is_some()
+                        && let Some(ai) = plan.ai.as_ref()
+                    {
+                        self.metrics.mcp_session_rehomed_total.with_label_values(&[ai.provider.as_ref()]).inc();
+                    }
                     if let Some(out) = self.outliers.responded(pool, &backend, status) {
                         self.note_ejection(plan, &backend, out, &format!("{status} responses in a row"));
                     }

@@ -520,6 +520,8 @@ pub struct AIProviderState {
     pub host: String,
     pub port: u16,
     pub credential: Option<AICredentialState>,
+    /// MCP: pin sessions to the endpoint that created them.
+    pub session_affinity: bool,
     pub generation: i64,
 }
 

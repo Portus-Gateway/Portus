@@ -251,6 +251,7 @@ mod tests {
                 host: "api.anthropic.com".into(),
                 port: 443,
                 credential: None,
+                session_affinity: false,
                 generation: 1,
             },
         );

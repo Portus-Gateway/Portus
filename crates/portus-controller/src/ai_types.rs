@@ -33,6 +33,11 @@ pub struct AIProviderSpec {
     /// Where the provider's API key comes from and how it is sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<AICredentialSpec>,
+    /// `header` pins requests carrying `Mcp-Session-Id` to the endpoint the
+    /// session hashes to; `none` load-balances every request. Default
+    /// `header` for `mcp`, `none` otherwise.
+    #[serde(rename = "sessionAffinity", default, skip_serializing_if = "Option::is_none")]
+    pub session_affinity: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

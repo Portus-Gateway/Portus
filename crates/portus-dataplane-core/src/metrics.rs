@@ -16,6 +16,9 @@ pub struct ProxyMetrics {
     pub circuit_breaker_state: IntGaugeVec,
     pub config_last_update_timestamp: Gauge,
     pub grpc_stream_connected: Gauge,
+    /// MCP sessions that reached a server which did not know them (a 404 on
+    /// a request carrying Mcp-Session-Id): the client re-initialises.
+    pub mcp_session_rehomed_total: IntCounterVec,
 }
 
 impl Default for ProxyMetrics {
@@ -69,6 +72,12 @@ impl ProxyMetrics {
                 &["service"]
             )
             .expect("proxy_upstream_connect_errors_total metric registration failed (duplicate?)"),
+            mcp_session_rehomed_total: register_int_counter_vec!(
+                "proxy_mcp_session_rehomed_total",
+                "MCP sessions answered 404 by a server that did not know them, by provider",
+                &["provider"]
+            )
+            .expect("proxy_mcp_session_rehomed_total metric registration failed (duplicate?)"),
             upstream_ejections_total: register_int_counter_vec!(
                 "proxy_upstream_ejections_total",
                 "Endpoints taken out of rotation after failures (passive outlier ejection), by service",
