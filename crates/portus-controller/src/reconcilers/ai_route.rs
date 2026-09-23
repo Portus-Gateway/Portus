@@ -22,6 +22,11 @@ use crate::store::{
 pub const MODEL_HEADER: &str = "portus-body-model";
 /// Header-match name the data plane resolves from the body's `stream`.
 pub const STREAM_HEADER: &str = "portus-body-stream";
+/// Header-match name the data plane resolves from a JSON-RPC body's `method`.
+pub const METHOD_HEADER: &str = "portus-body-method";
+/// Header-match name the data plane resolves from `params.name` of a
+/// JSON-RPC `tools/call`.
+pub const TOOL_HEADER: &str = "portus-body-tool";
 
 /// One AIRoute match as the HTTPRoute-shaped state the compiler consumes.
 /// `Err` names the field that could not be converted.
@@ -37,27 +42,41 @@ pub fn convert_match(m: &AIRouteMatch) -> Result<HTTPRouteMatchState, String> {
         .iter()
         .map(|h| (h.name.clone(), h.value.clone(), h.match_type.clone().unwrap_or_else(|| "Exact".to_string())))
         .collect();
+    // A request speaks one dialect: LLM fields and MCP fields never both apply.
+    let llm = m.model.is_some() || m.stream.is_some();
+    let mcp = m.method.is_some() || m.tool.is_some();
+    if llm && mcp {
+        return Err("a match cannot combine model/stream with method/tool".to_string());
+    }
     if let Some(model) = &m.model {
-        let (value, match_type) = string_match(model)?;
+        let (value, match_type) = string_match("model", model)?;
         headers.push((MODEL_HEADER.to_string(), value, match_type));
     }
     if let Some(stream) = m.stream {
         headers.push((STREAM_HEADER.to_string(), stream.to_string(), "Exact".to_string()));
+    }
+    if let Some(method) = &m.method {
+        let (value, match_type) = string_match("method", method)?;
+        headers.push((METHOD_HEADER.to_string(), value, match_type));
+    }
+    if let Some(tool) = &m.tool {
+        let (value, match_type) = string_match("tool", tool)?;
+        headers.push((TOOL_HEADER.to_string(), value, match_type));
     }
     Ok(HTTPRouteMatchState { path, headers, method: None, query_params: Vec::new() })
 }
 
 /// `Exact` and `RegularExpression` map straight onto header match types;
 /// `Prefix` becomes an anchored regex on the escaped value.
-fn string_match(m: &AIStringMatch) -> Result<(String, String), String> {
+fn string_match(field: &str, m: &AIStringMatch) -> Result<(String, String), String> {
     match m.match_type.as_deref().unwrap_or("Exact") {
         "Exact" => Ok((m.value.clone(), "Exact".to_string())),
         "RegularExpression" => {
-            regex::Regex::new(&m.value).map_err(|e| format!("model regex {:?}: {e}", m.value))?;
+            regex::Regex::new(&m.value).map_err(|e| format!("{field} regex {:?}: {e}", m.value))?;
             Ok((m.value.clone(), "RegularExpression".to_string()))
         }
         "Prefix" => Ok((format!("^{}", regex::escape(&m.value)), "RegularExpression".to_string())),
-        other => Err(format!("model match type {other:?} is not Exact, Prefix or RegularExpression")),
+        other => Err(format!("{field} match type {other:?} is not Exact, Prefix or RegularExpression")),
     }
 }
 
@@ -261,6 +280,8 @@ mod tests {
                 path: Some(HTTPPathMatchCRD { match_type: Some("PathPrefix".into()), value: Some("/v1/messages".into()) }),
                 model,
                 stream,
+                method: None,
+                tool: None,
                 headers: Vec::new(),
             }],
             provider_refs: providers.iter().map(|p| AIProviderRef { name: p.to_string(), weight: None }).collect(),
@@ -307,6 +328,44 @@ mod tests {
         assert!(state.rules[0].backend_refs.is_empty());
         assert!(state.rules[1].backend_refs.is_empty());
         assert_eq!(state.rules[2].backend_refs.len(), 1, "the good rule still routes");
+    }
+
+    #[test]
+    fn mcp_method_and_tool_matches_become_body_header_matches_and_never_mix_with_model() {
+        let store = ConfigStore::new();
+        gateway(&store);
+        provider(&store, "anthropic");
+        let m = |method: Option<(&str, &str)>, tool: Option<(&str, &str)>, model: Option<&str>| AIRouteMatch {
+            path: Some(HTTPPathMatchCRD { match_type: Some("PathPrefix".into()), value: Some("/mcp".into()) }),
+            model: model.map(|v| AIStringMatch { match_type: None, value: v.into() }),
+            stream: None,
+            method: method.map(|(t, v)| AIStringMatch { match_type: Some(t.into()), value: v.into() }),
+            tool: tool.map(|(t, v)| AIStringMatch { match_type: Some(t.into()), value: v.into() }),
+            headers: Vec::new(),
+        };
+        let call = convert_match(&m(Some(("Exact", "tools/call")), Some(("Prefix", "github.")), None)).unwrap();
+        assert_eq!(
+            call.headers,
+            vec![
+                ("portus-body-method".into(), "tools/call".into(), "Exact".into()),
+                ("portus-body-tool".into(), "^github\\.".into(), "RegularExpression".into()),
+            ]
+        );
+        let list = convert_match(&m(Some(("Exact", "tools/list")), None, None)).unwrap();
+        assert_eq!(list.headers, vec![("portus-body-method".into(), "tools/list".into(), "Exact".into())]);
+        let mixed = convert_match(&m(Some(("Exact", "tools/call")), None, Some("claude-opus-5")));
+        assert!(mixed.unwrap_err().contains("cannot combine"));
+        let bad = convert_match(&m(None, Some(("RegularExpression", "(")), None));
+        assert!(bad.unwrap_err().contains("tool regex"));
+
+        // Through the reconciler the rule lands on the provider's Service like an LLM rule.
+        let r = route(vec![AIRouteRule {
+            matches: vec![m(Some(("Exact", "tools/call")), Some(("Exact", "github.search")), None)],
+            provider_refs: vec![AIProviderRef { name: "anthropic".into(), weight: None }],
+        }]);
+        let (state, conditions) = reconcile_inner(&r, &store).unwrap();
+        assert_eq!(conditions[1].status, "True", "{}", conditions[1].message);
+        assert_eq!(state.rules[0].backend_refs[0].name, "aiprovider/llm/anthropic");
     }
 
     #[test]

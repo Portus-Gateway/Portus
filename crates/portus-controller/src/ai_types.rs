@@ -22,9 +22,10 @@ use crate::policy_types::{PolicyStatus, PolicyTargetRef};
     derive = "Default"
 )]
 pub struct AIProviderSpec {
-    /// API dialect the provider speaks: `anthropic`, `openai` or
-    /// `openai-compatible`. Decides the default credential header and, later,
-    /// how usage is read from responses.
+    /// API dialect the provider speaks: `anthropic`, `openai`,
+    /// `openai-compatible` or `mcp` (Model Context Protocol over Streamable
+    /// HTTP). Decides the default credential header and how usage is read
+    /// from responses.
     pub kind: String,
     /// Base URL: scheme and host, optional port, no path
     /// (`https://api.anthropic.com`).
@@ -102,6 +103,12 @@ pub struct AIRouteMatch {
     /// The request body's top-level `stream` flag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+    /// MCP: the JSON-RPC `method` (`tools/call`, `tools/list`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<AIStringMatch>,
+    /// MCP: the tool a `tools/call` names (`params.name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<AIStringMatch>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<HTTPHeaderMatchCRD>,
 }

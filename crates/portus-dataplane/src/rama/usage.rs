@@ -13,7 +13,7 @@ use rama::http::body::{Frame, SizeHint};
 use rama::http::{Body, StreamingBody};
 
 use portus_dataplane_core::ai::budget::Reservation;
-use portus_dataplane_core::ai::usage::{RefusalKind, UsageRecord, UsageRing, UsageTracker};
+use portus_dataplane_core::ai::usage::{Dialect, RefusalKind, UsageRecord, UsageRing, UsageTracker};
 use portus_dataplane_core::router::{AiBackend, BodyFields};
 
 /// What the handler knows about the request before the response body runs.
@@ -50,8 +50,16 @@ fn base_record(status: u16, req: &RequestSide<'_>) -> UsageRecord {
         stream,
         provider: UsageRecord::name(&req.ai.provider),
         route_host: UsageRecord::name(req.host),
-        requested_model: UsageRecord::name(field("model").unwrap_or("")),
-        served_model: UsageRecord::name(""),
+        // An MCP record carries the JSON-RPC method where an LLM record
+        // carries the model, and the tool where the served model would go.
+        requested_model: UsageRecord::name(match req.ai.dialect {
+            Dialect::Mcp => field("method").unwrap_or(""),
+            _ => field("model").unwrap_or(""),
+        }),
+        served_model: UsageRecord::name(match req.ai.dialect {
+            Dialect::Mcp => field("tool").unwrap_or(""),
+            _ => "",
+        }),
         tokens: None,
         request_bytes: req.request_bytes,
         response_bytes: 0,
@@ -146,6 +154,23 @@ mod tests {
 
     fn side<'a>(ai: &'a AiBackend, fields: &'a BodyFields) -> RequestSide<'a> {
         RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, reservation: None }
+    }
+
+    #[tokio::test]
+    async fn an_mcp_record_carries_the_method_and_tool_and_no_tokens() {
+        let ring = Arc::new(UsageRing::new(8));
+        let ai = AiBackend { dialect: Dialect::Mcp, provider: Arc::from("github-mcp"), key_required: false, budget: None };
+        let fields: BodyFields = vec![("method", "tools/call".into()), ("id", "3".into()), ("tool", "github.search".into())];
+        let side = RequestSide { ai: &ai, host: "mcp.example.com", body_fields: Some(&fields), request_bytes: 120, start: Instant::now(), key_id: 42, reservation: None };
+        let body = observe(Body::from(r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#), 200, side, Arc::clone(&ring));
+        let _ = body.collect().await.unwrap();
+        let mut out = Vec::new();
+        assert_eq!(ring.drain_into(&mut out, 10), 1);
+        let record = &out[0];
+        assert_eq!((record.dialect, record.status, record.key_id), (Dialect::Mcp, 200, 42));
+        assert_eq!((record.requested_model.as_str(), record.served_model.as_str()), ("tools/call", "github.search"));
+        assert_eq!(record.tokens, None);
+        assert!(record.response_bytes > 0);
     }
 
     #[tokio::test]

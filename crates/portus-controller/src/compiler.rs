@@ -911,6 +911,7 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         if let Some(provider) = store.ai_providers.get(&NamespacedName { namespace: ns.to_string(), name: name.to_string() }) {
             route.ai_dialect = match provider.kind.as_str() {
                 "anthropic" => "anthropic".to_string(),
+                "mcp" => "mcp".to_string(),
                 _ => "openai".to_string(),
             };
             route.ai_provider = provider.name.clone();

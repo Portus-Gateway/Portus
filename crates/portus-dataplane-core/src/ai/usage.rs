@@ -21,6 +21,8 @@ use super::scan::{FieldScanner, Progress, Scalar};
 pub enum Dialect {
     Anthropic,
     OpenAi,
+    /// Model Context Protocol over Streamable HTTP (JSON-RPC); no tokens.
+    Mcp,
 }
 
 impl Dialect {
@@ -29,6 +31,7 @@ impl Dialect {
         match kind {
             "anthropic" => Some(Self::Anthropic),
             "openai" | "openai-compatible" => Some(Self::OpenAi),
+            "mcp" => Some(Self::Mcp),
             _ => None,
         }
     }
@@ -37,6 +40,7 @@ impl Dialect {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::Mcp => "mcp",
         }
     }
 }
@@ -196,6 +200,8 @@ impl UsageTracker {
                     }
                 }
             }
+            // MCP responses carry no usage; the record counts the call.
+            Dialect::Mcp => {}
         }
     }
 }
@@ -204,6 +210,7 @@ fn parse_usage(dialect: Dialect, raw: &[u8]) -> Option<Tokens> {
     match dialect {
         Dialect::Anthropic => serde_json::from_slice::<AnthropicUsage>(raw).ok().map(Into::into),
         Dialect::OpenAi => serde_json::from_slice::<OpenAiUsage>(raw).ok().map(Into::into),
+        Dialect::Mcp => None,
     }
 }
 
@@ -391,6 +398,18 @@ impl UsageRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_is_a_dialect_without_tokens_for_json_and_sse_responses() {
+        assert_eq!(Dialect::parse("mcp"), Some(Dialect::Mcp));
+        assert_eq!(Dialect::Mcp.as_str(), "mcp");
+        let mut t = UsageTracker::new(Dialect::Mcp, false);
+        t.feed(br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":5}}}"#);
+        assert_eq!(t.finish(), Usage { tokens: None, model: None });
+        let mut t = UsageTracker::new(Dialect::Mcp, true);
+        t.feed(b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n");
+        assert_eq!(t.finish(), Usage { tokens: None, model: None });
+    }
 
     fn feed_chunked(tracker: &mut UsageTracker, body: &str, size: usize) {
         for c in body.as_bytes().chunks(size) {

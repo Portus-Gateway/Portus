@@ -23,7 +23,7 @@ use portus_types::BackendEndpoint;
 /// How often provider hostnames are re-resolved.
 pub const RESOLVE_INTERVAL: Duration = Duration::from_secs(30);
 
-const KINDS: &[&str] = &["anthropic", "openai", "openai-compatible"];
+const KINDS: &[&str] = &["anthropic", "openai", "openai-compatible", "mcp"];
 
 /// Parse `spec.url` into (tls, host, port). Only scheme and authority are
 /// allowed: a path prefix would have to be prepended to every request.
@@ -299,6 +299,18 @@ mod tests {
         reconcile_inner(&openai, &store).unwrap();
         let cred = store.ai_providers.get(&NamespacedName { namespace: "llm".into(), name: "anthropic".into() }).unwrap().credential.clone().unwrap();
         assert_eq!((cred.header.as_str(), cred.prefix.as_str()), ("authorization", "Bearer "));
+
+        // An MCP server is a provider too: bearer credential, plain HTTP allowed.
+        let mcp = provider(
+            "mcp",
+            "http://github-mcp.tools:8080",
+            Some(AICredentialSpec { secret_ref: AISecretKeyRef { name: "anthropic-key".into(), key: None }, header: None, prefix: None }),
+        );
+        let conditions = reconcile_inner(&mcp, &store).unwrap();
+        assert_eq!(conditions[0].status, "True", "{}", conditions[0].message);
+        let state = store.ai_providers.get(&NamespacedName { namespace: "llm".into(), name: "anthropic".into() }).unwrap().clone();
+        assert_eq!((state.kind.as_str(), state.tls, state.host.as_str(), state.port), ("mcp", false, "github-mcp.tools", 8080));
+        assert_eq!(state.credential.unwrap().header, "authorization");
     }
 
     #[test]

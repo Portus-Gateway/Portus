@@ -107,6 +107,13 @@ impl Refusal {
         let body = match dialect {
             Dialect::Anthropic => format!(r#"{{"type":"error","error":{{"type":"{kind}","message":"{message}"}}}}"#),
             Dialect::OpenAi => format!(r#"{{"error":{{"message":"{message}","type":"{kind}","code":null}}}}"#),
+            Dialect::Mcp => {
+                let code = match self {
+                    Refusal::Unauthenticated => super::mcp::CODE_UNAUTHENTICATED,
+                    Refusal::ModelNotAllowed => super::mcp::CODE_NOT_ALLOWED,
+                };
+                super::mcp::error_body(None, code, &message)
+            }
         };
         Reply::json(status, body)
     }

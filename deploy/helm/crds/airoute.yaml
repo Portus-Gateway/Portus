@@ -85,6 +85,26 @@ spec:
                             stream:
                               type: boolean
                               description: "Matches the request body's top-level stream flag"
+                            method:
+                              type: object
+                              required: [value]
+                              description: "MCP: matches the JSON-RPC method (tools/call, tools/list, ...)"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
+                            tool:
+                              type: object
+                              required: [value]
+                              description: "MCP: matches params.name of a tools/call"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
                             headers:
                               type: array
                               items:

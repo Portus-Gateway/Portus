@@ -20,6 +20,7 @@ use crate::circuit_breaker::{CircuitBreaker, ConnectionLimiter};
 use crate::metrics::ProxyMetrics;
 use crate::pool::Pool;
 use crate::rate_limiter::RateLimiterMode;
+use crate::ai::scan::{FieldScanner, Scalar};
 use crate::router::{
     cors_allow_origin_value, cors_headers_value, cors_methods_value, cors_origin_matches,
     detect_misdirected_request, extract_client_ip, header_str, listener_scheme_and_port,
@@ -62,8 +63,41 @@ pub struct BodyNeed {
     pub max_bytes: usize,
 }
 
-/// Top-level JSON keys an AI route can match on.
-pub const AI_BODY_KEYS: &[&str] = &["model", "stream", "max_tokens"];
+/// Top-level JSON keys an AI route can match on: the LLM ones (`model`,
+/// `stream`, `max_tokens`) and the MCP ones (`method`, `id`, `params`, the
+/// last captured so `params.name` becomes the `tool` field).
+pub const AI_BODY_KEYS: &[&str] = &["model", "stream", "max_tokens", "method", "id", "params"];
+
+/// The scanner a network stack runs over a request body for [`BodyNeed`].
+pub fn body_scanner(need: &BodyNeed) -> FieldScanner {
+    FieldScanner::new(need.keys).capturing_compounds().capture_limit(crate::ai::mcp::PARAMS_CAPTURE_LIMIT)
+}
+
+/// Turn what the scanner found into the request's body fields: scalars as
+/// text, `id` as JSON text so a refusal can echo it verbatim, and `tool`
+/// derived from a captured `params` object. Compound values are otherwise
+/// not fields.
+pub fn body_fields_from(scanner: &FieldScanner, need: &BodyNeed) -> BodyFields {
+    let mut fields: BodyFields = Vec::with_capacity(need.keys.len());
+    for &key in need.keys {
+        let value = match (key, scanner.get(key)) {
+            ("id", Some(Scalar::Str(s))) => serde_json::to_string(s).unwrap_or_default(),
+            ("params", Some(Scalar::Raw(raw))) => {
+                if let Some(tool) = crate::ai::mcp::tool_name(raw) {
+                    fields.push(("tool", tool));
+                }
+                continue;
+            }
+            (_, Some(Scalar::Str(s))) => s.clone(),
+            (_, Some(Scalar::Bool(b))) => b.to_string(),
+            (_, Some(Scalar::Num(n))) => n.clone(),
+            (_, Some(Scalar::Null)) => "null".to_string(),
+            (_, Some(Scalar::Compound | Scalar::Raw(_)) | None) => continue,
+        };
+        fields.push((key, value));
+    }
+    fields
+}
 /// Bytes of a request body held while scanning for [`AI_BODY_KEYS`]; larger
 /// bodies are refused with 413. Anthropic and OpenAI SDKs put `model` after
 /// `messages`, so a 200k-token prompt puts it ~800 KB in.
@@ -737,6 +771,42 @@ mod tests {
             peer_ip: None,
             body_fields,
         }
+    }
+
+    fn fields_of(body: &str) -> BodyFields {
+        let need = BodyNeed { keys: AI_BODY_KEYS, max_bytes: AI_BODY_SCAN_LIMIT };
+        let mut scanner = body_scanner(&need);
+        scanner.feed(body.as_bytes());
+        body_fields_from(&scanner, &need)
+    }
+
+    #[test]
+    fn llm_bodies_yield_the_same_fields_as_before_mcp_joined() {
+        assert_eq!(
+            fields_of(r#"{"max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"model":"claude-opus-5","stream":true}"#),
+            vec![("model", "claude-opus-5".to_string()), ("stream", "true".to_string()), ("max_tokens", "1024".to_string())]
+        );
+        assert!(fields_of("not json").is_empty());
+    }
+
+    #[test]
+    fn mcp_bodies_yield_method_id_and_the_tool_from_params() {
+        assert_eq!(
+            fields_of(r#"{"jsonrpc":"2.0","id":"req-9","method":"tools/call","params":{"name":"github.search","arguments":{"q":"name"}}}"#),
+            vec![("method", "tools/call".to_string()), ("id", "\"req-9\"".to_string()), ("tool", "github.search".to_string())]
+        );
+        assert_eq!(
+            fields_of(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#),
+            vec![("method", "tools/list".to_string()), ("id", "7".to_string())]
+        );
+        // A notification has no id; params without a name give no tool.
+        assert_eq!(
+            fields_of(r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#),
+            vec![("method", "notifications/initialized".to_string())]
+        );
+        // Arguments past the capture limit still leave method routable.
+        let huge = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"big","arguments":{{"blob":"{}"}}}}}}"#, "z".repeat(crate::ai::mcp::PARAMS_CAPTURE_LIMIT + 10));
+        assert_eq!(fields_of(&huge), vec![("method", "tools/call".to_string()), ("id", "1".to_string())]);
     }
 
     #[tokio::test]

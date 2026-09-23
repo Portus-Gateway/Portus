@@ -30,7 +30,7 @@ spec:
               properties:
                 kind:
                   type: string
-                  enum: [anthropic, openai, openai-compatible]
+                  enum: [anthropic, openai, openai-compatible, mcp]
                 url:
                   type: string
                   description: "Base URL, scheme and host only: https://api.anthropic.com"

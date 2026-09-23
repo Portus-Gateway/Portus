@@ -6,5 +6,6 @@
 pub mod budget;
 pub mod keys;
 pub mod ledger;
+pub mod mcp;
 pub mod scan;
 pub mod usage;

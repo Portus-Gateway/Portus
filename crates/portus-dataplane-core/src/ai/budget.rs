@@ -353,6 +353,7 @@ pub fn exhausted_reply(dialect: Dialect, retry_after_secs: u64, remaining: i64, 
     let body = match dialect {
         Dialect::Anthropic => format!(r#"{{"type":"error","error":{{"type":"rate_limit_error","message":"{message}"}}}}"#),
         Dialect::OpenAi => format!(r#"{{"error":{{"message":"{message}","type":"insufficient_quota","code":"insufficient_quota"}}}}"#),
+        Dialect::Mcp => super::mcp::error_body(None, super::mcp::CODE_BUDGET_EXHAUSTED, &message),
     };
     Reply::json(429, body)
         .with_header(http::header::RETRY_AFTER, http::HeaderValue::from(retry_after_secs))
