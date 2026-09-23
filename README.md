@@ -1,19 +1,99 @@
 # Portus
 
-Kubernetes Gateway API implementation built on Cloudflare's [Pingora](https://github.com/cloudflare/pingora) proxy framework. Written in Rust.
+A Kubernetes gateway in Rust: the Gateway API, an AI gateway for LLM providers and an MCP gateway
+for tool servers, on one data plane with a swappable network stack.
 
 <!-- badges -->
-[![Gateway API Conformance](https://img.shields.io/badge/Gateway%20API-v1.6.2-blue)](https://gateway-api.sigs.k8s.io/)
+[![Gateway API Conformance](https://img.shields.io/badge/Gateway%20API-v1.6.2%20%C2%B7%20130%2F130-blue)](https://gateway-api.sigs.k8s.io/)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](#license)
 
-## Why Portus
+## What Portus is
 
-Most Gateway API implementations are wrappers around general-purpose proxies (Envoy, Nginx, HAProxy) that translate Gateway API resources into the proxy's native configuration format. Portus skips the translation layer entirely — the controller compiles Gateway API CRDs directly into a protobuf config that the Pingora-based dataplane consumes over gRPC. There's no intermediate config language, no sidecar injection, and no control plane restart on config changes. Config updates are applied atomically via `ArcSwap`, so the dataplane never drops connections during reconfiguration.
+- **A Gateway API implementation.** Gateway API v1.6.2, experimental channel: HTTPRoute, GRPCRoute,
+  TLSRoute, TCPRoute, UDPRoute, ListenerSet, BackendTLSPolicy. 130 of 130 conformance tests across
+  all five profiles, no skips. The controller compiles the CRDs straight into a protobuf config and
+  streams it to the data planes over mTLS gRPC; there is no intermediate proxy config language.
+- **An AI gateway.** Point clients that speak the Anthropic Messages or OpenAI chat API at Portus.
+  It routes on the request body (`model`, `stream`), swaps the client's key for the provider's,
+  meters tokens from JSON and streamed responses, enforces token budgets and issues its own API keys.
+- **An MCP gateway.** Model Context Protocol servers over Streamable HTTP sit behind the same
+  gateway: routing on the JSON-RPC method and tool, sessions pinned to the server pod that created
+  them, per-key tool allow lists, call budgets, and OAuth bearer tokens verified against an issuer
+  such as dex.
 
-## Conformance
+Three rules shape the design. The data plane never calls anything on the request path: keys,
+budgets and token verification are local lookups against state the ledger pushes in. Config
+changes swap atomically (`ArcSwap`), so a reload never drops a connection. And the network stack
+is an adapter: everything Portus decides lives in a stack-independent core, and the release image
+carries both [Rama](https://github.com/plabayo/rama) (default) and
+[Pingora](https://github.com/cloudflare/pingora).
 
-Gateway API **v1.6.2** (`experimental` channel): **130 of 130 conformance tests pass, 0 failures, 0 skips**, across all five profiles (GATEWAY-HTTP, GATEWAY-GRPC, GATEWAY-TLS, GATEWAY-TCP, GATEWAY-UDP), run in-cluster against the per-Gateway deployment (one dataplane Deployment and Service per Gateway).
+## Quick Start
+
+Prerequisites: a Kubernetes 1.32+ cluster, `kubectl`, Helm 3.8+.
+
+```bash
+# Gateway API CRDs (experimental channel: GRPCRoute, TLSRoute, TCPRoute, UDPRoute, ListenerSet)
+kubectl apply --server-side --force-conflicts \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
+
+# Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.4 \
+  --namespace portus --create-namespace
+```
+
+Images are published to `ghcr.io/portus-gateway/controller`, `ghcr.io/portus-gateway/dataplane` and
+`ghcr.io/portus-gateway/ledger` for `linux/amd64` and `linux/arm64`; the chart pins the tag matching
+its version.
+
+A Gateway and an HTTPRoute:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+  namespace: portus
+spec:
+  gatewayClassName: portus-gateway
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-route
+  namespace: portus
+spec:
+  parentRefs:
+  - name: my-gateway
+  hostnames:
+  - "app.example.com"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: my-service
+      port: 8080
+```
+
+Each Gateway gets its own dataplane Deployment and Service; the Service's address appears in
+`status.addresses`:
+
+```bash
+ADDR=$(kubectl get gateway my-gateway -n portus -o jsonpath='{.status.addresses[0].value}')
+curl -H "Host: app.example.com" http://$ADDR/
+```
+
+## Gateway API
+
+Gateway API **v1.6.2** (`experimental` channel): **130 of 130 conformance tests pass, 0 failures,
+0 skips**, run in-cluster against the per-Gateway deployment.
 
 | Profile | Core | Extended |
 |---------|------|----------|
@@ -23,9 +103,134 @@ Gateway API **v1.6.2** (`experimental` channel): **130 of 130 conformance tests 
 | TCP     | 19/19 | 9/9 |
 | UDP     | 20/20 | 9/9 |
 
-Supported extended features include: HTTPRoute method matching, query param matching, request mirroring (including multiple mirrors and percentage-based), path/host rewrite, backend request header modification, response header modification, backend protocol H2C, WebSocket, destination port matching, request/backend timeouts, redirect status codes (303/307/308), CORS, ListenerSet, HTTP listener isolation, misdirected-request detection, BackendTLSPolicy with SAN validation, TLS Terminate and mixed mode, HTTPRoute retry, TCPRoute and UDPRoute.
 
-See the full [conformance report](tests/conformance/conformance-report.yaml).
+Extended features covered: HTTPRoute method and query matching, request mirroring (multiple and
+percentage-based), path and host rewrite, request and response header modification, H2C and
+WebSocket backends, destination port matching, request and backend timeouts, redirect status codes,
+CORS, ListenerSet, HTTP listener isolation, misdirected-request detection, BackendTLSPolicy with SAN
+validation, TLS terminate, passthrough and mixed mode, HTTPRoute retry, TCPRoute and UDPRoute. Full
+[conformance report](tests/conformance/conformance-report.yaml).
+
+### Policies
+
+Portus policies are CRDs that attach to a Gateway, route or Service with a `targetRef`; the
+controller compiles them into the route config and the data plane enforces them locally.
+
+| Policy | What it does |
+|---|---|
+| `TimeoutPolicy` | Request, backend-request and connect deadlines |
+| `RetryPolicy` | Replay to another endpoint when the connection fails |
+| `RateLimitPolicy` | Token bucket per route or per client IP |
+| `CircuitBreakerPolicy` | Stop sending to a backend after consecutive 5xx |
+| `ConnectionPolicy` | Cap in-flight requests to a backend |
+| `HealthCheckPolicy` | Active HTTP health checks on the endpoints |
+| `CORSPolicy` | Preflight answers and CORS response headers |
+| `IPAllowlistPolicy` | Allow and deny CIDRs, with trusted proxies for `X-Forwarded-For` |
+| `RequestBodySizeLimitPolicy` | 413 above `maxBytes`, streamed bodies included |
+| `BasicAuthPolicy`, `ApiKeyAuthPolicy` | HTTP Basic against bcrypt hashes; a header against keys in a Secret |
+| `AIUsagePolicy` | Token or call budgets on an AIRoute |
+
+Fields, examples and semantics: [`docs/policies.md`](docs/policies.md).
+
+## AI gateway
+
+Three CRDs turn a Gateway into a front for LLM providers. Clients keep speaking the provider's
+native API; the gateway routes on the body, swaps credentials, meters and enforces. Opt in with
+`aiGateway.enabled: true`, which also deploys the **ledger**, the companion service that holds
+keys, budgets and usage so the data plane never calls out on the request path.
+
+```yaml
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIProvider
+metadata: {name: anthropic, namespace: llm}
+spec:
+  kind: anthropic
+  url: https://api.anthropic.com
+  credential: {secretRef: {name: anthropic-key}}
+---
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIRoute
+metadata: {name: claude, namespace: llm}
+spec:
+  parentRefs: [{name: gateway}]
+  hostnames: [llm.example.com]
+  requireApiKey: true
+  rules:
+  - matches:
+    - model: {type: Prefix, value: claude-}
+    providerRefs: [{name: anthropic}]
+---
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIUsagePolicy
+metadata: {name: daily-cap, namespace: llm}
+spec:
+  targetRef: {group: portus-gateway.dev, kind: AIRoute, name: claude}
+  budget: {tokens: 1000000, window: Daily, per: Key}
+```
+
+- **Routing on the body.** A streaming JSON scanner reads `model`, `stream` and `max_tokens` as
+  the request arrives and replays the bytes to the provider unchanged; Anthropic and OpenAI SDKs
+  put `model` after the prompt, so this matters.
+- **Keys.** The ledger issues `portus_sk_…` keys or imports external ones and stores only hashes;
+  the data plane checks a key with one hash and one lookup against a pushed snapshot. Keys carry
+  `allowed_models` and `allowed_tools`.
+- **Metering and budgets.** Input, output and cache tokens are read from JSON and SSE responses of
+  both dialects. Budgets are local counters per key, tenant or route, reserved before the request
+  and settled after, synced with the ledger once a second; every response carries
+  `x-portus-tokens-remaining`.
+- **Refusals in the provider's shape**: 401 `authentication_error`, 403 `permission_error`, 429
+  with `Retry-After`. Every refusal is recorded with its reason.
+- **Ordinary policies apply**: `TimeoutPolicy`, `RateLimitPolicy`, `RetryPolicy` and the rest
+  target an AIRoute like an HTTPRoute.
+- **Claude Code** works unchanged: `ANTHROPIC_BASE_URL=https://llm.example.com ANTHROPIC_API_KEY=portus_sk_… claude`.
+
+## MCP gateway
+
+An MCP server is a provider of `kind: mcp`; the transport is Streamable HTTP.
+
+```yaml
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIProvider
+metadata: {name: github-mcp, namespace: tools}
+spec:
+  kind: mcp
+  url: http://github-mcp.tools.svc.cluster.local:3001
+---
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIRoute
+metadata: {name: mcp, namespace: tools}
+spec:
+  parentRefs: [{name: gateway}]
+  hostnames: [mcp.example.com]
+  requireApiKey: true
+  auth:
+    jwt: {issuer: https://dex.example.com, audience: portus}
+  rules:
+  - matches:
+    - method: {type: Exact, value: tools/call}
+      tool: {type: Prefix, value: github.}
+    providerRefs: [{name: github-mcp}]
+  - matches:
+    - path: {type: PathPrefix, value: /mcp}
+    providerRefs: [{name: github-mcp}]
+```
+
+- **Routing** on the JSON-RPC `method` and on the tool a `tools/call` names, so one namespace of
+  tools can live on one server and the rest elsewhere.
+- **Sessions stay on the server pod that created them.** The `Mcp-Session-Id` a client receives
+  carries the gateway's tag for that endpoint in front of the server's id; nothing is shared between
+  gateway pods and the server never sees the tag. A provider that names a cluster Service follows
+  its pod endpoints, not the ClusterIP.
+- **Per-key tool allow lists** (`allowed_tools`, exact or `prefix.*`) and **call budgets**
+  (`budget.calls`), with refusals as JSON-RPC errors on 200 so clients keep their session.
+- **OAuth.** With `auth.jwt`, bearer tokens from an issuer such as dex are accepted in place of a
+  Portus key: the ledger fetches the issuer's JWKS, the data plane verifies tokens locally and caches
+  them by hash, the subject's groups become the tenant and a scope claim can gate tools. The host
+  publishes `/.well-known/oauth-protected-resource`, which is how MCP clients find the login.
+- **Claude Code**: `claude mcp add --transport http github https://mcp.example.com/mcp --header "Authorization: Bearer …"`.
+
+Field reference for the three CRDs, the key API and the refusal shapes:
+[`docs/ai-gateway.md`](docs/ai-gateway.md). Examples: [`deploy/examples/ai-gateway/`](deploy/examples/ai-gateway/).
 
 ## Performance
 
@@ -75,65 +280,23 @@ Details: [`benchmarks/head-to-head-machine-2026-09-11.md`](benchmarks/head-to-he
 `make bench-backend bench-portus bench-traffic-fortio bench-latency bench-download bench-upload bench-https bench-h2` and
 the `bench-*` control-plane targets.
 
-## Quick Start
 
-Prerequisites: a Kubernetes 1.32+ cluster, `kubectl`, Helm 3.8+.
+### Network stacks
 
-```bash
-# Gateway API CRDs (experimental channel: GRPCRoute, TLSRoute, TCPRoute, UDPRoute, ListenerSet)
-kubectl apply --server-side --force-conflicts \
-  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
+Everything the data plane decides (routing, policies, TLS material, endpoint pools, the SNI mux, the
+L4 and UDP proxies, the AI and MCP logic) lives in `portus-dataplane-core` and knows nothing about
+the proxy framework underneath. The framework is an adapter that extracts a request's facts, asks
+the core for a plan and carries it out. The release image carries two:
 
-# Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.4 \
-  --namespace portus --create-namespace
-```
+| Stack | Status | Select with |
+|---|---|---|
+| [Rama](https://github.com/plabayo/rama) 0.4 | Default since 0.2.4: conformance 130/130, the AI and MCP gateways run on it. Rama is used unpatched; the upstream connection pool is Portus's own | `dataplane.networkStack: rama` (default) |
+| [Pingora](https://github.com/cloudflare/pingora) 0.9 | The stack behind releases up to 0.2.3 and the numbers above; a small patch to `pingora-core` is vendored | `dataplane.networkStack: pingora` |
 
-Images are published to `ghcr.io/portus-gateway/controller` and `ghcr.io/portus-gateway/dataplane`
-for `linux/amd64` and `linux/arm64`; the chart pins the tag matching its version.
-
-Once deployed, create a Gateway and HTTPRoute:
-
-```yaml
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: my-gateway
-  namespace: portus
-spec:
-  gatewayClassName: portus-gateway
-  listeners:
-  - name: http
-    protocol: HTTP
-    port: 80
----
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: my-route
-  namespace: portus
-spec:
-  parentRefs:
-  - name: my-gateway
-  hostnames:
-  - "app.example.com"
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /
-    backendRefs:
-    - name: my-service
-      port: 8080
-```
-
-Each Gateway gets its own dataplane Deployment and Service; the Service's address appears in
-`status.addresses`:
-
-```bash
-ADDR=$(kubectl get gateway my-gateway -n portus -o jsonpath='{.status.addresses[0].value}')
-curl -H "Host: app.example.com" http://$ADDR/
-```
+On the same machine Rama measured 3–31 % more throughput than Pingora on every payload rung and used
+2–2.6× less memory in a single round
+([`benchmarks/rama-vs-pingora-2026-09-15.md`](benchmarks/rama-vs-pingora-2026-09-15.md)); a
+three-round comparison is due with the next release's numbers.
 
 ## Architecture
 
@@ -141,95 +304,47 @@ curl -H "Host: app.example.com" http://$ADDR/
                     ┌──────────────────────────────────┐
                     │         Kubernetes API            │
                     │  Gateway  HTTPRoute  GRPCRoute    │
-                    │  TLSRoute  TCPRoute  UDPRoute     │
+                    │  TLSRoute TCPRoute UDPRoute       │
+                    │  AIProvider AIRoute AIUsagePolicy │
                     └──────────┬───────────────────────┘
                                │ watch
-                    ┌──────────▼───────────────────────┐
-                    │       portus-controller             │
-                    │                                   │
-                    │  Reconcilers → ConfigStore         │
-                    │       → compile_config()           │
-                    │       → CompiledConfig (proto)     │
-                    └──────────┬───────────────────────┘
-                               │ gRPC stream
-              ┌────────────────┼────────────────┐
-              ▼                ▼                 ▼
-     ┌────────────┐   ┌────────────┐   ┌────────────┐
-     │  dataplane  │   │  dataplane  │   │  dataplane  │
-     │  (Pingora)  │   │  (Pingora)  │   │  (Pingora)  │
+                    ┌──────────▼───────────────────────┐        ┌──────────────────┐
+                    │       portus-controller           │        │  portus-ledger   │
+                    │  Reconcilers → ConfigStore        │        │  keys · budgets  │
+                    │       → compile_config()          │        │  usage · JWKS    │
+                    │       → CompiledConfig (proto)    │        └───────┬──────────┘
+                    └──────────┬───────────────────────┘                │ snapshots, syncs,
+                               │ gRPC stream (mTLS)                     │ usage batches (mTLS)
+              ┌────────────────┼────────────────┐                       │
+              ▼                ▼                 ▼                       │
+     ┌────────────┐   ┌────────────┐   ┌────────────┐                    │
+     │  dataplane  │   │  dataplane  │   │  dataplane  │ ◀─────────────────┘
+     │   (rama)    │   │   (rama)    │   │   (rama)    │
      └────────────┘   └────────────┘   └────────────┘
 ```
 
-The **controller** watches Gateway API CRDs via the kube-rs runtime and provisions a dataplane Deployment, Service and PodDisruptionBudget per Gateway. Each resource type has a dedicated reconciler that updates a shared `ConfigStore`. Reconcilers publish store events to each other instead of polling, so nothing is requeued on a timer. On any change the store is compiled into a `CompiledConfig` protobuf message; each dataplane receives only its own Gateway's slice over gRPC and acknowledges the content fingerprint it applied, which is what drives the Gateway's `Programmed` condition.
+The **controller** watches Gateway API and Portus CRDs via the kube-rs runtime and provisions a
+dataplane Deployment, Service and PodDisruptionBudget per Gateway. Each resource type has a
+dedicated reconciler that updates a shared `ConfigStore`; reconcilers publish store events to each
+other instead of polling. On any change the store is compiled into a `CompiledConfig` protobuf
+message; each dataplane receives only its own Gateway's slice over gRPC and acknowledges the
+content fingerprint it applied, which drives the Gateway's `Programmed` condition.
 
-The **dataplane** receives the compiled config, builds route maps keyed by `listener_port:hostname`, binds every listener port from the config, and serves traffic through Pingora's proxy framework. Failing endpoints are ejected from load balancing passively (a connect failure or five consecutive 5xx) and readmitted after a growing back-off. Route matching follows Gateway API precedence rules — exact paths before prefix paths, longest prefix first, with header/method/query matches as tiebreakers. Config updates are swapped atomically via `ArcSwap`, so in-flight requests always see a consistent snapshot and no connections are dropped.
+The **dataplane** builds route maps keyed by `listener_port:hostname`, binds every listener port
+and serves traffic through the selected network stack. Failing endpoints are ejected from load
+balancing passively (a connect failure or five consecutive 5xx) and readmitted after a growing
+back-off. Route matching follows Gateway API precedence: exact paths before prefix paths, longest
+prefix first, header, method and query matches as tiebreakers. Config updates swap atomically via
+`ArcSwap`. On SIGTERM a pod stops accepting, reports not ready, lets requests in flight finish and
+exits.
 
-The **proto schema** (`proto/portus/v1/config.proto`) defines the contract between controller and dataplane. It carries listeners, route configs, backend refs, filters, TLS certificates, and all the routing metadata needed to reconstruct full Gateway API semantics on the dataplane side.
+The **ledger** (opt-in with the AI gateway) issues keys, keeps budgets as a shared counter the data
+planes sync every second, stores usage in SQLite and fetches OAuth issuers' JWKS. It pushes
+snapshots down and receives usage batches up; it is never on the request path.
 
-### Network stacks
-
-Everything the data plane decides — routing, policies, TLS material, endpoint pools, the SNI mux, the L4 and UDP proxies — lives in `portus-dataplane-core` and knows nothing about the proxy framework underneath. The framework is an adapter that extracts a request's facts, asks the core for a plan, and carries it out. Two adapters exist:
-
-| Stack | Status | Select with |
-|---|---|---|
-| [Rama](https://github.com/plabayo/rama) 0.4 | The release stack since 0.2.4: default in every published image, conformance 130/130, the AI gateway runs on it | `dataplane.networkStack: rama` (default) |
-| [Pingora](https://github.com/cloudflare/pingora) 0.9 | The stack behind every release up to 0.2.3 and every number in the tables above; still in the release image | `dataplane.networkStack: pingora` |
-
-Both stacks share the core, benchmarks and conformance suite; a value the image was not built with fails the pod at start with a log line naming it.
-
-Rama against Pingora, one round on the same 10 vCPU machine as the tables above, Pingora then Rama on the same 3 pods × 2 CPU (fortio, 10 s per rung, all requests 200). Rama ran with other load on the box (load average 7.4 against 2.7 for the Pingora pass), so its numbers are if anything understated; a single round still means differences under 5 % are noise.
-
-| Ladder | Rung | Pingora | Rama | Δ |
-|---|---|---|---|---|
-| Traffic (bare `GET /`, by connections) | 64 | 135,987 | 149,683 | +10 % |
-| | 128 | 149,926 | 169,209 | +13 % |
-| | 256 | 148,653 | 163,788 | +10 % |
-| Download (64 connections, by response size) | 1 KiB | 88,970 | 91,627 | +3 % |
-| | 16 KiB | 69,336 | 75,649 | +9 % |
-| | 128 KiB | 38,578 | 40,449 | +5 % |
-| | 1 MiB | 6,496 | 7,317 | +13 % |
-| Upload (POST, echoed) | 1 KiB | 75,840 | 84,721 | +12 % |
-| | 16 KiB | 32,335 | 36,934 | +14 % |
-| | 128 KiB | 9,819 | 9,778 | 0 % |
-| | 1 MiB | 5,142 | 5,374 | +5 % |
-| HTTPS download | 1 KiB | 81,094 | 86,925 | +7 % |
-| | 16 KiB | 59,729 | 67,483 | +13 % |
-| | 128 KiB | 25,914 | 28,960 | +12 % |
-| | 1 MiB | 4,154 | 5,427 | +31 % |
-| HTTP/2 download | 1 KiB | 60,484 | 66,619 | +10 % |
-| | 16 KiB | 45,696 | 52,156 | +14 % |
-| | 128 KiB | 21,276 | 23,329 | +10 % |
-| | 1 MiB | 3,781 | 4,602 | +22 % |
-
-Resources over the same round, summed across the three dataplane pods (CPU in millicores, memory in MiB):
-
-| Ladder | Pingora CPU mean / peak | Rama CPU mean / peak | Pingora memory mean / peak | Rama memory mean / peak |
-|---|---|---|---|---|
-| Traffic | 1,323 / 2,691 | 1,257 / 3,208 | 41 / 68 | 31 / 85 |
-| Download | 3,246 / 3,563 | 3,036 / 3,273 | 136 / 282 | 120 / 138 |
-| Upload | 2,600 / 3,237 | 2,436 / 3,184 | 184 / 282 | 123 / 152 |
-| HTTPS | 2,213 / 2,973 | 2,264 / 3,035 | 235 / 331 | 140 / 152 |
-| HTTP/2 | 3,063 / 3,499 | 2,716 / 3,236 | 369 / 432 | 126 / 167 |
-
-The Rama adapter uses Rama 0.4 unpatched for TCP, TLS, the HTTP/1 and HTTP/2 client connections and the server. The upstream connection pool is Portus's own: one shard of idle HTTP/1 connections per backend, TLS policy and protocol, a rotating set of HTTP/2 connections per gRPC or h2c backend, the client read buffer capped at 64 KiB, and TCP_NODELAY on every socket. Its decisions are exported as `proxy_upstream_pool_events_total{event}` on the metrics port.
-
-## AI gateway
-
-Portus can front LLM providers as well as ordinary backends. Three CRDs turn a Gateway into an AI gateway; clients keep speaking the provider's native API (Anthropic Messages, OpenAI chat) and the gateway routes on the request body, swaps the client's key for the provider's, meters tokens and enforces budgets. It needs the Rama network stack (`dataplane.networkStack: rama`) and `aiGateway.enabled: true`, which also deploys the ledger, the small companion service that keeps everything with state so the data plane never calls out on the request path.
-
-| Resource | What it does |
-|---|---|
-| `AIProvider` | An LLM API: `kind` (`anthropic`, `openai`, `openai-compatible`), `url` (scheme and host), the provider credential from a Secret. Resolved to endpoints by the controller. |
-| `AIRoute` | An HTTPRoute-shaped route whose matches include the body's `model` (exact, prefix or regex) and `stream`. `requireApiKey: true` demands a Portus API key. |
-| `AIUsagePolicy` | A token budget on an AIRoute per key, tenant or route, per UTC hour, day or month, with a fail-open or fail-closed choice when the ledger is unreachable. |
-
-The ordinary policies (TimeoutPolicy, RateLimitPolicy, RetryPolicy and the rest) target an AIRoute the same way they target an HTTPRoute.
-
-MCP servers are providers too (`kind: mcp`, Streamable HTTP): an AIRoute matches on the JSON-RPC `method` and on the tool a `tools/call` names, keys carry a tool allow list, budgets can count calls instead of tokens, and a session stays on the server pod that created it (rendezvous hashing on `Mcp-Session-Id`, nothing shared between gateway pods). Refusals inside a session are JSON-RPC errors on 200 so clients keep their session. Routes can also accept OAuth bearer tokens from an issuer such as dex (`auth.jwt`): the ledger fetches the JWKS, the data plane verifies tokens locally and caches them, and the host publishes the RFC 9728 metadata MCP clients use to find the login. Field reference: [`docs/ai-gateway.md`](docs/ai-gateway.md).
-
-How it stays fast: the body is scanned as it streams with a memchr-driven JSON field scanner that stops at the first sight of `model` and `stream`, and the held bytes are replayed to the provider unchanged; keys are one SHA-256 and a hash-map lookup against a snapshot the ledger pushes; budgets are a local counter per subject that reserves an estimate before the request and settles to the provider's real token count after, syncing with the ledger once a second; usage records go into a lock-free ring drained by a background task. Every budgeted response carries `x-portus-tokens-remaining`; refusals are 401, 403 or 429 in the provider's own error shape with `Retry-After`.
-
-The ledger issues and revokes keys (`POST`/`GET`/`DELETE /v1/keys`, bearer token in the generated `<release>-portus-gateway-ledger-admin` Secret), answers `GET /v1/summary?hours=24` with requests, refusals and tokens per key, exports every record as JSON lines (`GET /export.jsonl`) and exposes `/metrics`. Example manifests and a walk-through, including pointing Claude Code at the gateway with `ANTHROPIC_BASE_URL`, are in [`deploy/examples/ai-gateway/`](deploy/examples/ai-gateway/).
+The **proto schema** (`proto/portus/v1/`) is the contract between the three: listeners, routes,
+backends, filters, TLS material, AI backends and budgets on the config stream; key snapshots,
+budget syncs and usage records on the ledger stream.
 
 ## Configuration
 
@@ -265,45 +380,44 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `aiGateway.ledger.adminTokenSecretName` | `""` | Bring your own admin token Secret (key `token`) for the key API |
 | `aiGateway.jwt.issuers` | `[]` | OAuth issuers whose tokens `AIRoute.auth.jwt` may accept; the ledger fetches their JWKS every 5 minutes |
 
-Full reference: [`docs/deployment.md`](docs/deployment.md). Policies (timeouts, retries, rate limits, circuit breakers, CORS, IP allow lists, body limits, auth): [`docs/policies.md`](docs/policies.md). AI gateway and MCP: [`docs/ai-gateway.md`](docs/ai-gateway.md). What is supported, planned and not planned: [`docs/compliance-matrix.md`](docs/compliance-matrix.md).
+Full reference: [`docs/deployment.md`](docs/deployment.md). Policies: [`docs/policies.md`](docs/policies.md).
+AI gateway and MCP: [`docs/ai-gateway.md`](docs/ai-gateway.md). What is supported, planned and not
+planned: [`docs/compliance-matrix.md`](docs/compliance-matrix.md).
 
 ## Building from Source
 
 Requires Rust 1.98+ and protoc.
 
 ```bash
-# Build all workspace crates
 cargo build --workspace --release
-
-# Run unit tests
 cargo test --workspace -- --test-threads=1 -q
-
-# Build container images
-make build
+make build      # controller, dataplane and ledger images
 ```
 
 Local cluster with [mise](https://mise.jdx.dev/) managing k3d, helm, kubectl, go and protoc:
 
 ```bash
 make k3d-up     # k3d cluster `portus-local`
-make build      # controller + dataplane images
+make build      # images
 make deploy     # Gateway API CRDs, image import, helm install (ClusterIP Services, one pod per Gateway)
 ```
 
-The workspace contains four crates plus the patched `pingora-core`:
+The workspace contains five crates plus the patched `pingora-core`:
 
 | Crate | Path | Description |
 |-------|------|-------------|
-| `portus-controller` | `crates/portus-controller` | Kubernetes controller — reconcilers, config store, compiler, gRPC server |
-| `portus-dataplane-core` | `crates/portus-dataplane-core` | Network-stack-independent data plane — config receiver, route matching, policies, endpoint pools, TLS material, SNI mux, L4/UDP proxies, metrics |
-| `portus-dataplane` | `crates/portus-dataplane` | The data plane binary: network-stack adapters over the core (Pingora; Rama behind the `rama` feature), selected with `PORTUS_NETWORK_STACK` |
-| `portus-types` | `crates/portus-types` | Protobuf-generated types shared between controller and dataplane |
+| `portus-controller` | `crates/portus-controller` | Kubernetes controller: reconcilers, config store, compiler, gRPC server |
+| `portus-dataplane-core` | `crates/portus-dataplane-core` | Network-stack-independent data plane: config receiver, route matching, policies, endpoint pools, TLS material, SNI mux, L4/UDP proxies, AI and MCP logic, metrics |
+| `portus-dataplane` | `crates/portus-dataplane` | The data plane binary: network-stack adapters over the core (Rama by default, Pingora), selected with `PORTUS_NETWORK_STACK` |
+| `portus-ledger` | `crates/portus-ledger` | The AI gateway's companion: keys, budgets, usage store, JWKS refresh |
+| `portus-types` | `crates/portus-types` | Protobuf-generated types shared by all three |
 
-Release builds use `opt-level = 3`, fat LTO, single codegen unit, and `panic = abort` for minimal binary size.
+Release builds use `opt-level = 3`, fat LTO, single codegen unit, and `panic = abort`.
 
 ### Running Conformance Tests
 
-Conformance runs in-cluster: every Gateway gets its own dataplane and a ClusterIP address that only pods can reach, so the suite is built into an image and run as a Job.
+Conformance runs in-cluster: every Gateway gets its own dataplane and a ClusterIP address that only
+pods can reach, so the suite is built into an image and run as a Job.
 
 ```bash
 make k3d-up build deploy          # cluster, images, chart
