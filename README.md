@@ -225,7 +225,7 @@ Portus can front LLM providers as well as ordinary backends. Three CRDs turn a G
 
 The ordinary policies (TimeoutPolicy, RateLimitPolicy, RetryPolicy and the rest) target an AIRoute the same way they target an HTTPRoute.
 
-MCP servers are providers too (`kind: mcp`, Streamable HTTP): an AIRoute matches on the JSON-RPC `method` and on the tool a `tools/call` names, keys carry a tool allow list, budgets can count calls instead of tokens, and a session stays on the server pod that created it (rendezvous hashing on `Mcp-Session-Id`, nothing shared between gateway pods). Refusals inside a session are JSON-RPC errors on 200 so clients keep their session. Field reference: [`docs/ai-gateway.md`](docs/ai-gateway.md).
+MCP servers are providers too (`kind: mcp`, Streamable HTTP): an AIRoute matches on the JSON-RPC `method` and on the tool a `tools/call` names, keys carry a tool allow list, budgets can count calls instead of tokens, and a session stays on the server pod that created it (rendezvous hashing on `Mcp-Session-Id`, nothing shared between gateway pods). Refusals inside a session are JSON-RPC errors on 200 so clients keep their session. Routes can also accept OAuth bearer tokens from an issuer such as dex (`auth.jwt`): the ledger fetches the JWKS, the data plane verifies tokens locally and caches them, and the host publishes the RFC 9728 metadata MCP clients use to find the login. Field reference: [`docs/ai-gateway.md`](docs/ai-gateway.md).
 
 How it stays fast: the body is scanned as it streams with a memchr-driven JSON field scanner that stops at the first sight of `model` and `stream`, and the held bytes are replayed to the provider unchanged; keys are one SHA-256 and a hash-map lookup against a snapshot the ledger pushes; budgets are a local counter per subject that reserves an estimate before the request and settles to the provider's real token count after, syncing with the ledger once a second; usage records go into a lock-free ring drained by a background task. Every budgeted response carries `x-portus-tokens-remaining`; refusals are 401, 403 or 429 in the provider's own error shape with `Retry-After`.
 
@@ -263,6 +263,7 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `aiGateway.enabled` | `false` | Deploy the ledger and enable AI routes; needs `dataplane.networkStack: rama`. On an existing install upgrade with `--reset-then-reuse-values` and delete the generated grpc-tls Secret once so it is regenerated with the ledger's names |
 | `aiGateway.ledger.storage.size` | `1Gi` | PersistentVolumeClaim for the ledger's SQLite file |
 | `aiGateway.ledger.adminTokenSecretName` | `""` | Bring your own admin token Secret (key `token`) for the key API |
+| `aiGateway.jwt.issuers` | `[]` | OAuth issuers whose tokens `AIRoute.auth.jwt` may accept; the ledger fetches their JWKS every 5 minutes |
 
 Full reference: [`docs/deployment.md`](docs/deployment.md). Policies (timeouts, retries, rate limits, circuit breakers, CORS, IP allow lists, body limits, auth): [`docs/policies.md`](docs/policies.md). AI gateway and MCP: [`docs/ai-gateway.md`](docs/ai-gateway.md). What is supported, planned and not planned: [`docs/compliance-matrix.md`](docs/compliance-matrix.md).
 

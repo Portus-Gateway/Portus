@@ -63,6 +63,16 @@ so a rule with only a `path` match is what carries those requests. `model`/`stre
 on every request; the key is checked against the ledger's snapshot on the data plane and
 stripped before forwarding.
 
+`auth.jwt` lets the route accept OAuth bearer tokens from one issuer in place of a Portus
+key (see [OAuth clients](#oauth-clients)).
+
+| `auth.jwt` field | Values | Notes |
+|---|---|---|
+| `issuer` | `https://…` | The token's `iss`; must be listed in the chart's `aiGateway.jwt.issuers` |
+| `audience` | string | Required `aud` when set |
+| `tenantClaim` | claim name, default `groups` | A string claim, or the first entry of an array claim |
+| `toolsClaim` | claim name, default `scope` | The MCP tools the subject may call: an array of strings or a space-separated string |
+
 The body is scanned as it streams for `model`, `stream`, `max_tokens`, `method`, `id`
 and `params` (`params` kept up to 64 KiB to read the tool name). Bodies over 8 MiB are
 refused with 413; the bytes read are replayed to the provider unchanged.
@@ -105,6 +115,33 @@ Secret (key `token`).
 `allowed_models` applies to LLM requests (empty: any model). `allowed_tools` applies to
 MCP `tools/call` requests, exact names or `prefix.*` (empty: any tool); other MCP
 methods only need a valid key.
+
+## OAuth clients
+
+Routes with `auth.jwt` accept bearer JWTs without any call-out on the request path:
+
+- The ledger fetches each issuer in `aiGateway.jwt.issuers` (`/.well-known/openid-configuration`
+  → `jwks_uri`, or `<issuer>/keys` for dex-style issuers) every five minutes and ships the
+  JWKS to the data planes in the key snapshot.
+- The data plane verifies signature, `exp`, `iss` and `aud` against those keys (RS*, PS*,
+  ES*, EdDSA), then caches the verified token by hash until it expires; a cached token costs
+  the same hash lookup as a Portus key.
+- The subject is `sub`; its id, used in usage rows and per-key budgets, is derived from
+  `(issuer, sub)`; tenant and tool list come from `tenantClaim` and `toolsClaim`. A
+  Portus key on the same route keeps working.
+- A host with such a route answers `GET /.well-known/oauth-protected-resource` (RFC 9728)
+  with the issuer as its authorization server, which is how MCP clients discover the login
+  flow.
+
+```yaml
+spec:
+  requireApiKey: true
+  auth:
+    jwt:
+      issuer: https://dex.example.com
+      audience: portus
+      toolsClaim: scope
+```
 
 ## Refusals
 

@@ -23,7 +23,8 @@ rand = "0.10"
 axum = { workspace = true }
 tokio-stream = { workspace = true }
 subtle = "2"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json"] }
+rustls = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

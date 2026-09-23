@@ -420,6 +420,8 @@ fn server_tls() -> Option<tonic::transport::ServerTlsConfig> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // tonic and reqwest both use rustls; one process-wide provider, chosen here.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let db_path = PathBuf::from(env_or("LEDGER_DB_PATH", "/data/ledger.db"));
     let grpc_addr: std::net::SocketAddr = env_or("LEDGER_GRPC_ADDR", "0.0.0.0:9444").parse()?;
