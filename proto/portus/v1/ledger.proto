@@ -39,6 +39,10 @@ message UsageRecord {
   // Why the gateway refused the request before forwarding it; empty when
   // it was forwarded. unauthenticated | model_not_allowed | budget_exhausted
   string refusal = 19;
+  // The subject's tenant and name as the data plane knew them: a key's, or
+  // an OAuth token's claims (the ledger has no key row for those).
+  string tenant = 20;
+  string subject = 21;
 }
 
 message ReportAck {

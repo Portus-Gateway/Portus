@@ -104,6 +104,8 @@ pub fn to_wire(r: &UsageRecord) -> WireRecord {
         request_bytes: r.request_bytes,
         response_bytes: r.response_bytes,
         key_id: r.key_id,
+        tenant: r.tenant.to_string(),
+        subject: r.subject.to_string(),
         request_id: r.request_id,
         refusal: r.refusal.map_or("", |k| k.as_str()).to_string(),
     }
@@ -245,11 +247,14 @@ mod tests {
             request_bytes: 100,
             response_bytes: 200,
             key_id: 7,
+            tenant: UsageRecord::name("team-a"),
+            subject: UsageRecord::name("alice@example.com"),
             request_id: 42,
             refusal: None,
         };
         let w = to_wire(&r);
         assert_eq!(w.refusal, "");
+        assert_eq!((w.tenant.as_str(), w.subject.as_str()), ("team-a", "alice@example.com"));
         assert_eq!((w.status, w.dialect.as_str(), w.stream, w.has_usage), (200, "openai", true, true));
         assert_eq!((w.input_tokens, w.output_tokens, w.cache_read_tokens), (9, 12, 3));
         assert_eq!((w.provider.as_str(), w.route_host.as_str(), w.requested_model.as_str(), w.served_model.as_str()), ("echo", "llm.bench", "gpt-5", ""));

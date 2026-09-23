@@ -108,8 +108,8 @@ Secret (key `token`).
 | `POST /v1/keys` | `{"tenant","name","allowed_models":[…],"allowed_tools":[…],"key"}`; `key` imports an external key (≥ 16 characters), omitted generates `portus_sk_` + 40 hex. The plaintext is returned once |
 | `GET /v1/keys` | Every key, revoked ones included, without plaintext or hash |
 | `DELETE /v1/keys/{id}` | Revoke; data planes drop the key within a second |
-| `GET /v1/summary?hours=N` | Requests, refusals and tokens per key |
-| `GET /export.jsonl?since_us=&limit=` | One JSON row per request: status, dialect, provider, model or method, tool, tokens, bytes, key, refusal |
+| `GET /v1/summary?hours=N` | Requests, refusals and tokens per subject: a key's tenant and name, or an OAuth token's tenant claim and `sub` |
+| `GET /export.jsonl?since_us=&limit=` | One JSON row per request: status, dialect, provider, model or method, tool, tokens, bytes, key id, tenant, subject, refusal |
 | `GET /metrics` | Prometheus |
 
 `allowed_models` applies to LLM requests (empty: any model). `allowed_tools` applies to

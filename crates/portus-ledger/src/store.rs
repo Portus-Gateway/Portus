@@ -59,6 +59,10 @@ pub struct Row {
     pub request_id: u64,
     /// Empty when the request was forwarded.
     pub refusal: String,
+    /// The subject as the data plane knew it; names OAuth subjects, which
+    /// have no key row.
+    pub tenant: String,
+    pub subject: String,
 }
 
 const SCHEMA: &str = "
@@ -83,7 +87,9 @@ CREATE TABLE IF NOT EXISTS usage (
     response_bytes INTEGER NOT NULL,
     key_id INTEGER NOT NULL,
     request_id INTEGER NOT NULL,
-    refusal TEXT NOT NULL DEFAULT ''
+    refusal TEXT NOT NULL DEFAULT '',
+    tenant TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS usage_ts ON usage (ts_unix_micros);
 CREATE INDEX IF NOT EXISTS usage_key_ts ON usage (key_id, ts_unix_micros);
@@ -116,6 +122,13 @@ impl Store {
             .exists([])?;
         if !has_refusal {
             conn.execute_batch("ALTER TABLE usage ADD COLUMN refusal TEXT NOT NULL DEFAULT ''")?;
+        }
+        // Ledgers created before OAuth subjects lack the subject columns.
+        let has_subject: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('usage') WHERE name = 'subject'")?
+            .exists([])?;
+        if !has_subject {
+            conn.execute_batch("ALTER TABLE usage ADD COLUMN tenant TEXT NOT NULL DEFAULT ''; ALTER TABLE usage ADD COLUMN subject TEXT NOT NULL DEFAULT ''")?;
         }
         conn.execute_batch(keys::SCHEMA)?;
         // Ledgers created before MCP lack the tool list on keys.
@@ -179,8 +192,8 @@ impl Store {
             let mut stmt = tx.prepare_cached(
                 "INSERT INTO usage (node, ts_unix_micros, duration_micros, status, dialect, stream, provider, route_host,
                  requested_model, served_model, has_usage, input_tokens, output_tokens, cache_read_tokens,
-                 cache_creation_tokens, request_bytes, response_bytes, key_id, request_id, refusal)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                 cache_creation_tokens, request_bytes, response_bytes, key_id, request_id, refusal, tenant, subject)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             )?;
             for r in records {
                 stmt.execute(params![
@@ -204,6 +217,8 @@ impl Store {
                     r.key_id as i64,
                     r.request_id as i64,
                     r.refusal,
+                    r.tenant,
+                    r.subject,
                 ])?;
             }
         }
@@ -216,7 +231,7 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(
             "SELECT id, node, ts_unix_micros, duration_micros, status, dialect, stream, provider, route_host,
              requested_model, served_model, has_usage, input_tokens, output_tokens, cache_read_tokens,
-             cache_creation_tokens, request_bytes, response_bytes, key_id, request_id, refusal
+             cache_creation_tokens, request_bytes, response_bytes, key_id, request_id, refusal, tenant, subject
              FROM usage WHERE ts_unix_micros >= ?1 ORDER BY ts_unix_micros, id LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![since as i64, limit as i64], |r| {
@@ -242,6 +257,8 @@ impl Store {
                 key_id: r.get::<_, i64>(18)? as u64,
                 request_id: r.get::<_, i64>(19)? as u64,
                 refusal: r.get(20)?,
+                tenant: r.get(21)?,
+                subject: r.get(22)?,
             })
         })?;
         rows.collect()
@@ -250,7 +267,7 @@ impl Store {
     /// Per-key totals since `since` (unix µs): what an operator asks first.
     pub fn summary(&self, since: u64) -> rusqlite::Result<Vec<KeySummary>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT u.key_id, COALESCE(k.tenant, ''), COALESCE(k.name, ''),
+            "SELECT u.key_id, COALESCE(NULLIF(k.tenant, ''), MAX(u.tenant), ''), COALESCE(NULLIF(k.name, ''), MAX(u.subject), ''),
                     SUM(CASE WHEN u.refusal = '' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN u.refusal <> '' THEN 1 ELSE 0 END),
                     SUM(u.input_tokens), SUM(u.output_tokens), SUM(u.cache_read_tokens), SUM(u.cache_creation_tokens),
@@ -308,7 +325,28 @@ mod tests {
             key_id: 0,
             request_id: ts,
             refusal: String::new(),
+            tenant: String::new(),
+            subject: String::new(),
         }
+    }
+
+    #[test]
+    fn oauth_subjects_are_named_in_the_summary_from_their_rows() {
+        let mut store = Store::in_memory().unwrap();
+        let mut a = record(10, "tools/list", None);
+        a.key_id = 4242;
+        a.tenant = "team-oauth".into();
+        a.subject = "alice@example.com".into();
+        let mut b = record(20, "tools/call", None);
+        b.key_id = 4242;
+        b.tenant = "team-oauth".into();
+        b.subject = "alice@example.com".into();
+        store.insert_batch("pod", &[a, b]).unwrap();
+        let rows = store.export(0, 10).unwrap();
+        assert_eq!((rows[0].tenant.as_str(), rows[0].subject.as_str()), ("team-oauth", "alice@example.com"));
+        let s = store.summary(0).unwrap();
+        let alice = s.iter().find(|k| k.key_id == 4242).unwrap();
+        assert_eq!((alice.tenant.as_str(), alice.name.as_str(), alice.requests), ("team-oauth", "alice@example.com", 2));
     }
 
     #[test]

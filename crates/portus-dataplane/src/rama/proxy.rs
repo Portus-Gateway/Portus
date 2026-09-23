@@ -253,6 +253,7 @@ impl ProxyService {
         // route's mutations set the provider's own.
         let mut key_id = 0;
         let mut tenant: Option<Arc<str>> = None;
+        let mut who_name: Option<Arc<str>> = None;
         let field = |key: &str| body_fields.as_ref().and_then(|f| f.iter().find(|(k, _)| *k == key)).map(|(_, v)| v.as_str());
         let model = field("model");
         // The JSON-RPC id, as JSON text, for MCP refusals to echo.
@@ -286,12 +287,13 @@ impl ProxyService {
                 }
                 None => Err(Refusal::Unauthenticated),
             };
-            let known_id = identity.as_ref().map(|i| i.id).unwrap_or(0);
+            let known: Option<KeyInfo> = identity.as_ref().ok().cloned();
             let verdict = identity.and_then(|info| check_access(&info, access).map(|_| info));
             match verdict {
                 Ok(info) => {
                     key_id = info.id;
                     tenant = Some(Arc::clone(&info.tenant));
+                    who_name = Some(Arc::clone(&info.name));
                 }
                 Err(refusal) => {
                     let reply = refusal.reply(ai.dialect, subject, request_id);
@@ -299,8 +301,18 @@ impl ProxyService {
                     self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                     if let Some(ledger) = self.ledger.as_ref() {
                         // A model or tool refusal knows its subject; an authentication one does not.
-                        let key_id = known_id;
-                        let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation: None };
+                        let key_id = known.as_ref().map(|k| k.id).unwrap_or(0);
+                        let side = RequestSide {
+                            ai,
+                            host,
+                            body_fields: body_fields.as_ref(),
+                            request_bytes,
+                            start,
+                            key_id,
+                            tenant: known.as_ref().map(|k| k.tenant.as_ref()),
+                            subject: known.as_ref().map(|k| k.name.as_ref()),
+                            reservation: None,
+                        };
                         record_refusal(status, refusal.kind(), side, &ledger.ring);
                     }
                     if let Some((method, path)) = &logged {
@@ -355,7 +367,7 @@ impl ProxyService {
                 let status = reply.status;
                 self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                 if let Some(ledger) = self.ledger.as_ref() {
-                    let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation: None };
+                    let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: who_name.as_deref(), reservation: None };
                     record_refusal(status, RefusalKind::BudgetExhausted, side, &ledger.ring);
                 }
                 if let Some((method, path)) = &logged {
@@ -373,7 +385,7 @@ impl ProxyService {
             response.headers_mut().insert(n, HeaderValue::from(remaining.max(0)));
         }
         if let (Some(ai), Some(ledger)) = (plan.ai.as_ref(), self.ledger.as_ref()) {
-            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation };
+            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: who_name.as_deref(), reservation };
             let body = std::mem::replace(response.body_mut(), Body::empty());
             *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring));
         }

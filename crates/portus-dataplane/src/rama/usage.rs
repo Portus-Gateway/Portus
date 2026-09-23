@@ -25,6 +25,9 @@ pub struct RequestSide<'a> {
     pub start: Instant,
     /// The Portus API key that authenticated the request; 0 when none.
     pub key_id: u64,
+    /// The subject's tenant and name, when known.
+    pub tenant: Option<&'a str>,
+    pub subject: Option<&'a str>,
     /// The budget reservation to settle with the response's tokens.
     pub reservation: Option<Reservation>,
 }
@@ -64,6 +67,8 @@ fn base_record(status: u16, req: &RequestSide<'_>) -> UsageRecord {
         request_bytes: req.request_bytes,
         response_bytes: 0,
         key_id: req.key_id,
+        tenant: UsageRecord::name(req.tenant.unwrap_or("")),
+        subject: UsageRecord::name(req.subject.unwrap_or("")),
         request_id: rand::random(),
         refusal: None,
     }
@@ -153,7 +158,7 @@ mod tests {
     use rama::http::body::util::{BodyExt, Full};
 
     fn side<'a>(ai: &'a AiBackend, fields: &'a BodyFields) -> RequestSide<'a> {
-        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, reservation: None }
+        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, tenant: Some("team-a"), subject: Some("ci"), reservation: None }
     }
 
     #[tokio::test]
@@ -161,13 +166,14 @@ mod tests {
         let ring = Arc::new(UsageRing::new(8));
         let ai = AiBackend { dialect: Dialect::Mcp, provider: Arc::from("github-mcp"), key_required: false, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("method", "tools/call".into()), ("id", "3".into()), ("tool", "github.search".into())];
-        let side = RequestSide { ai: &ai, host: "mcp.example.com", body_fields: Some(&fields), request_bytes: 120, start: Instant::now(), key_id: 42, reservation: None };
+        let side = RequestSide { ai: &ai, host: "mcp.example.com", body_fields: Some(&fields), request_bytes: 120, start: Instant::now(), key_id: 42, tenant: Some("team-mcp"), subject: Some("agent"), reservation: None };
         let body = observe(Body::from(r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#), 200, side, Arc::clone(&ring));
         let _ = body.collect().await.unwrap();
         let mut out = Vec::new();
         assert_eq!(ring.drain_into(&mut out, 10), 1);
         let record = &out[0];
         assert_eq!((record.dialect, record.status, record.key_id), (Dialect::Mcp, 200, 42));
+        assert_eq!((record.tenant.as_str(), record.subject.as_str()), ("team-mcp", "agent"));
         assert_eq!((record.requested_model.as_str(), record.served_model.as_str()), ("tools/call", "github.search"));
         assert_eq!(record.tokens, None);
         assert!(record.response_bytes > 0);

@@ -312,6 +312,11 @@ pub struct UsageRecord {
     pub response_bytes: u64,
     /// The API key the request authenticated with; 0 until keys exist.
     pub key_id: u64,
+    /// The subject's tenant and name as the data plane knew them (a key's
+    /// tenant and name, or an OAuth token's claims), so the ledger can name
+    /// subjects it never issued a key for.
+    pub tenant: ArrayString<NAME_LEN>,
+    pub subject: ArrayString<NAME_LEN>,
     pub request_id: u64,
     /// Set when the gateway refused the request instead of forwarding it.
     pub refusal: Option<RefusalKind>,
@@ -501,7 +506,7 @@ mod tests {
 
     #[test]
     fn records_are_fixed_size_and_names_truncate_on_char_boundaries() {
-        assert!(std::mem::size_of::<UsageRecord>() <= 400, "{}", std::mem::size_of::<UsageRecord>());
+        assert!(std::mem::size_of::<UsageRecord>() <= 560, "{}", std::mem::size_of::<UsageRecord>());
         assert_eq!(UsageRecord::name("claude-opus-5").as_str(), "claude-opus-5");
         let long = format!("{}é", "a".repeat(63));
         assert_eq!(UsageRecord::name(&long).as_str(), "a".repeat(63));
@@ -519,6 +524,8 @@ mod tests {
             requested_model: UsageRecord::name("claude-opus-5"),
             served_model: ArrayString::new(),
             tokens: None,
+            tenant: ArrayString::new(),
+            subject: ArrayString::new(),
             request_bytes: 0,
             response_bytes: 0,
             key_id: 0,
