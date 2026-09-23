@@ -130,12 +130,12 @@ opens the server-to-client event stream, `DELETE` ends the session. The gateway:
 
 - routes on `method` and `tool`, so `tools/call` for one namespace can go to one server
   and everything else to another;
-- keeps a session on the endpoint that created it: requests carrying `Mcp-Session-Id`
-  pick the endpoint by rendezvous hashing over the provider's ready endpoints, the same
-  answer on every gateway pod, with nothing shared. A request without the header
-  (`initialize`) is load-balanced. When an endpoint goes away its sessions land on
-  another server, which answers 404 as the spec requires and the client re-initialises;
-  `proxy_mcp_session_rehomed_total{provider}` counts those;
+- keeps a session on the server pod that created it. The `Mcp-Session-Id` the client
+  receives is the gateway's tag for that endpoint (16 hex characters) followed by a dot
+  and the server's own id; on every later request the tag picks the endpoint and the
+  server sees only its id. Nothing is shared between gateway pods. When the endpoint is
+  gone the request goes to another server, which answers 404 as the spec requires and the
+  client re-initialises; `proxy_mcp_session_rehomed_total{provider}` counts those;
 - passes `Mcp-Session-Id`, `MCP-Protocol-Version`, `Last-Event-ID` and `Accept` through
   untouched, rewrites `Host` to the provider;
 - records one usage row per request with the method in the model column and the tool in

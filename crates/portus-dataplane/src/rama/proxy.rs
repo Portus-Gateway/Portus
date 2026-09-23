@@ -43,6 +43,8 @@ use portus_dataplane_core::ai::usage::RefusalKind;
 use portus_dataplane_core::ai::budget::{cost, exhausted_reply, now_micros, remaining_header, Scope, Verdict};
 use portus_dataplane_core::ai::keys::{authorize, Access, Refusal};
 use portus_dataplane_core::ai::usage::Dialect;
+use portus_dataplane_core::ai::mcp::{split_session, tag_session};
+use portus_dataplane_core::pool::endpoint_tag;
 use portus_dataplane_core::ai::ledger::LedgerReporter;
 use super::tls::{client_auth_for, upstream_tls_for};
 
@@ -465,17 +467,31 @@ impl ProxyService {
         let retrying = buffered.is_some();
         let mut retries_left = if retrying { plan.max_retries } else { 0 };
         let incoming = Incoming { method, version, uri };
-        // An MCP session stays on the endpoint that created it.
-        let session_key: Option<Vec<u8>> = plan
-            .ai
-            .as_ref()
-            .filter(|ai| ai.session_affinity)
-            .and_then(|_| headers.get("mcp-session-id"))
-            .map(|v| v.as_bytes().to_vec());
+        // An MCP session stays on the endpoint that created it: the session
+        // id a client holds is the endpoint's tag in front of the server's own
+        // id. The server sees only its id; the tag picks the endpoint.
+        let pin_sessions = plan.ai.as_ref().is_some_and(|ai| ai.session_affinity);
+        let mut session_tag: Option<String> = None;
+        let mut session_present = false;
+        if pin_sessions
+            && let Some(value) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string)
+        {
+            session_present = true;
+            let (tag, server_id) = split_session(&value);
+            session_tag = tag.map(str::to_string);
+            if tag.is_some()
+                && let Ok(v) = HeaderValue::from_str(server_id)
+            {
+                headers.insert("mcp-session-id", v);
+            }
+        }
 
         let mut response = loop {
-            let picked = match &session_key {
-                Some(key) => pool.select_by_key(key),
+            let picked = match session_tag.as_deref().and_then(|t| pool.endpoint_by_tag(t)) {
+                Some(pinned) => Some(pinned),
+                // No tag, or the pinned endpoint is gone: any endpoint; the
+                // server answers 404 for a session it does not know and the
+                // client re-initialises.
                 None => pool.select(),
             };
             let Some(backend) = picked else {
@@ -494,13 +510,23 @@ impl ProxyService {
             // else its backend-request (read) timeout, else the connect timeout.
             let deadline = plan.request_timeout.or(plan.read_timeout).or(plan.connect_timeout);
             match self.attempt(upstream, deadline).await {
-                Ok(resp) => {
+                Ok(mut resp) => {
                     let status = resp.status().as_u16();
-                    if status == 404
-                        && session_key.is_some()
-                        && let Some(ai) = plan.ai.as_ref()
-                    {
-                        self.metrics.mcp_session_rehomed_total.with_label_values(&[ai.provider.as_ref()]).inc();
+                    if pin_sessions {
+                        if status == 404
+                            && session_present
+                            && let Some(ai) = plan.ai.as_ref()
+                        {
+                            self.metrics.mcp_session_rehomed_total.with_label_values(&[ai.provider.as_ref()]).inc();
+                        }
+                        // A session the server created (or echoed) leaves
+                        // tagged with the endpoint that holds it.
+                        if let Some(id) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string)
+                            && split_session(&id).0.is_none()
+                            && let Ok(v) = HeaderValue::from_str(&tag_session(&endpoint_tag(&backend), &id))
+                        {
+                            resp.headers_mut().insert("mcp-session-id", v);
+                        }
                     }
                     if let Some(out) = self.outliers.responded(pool, &backend, status) {
                         self.note_ejection(plan, &backend, out, &format!("{status} responses in a row"));

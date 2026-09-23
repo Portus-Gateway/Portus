@@ -92,6 +92,17 @@ impl Endpoint {
     }
 }
 
+/// Length of an [`endpoint_tag`].
+pub const TAG_LEN: usize = 16;
+
+/// A short stable name for an endpoint address, the same on every pod, safe
+/// in a header value: the first 16 hex characters of its SHA-256.
+pub fn endpoint_tag(addr: &SocketAddr) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(addr.to_string().as_bytes());
+    digest[..TAG_LEN / 2].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Round-robin pool over the endpoints of one Service port.
 #[derive(Debug)]
 pub struct Pool {
@@ -138,6 +149,11 @@ impl Pool {
             .map(|i| &self.endpoints[(start + i) % n])
             .find(|ep| ep.ready())
             .map(|ep| ep.addr)
+    }
+
+    /// The ready endpoint whose [`endpoint_tag`] is `tag`, if any.
+    pub fn endpoint_by_tag(&self, tag: &str) -> Option<SocketAddr> {
+        self.endpoints.iter().find(|ep| ep.ready() && endpoint_tag(&ep.addr) == tag).map(|ep| ep.addr)
     }
 
     /// The ready endpoint `key` maps to, the same on every pod for the same
@@ -323,6 +339,20 @@ mod tests {
         // Different keys spread; the same key repeats.
         assert_eq!(a.select_by_key(b"x"), a.select_by_key(b"x"));
         assert!(pool(&[]).select_by_key(b"x").is_none());
+    }
+
+    #[test]
+    fn endpoint_tags_are_stable_hex_and_resolve_only_to_ready_endpoints() {
+        let p = pool(&["10.0.0.1:80", "10.0.0.2:80"]);
+        let tag = endpoint_tag(&addr("10.0.0.2:80"));
+        assert_eq!(tag.len(), TAG_LEN);
+        assert!(tag.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(tag, endpoint_tag(&addr("10.0.0.2:80")));
+        assert_ne!(tag, endpoint_tag(&addr("10.0.0.1:80")));
+        assert_eq!(p.endpoint_by_tag(&tag), Some(addr("10.0.0.2:80")));
+        p.set_enabled(&addr("10.0.0.2:80"), false);
+        assert_eq!(p.endpoint_by_tag(&tag), None, "a session cannot be pinned to an endpoint that is out");
+        assert_eq!(p.endpoint_by_tag("nope"), None);
     }
 
     #[test]
