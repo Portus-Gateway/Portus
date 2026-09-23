@@ -520,6 +520,8 @@ pub struct AIProviderState {
     pub host: String,
     pub port: u16,
     pub credential: Option<AICredentialState>,
+    /// MCP: pin sessions to the endpoint that created them.
+    pub session_affinity: bool,
     pub generation: i64,
 }
 
@@ -560,14 +562,30 @@ pub struct AIRouteState {
     pub parent_refs: Vec<ParentRefState>,
     pub rules: Vec<AIRouteRuleState>,
     pub require_api_key: bool,
+    /// `auth.jwt`, normalised (claims defaulted).
+    pub jwt: Option<AIJwtState>,
     pub generation: i64,
+}
+
+/// An AIRoute's OAuth acceptance as the compiler needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AIJwtState {
+    pub issuer: String,
+    pub audience: Option<String>,
+    pub tenant_claim: String,
+    pub tools_claim: String,
+    /// Space-separated.
+    pub scopes: String,
 }
 
 /// An `AIUsagePolicy`: a token budget on an AIRoute.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AIUsagePolicyState {
     pub target: PolicyTargetKey,
-    pub tokens: u64,
+    /// Units per window.
+    pub limit: u64,
+    /// TOKENS | CALLS
+    pub unit: String,
     /// HOURLY | DAILY | MONTHLY
     pub window: String,
     /// KEY | TENANT | ROUTE

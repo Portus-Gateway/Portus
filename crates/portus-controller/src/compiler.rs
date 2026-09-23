@@ -878,12 +878,30 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
                 (p.target.namespace.clone(), p.target.name.clone()),
                 portus_types::AiBudget {
                     policy: format!("{}/{}", e.key().namespace, e.key().name),
-                    tokens: p.tokens,
+                    limit: p.limit,
+                    unit: p.unit.clone(),
                     window: p.window.clone(),
                     per: p.per.clone(),
                     fail_open: p.fail_open,
                 },
             )
+        })
+        .collect();
+    let jwts: HashMap<(String, String), portus_types::AiJwt> = store
+        .ai_routes
+        .iter()
+        .filter_map(|e| {
+            let j = e.value().jwt.as_ref()?;
+            Some((
+                (e.key().namespace.clone(), e.key().name.clone()),
+                portus_types::AiJwt {
+                    issuer: j.issuer.clone(),
+                    audience: j.audience.clone().unwrap_or_default(),
+                    tenant_claim: j.tenant_claim.clone(),
+                    tools_claim: j.tools_claim.clone(),
+                    scopes: j.scopes.clone(),
+                },
+            ))
         })
         .collect();
     for (route, source) in routes.iter_mut().zip(route_sources.iter()) {
@@ -893,6 +911,9 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         let key = (source.namespace.clone(), source.name.clone());
         if key_required.contains(&key) {
             route.ai_key_required = true;
+        }
+        if let Some(j) = jwts.get(&key) {
+            route.ai_jwt = Some(j.clone());
         }
         if let Some(b) = budgets.get(&key) {
             route.ai_budget = Some(b.clone());
@@ -911,9 +932,11 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         if let Some(provider) = store.ai_providers.get(&NamespacedName { namespace: ns.to_string(), name: name.to_string() }) {
             route.ai_dialect = match provider.kind.as_str() {
                 "anthropic" => "anthropic".to_string(),
+                "mcp" => "mcp".to_string(),
                 _ => "openai".to_string(),
             };
             route.ai_provider = provider.name.clone();
+            route.ai_session_affinity = provider.session_affinity;
             if provider.tls {
                 route.upstream_tls = Some(UpstreamTlsConfig { enabled: true, verify_cert: true, sni: provider.host.clone() });
             }
@@ -2342,6 +2365,7 @@ mod tests {
                 header: "x-api-key".into(),
                 prefix: String::new(),
             }),
+            session_affinity: false,
             generation: 1,
         };
         store.endpoints.insert(
@@ -2368,6 +2392,7 @@ mod tests {
                     provider: NamespacedName { namespace: "default".into(), name: "anthropic".into() },
                 }],
                 require_api_key: true,
+                jwt: Some(crate::store::AIJwtState { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: "groups".into(), tools_claim: "scope".into(), scopes: "openid profile email groups".into() }),
                 generation: 1,
             },
         );
@@ -2376,7 +2401,8 @@ mod tests {
             NamespacedName { namespace: "default".into(), name: "cap".into() },
             crate::store::AIUsagePolicyState {
                 target: crate::store::PolicyTargetKey { group: "portus-gateway.dev".into(), kind: "AIRoute".into(), namespace: "default".into(), name: "claude".into(), section_name: None },
-                tokens: 1_000_000,
+                limit: 1_000_000,
+                unit: "TOKENS".into(),
                 window: "DAILY".into(),
                 per: "KEY".into(),
                 fail_open: false,
@@ -2427,10 +2453,11 @@ mod tests {
         assert_eq!(config.routes.len(), 1);
         let route = &config.routes[0];
         assert!(route.ai_key_required);
+        assert_eq!(route.ai_jwt.as_ref().map(|j| (j.issuer.as_str(), j.audience.as_str(), j.tenant_claim.as_str(), j.tools_claim.as_str())), Some(("https://dex.example.com", "", "groups", "scope")));
         assert_eq!(route.request_timeout_ms, 600_000, "TimeoutPolicy targeting the AIRoute applies");
         assert_eq!(route.rate_limit.as_ref().map(|r| (r.requests_per_second, r.per_client)), Some((5, true)), "RateLimitPolicy targeting the AIRoute applies, the HTTPRoute one does not");
         let budget = route.ai_budget.as_ref().expect("budget attached");
-        assert_eq!((budget.policy.as_str(), budget.tokens, budget.window.as_str(), budget.per.as_str(), budget.fail_open), ("default/cap", 1_000_000, "DAILY", "KEY", false));
+        assert_eq!((budget.policy.as_str(), budget.limit, budget.unit.as_str(), budget.window.as_str(), budget.per.as_str(), budget.fail_open), ("default/cap", 1_000_000, "TOKENS", "DAILY", "KEY", false));
         assert_eq!(route.host, "llm.example.com");
         assert_eq!(route.service_name, "aiprovider/default/anthropic");
         assert_eq!(route.port, 443);

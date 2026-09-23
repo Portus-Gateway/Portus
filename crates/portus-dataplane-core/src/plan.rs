@@ -20,6 +20,7 @@ use crate::circuit_breaker::{CircuitBreaker, ConnectionLimiter};
 use crate::metrics::ProxyMetrics;
 use crate::pool::Pool;
 use crate::rate_limiter::RateLimiterMode;
+use crate::ai::scan::{FieldScanner, Scalar};
 use crate::router::{
     cors_allow_origin_value, cors_headers_value, cors_methods_value, cors_origin_matches,
     detect_misdirected_request, extract_client_ip, header_str, listener_scheme_and_port,
@@ -62,8 +63,44 @@ pub struct BodyNeed {
     pub max_bytes: usize,
 }
 
-/// Top-level JSON keys an AI route can match on.
-pub const AI_BODY_KEYS: &[&str] = &["model", "stream", "max_tokens"];
+/// Where a host with OAuth-protected AI routes publishes its metadata.
+pub const OAUTH_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+
+/// Top-level JSON keys an AI route can match on: the LLM ones (`model`,
+/// `stream`, `max_tokens`) and the MCP ones (`method`, `id`, `params`, the
+/// last captured so `params.name` becomes the `tool` field).
+pub const AI_BODY_KEYS: &[&str] = &["model", "stream", "max_tokens", "method", "id", "params"];
+
+/// The scanner a network stack runs over a request body for [`BodyNeed`].
+pub fn body_scanner(need: &BodyNeed) -> FieldScanner {
+    FieldScanner::new(need.keys).capturing_compounds().capture_limit(crate::ai::mcp::PARAMS_CAPTURE_LIMIT)
+}
+
+/// Turn what the scanner found into the request's body fields: scalars as
+/// text, `id` as JSON text so a refusal can echo it verbatim, and `tool`
+/// derived from a captured `params` object. Compound values are otherwise
+/// not fields.
+pub fn body_fields_from(scanner: &FieldScanner, need: &BodyNeed) -> BodyFields {
+    let mut fields: BodyFields = Vec::with_capacity(need.keys.len());
+    for &key in need.keys {
+        let value = match (key, scanner.get(key)) {
+            ("id", Some(Scalar::Str(s))) => serde_json::to_string(s).unwrap_or_default(),
+            ("params", Some(Scalar::Raw(raw))) => {
+                if let Some(tool) = crate::ai::mcp::tool_name(raw) {
+                    fields.push(("tool", tool));
+                }
+                continue;
+            }
+            (_, Some(Scalar::Str(s))) => s.clone(),
+            (_, Some(Scalar::Bool(b))) => b.to_string(),
+            (_, Some(Scalar::Num(n))) => n.clone(),
+            (_, Some(Scalar::Null)) => "null".to_string(),
+            (_, Some(Scalar::Compound | Scalar::Raw(_)) | None) => continue,
+        };
+        fields.push((key, value));
+    }
+    fields
+}
 /// Bytes of a request body held while scanning for [`AI_BODY_KEYS`]; larger
 /// bodies are refused with 413. Anthropic and OpenAI SDKs put `model` after
 /// `messages`, so a 200k-token prompt puts it ~800 KB in.
@@ -298,6 +335,19 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
             .or_else(|| lookup_domain_wildcard_bucket(host, &b.domain_wildcards))
             .or(b.catch_all.as_ref())
     });
+    // OAuth protected-resource metadata (RFC 9728): how an MCP client finds
+    // the authorization server for a host whose routes accept its tokens.
+    // `/.well-known/oauth-protected-resource` describes the host,
+    // `/.well-known/oauth-protected-resource/mcp` the resource at `/mcp`,
+    // which is what the 401 challenge points a client at.
+    if let Some(suffix) = facts.path.strip_prefix(OAUTH_METADATA_PATH)
+        && (suffix.is_empty() || suffix.starts_with('/'))
+        && let Some(oauth) = host_routes.and_then(|hr| hr.oauth.as_ref())
+    {
+        let resource = format!("{original_scheme}://{host}{}", suffix.trim_end_matches('/'));
+        let body = crate::ai::jwt::metadata_document(&resource, &oauth.issuer, &oauth.scopes);
+        return Plan::Respond(Reply::json(200, body));
+    }
     if facts.body_fields.is_none()
         && host_routes.is_some_and(|hr| hr.needs_body)
         && has_request_body(facts.headers)
@@ -707,7 +757,7 @@ mod tests {
         );
         let mut exact_map = HashMap::new();
         exact_map.insert(Arc::from("/v1/messages"), routes);
-        let host_routes = HostRoutes { exact_map, rules: Vec::new(), catch_all: None, needs_body };
+        let host_routes = HostRoutes { exact_map, rules: Vec::new(), catch_all: None, needs_body, oauth: None };
         let bucket = ListenerBucket {
             listener_hostname: Arc::from(""),
             exact: HashMap::from([("llm.example.com".to_string(), host_routes)]),
@@ -737,6 +787,97 @@ mod tests {
             peer_ip: None,
             body_fields,
         }
+    }
+
+    fn fields_of(body: &str) -> BodyFields {
+        let need = BodyNeed { keys: AI_BODY_KEYS, max_bytes: AI_BODY_SCAN_LIMIT };
+        let mut scanner = body_scanner(&need);
+        scanner.feed(body.as_bytes());
+        body_fields_from(&scanner, &need)
+    }
+
+    #[test]
+    fn llm_bodies_yield_the_same_fields_as_before_mcp_joined() {
+        assert_eq!(
+            fields_of(r#"{"max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"model":"claude-opus-5","stream":true}"#),
+            vec![("model", "claude-opus-5".to_string()), ("stream", "true".to_string()), ("max_tokens", "1024".to_string())]
+        );
+        assert!(fields_of("not json").is_empty());
+    }
+
+    #[test]
+    fn mcp_bodies_yield_method_id_and_the_tool_from_params() {
+        assert_eq!(
+            fields_of(r#"{"jsonrpc":"2.0","id":"req-9","method":"tools/call","params":{"name":"github.search","arguments":{"q":"name"}}}"#),
+            vec![("method", "tools/call".to_string()), ("id", "\"req-9\"".to_string()), ("tool", "github.search".to_string())]
+        );
+        assert_eq!(
+            fields_of(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#),
+            vec![("method", "tools/list".to_string()), ("id", "7".to_string())]
+        );
+        // A notification has no id; params without a name give no tool.
+        assert_eq!(
+            fields_of(r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#),
+            vec![("method", "notifications/initialized".to_string())]
+        );
+        // Arguments past the capture limit still leave method routable.
+        let huge = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"big","arguments":{{"blob":"{}"}}}}}}"#, "z".repeat(crate::ai::mcp::PARAMS_CAPTURE_LIMIT + 10));
+        assert_eq!(fields_of(&huge), vec![("method", "tools/call".to_string()), ("id", "1".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_host_with_a_jwt_route_publishes_its_oauth_metadata() {
+        let mut route = messages_route("mcp", None);
+        route.ai = Some(crate::router::AiBackend {
+            dialect: crate::ai::usage::Dialect::Mcp,
+            provider: Arc::from("tools"),
+            key_required: true,
+            budget: None,
+            session_affinity: true,
+            jwt: Some(crate::ai::jwt::JwtPolicy { issuer: Arc::from("https://dex.example.com"), audience: None, tenant_claim: Arc::from("groups"), tools_claim: Arc::from("scope"), scopes: Arc::from("openid profile email groups") }),
+        });
+        let mut snap = snapshot_with(vec![route]);
+        // The test builder does not compute the issuer; the receiver does.
+        let bucket = snap.listeners_by_port.get_mut(&80).unwrap();
+        let hr = bucket[0].exact.get_mut("llm.example.com").unwrap();
+        hr.oauth = crate::router::oauth_of(hr.exact_map.values().flatten());
+        assert_eq!(hr.oauth.as_ref().map(|o| o.issuer.as_ref()), Some("https://dex.example.com"));
+        let headers = HeaderMap::new();
+        let mut facts = facts(&headers, None);
+        facts.path = OAUTH_METADATA_PATH;
+        facts.path_and_query = OAUTH_METADATA_PATH;
+        facts.method = "GET";
+        match plan_request(&snap, facts, metrics()).await {
+            Plan::Respond(r) => {
+                assert_eq!(r.status, 200);
+                assert_eq!(std::str::from_utf8(&r.body).unwrap(), r#"{"resource":"http://llm.example.com","authorization_servers":["https://dex.example.com"],"bearer_methods_supported":["header"],"scopes_supported":["openid","profile","email","groups"],"resource_name":"Portus"}"#);
+            }
+            Plan::Forward(_) => panic!("expected the metadata document, got a forward"),
+            Plan::NeedsBody(_) => panic!("expected the metadata document, got a body request"),
+        }
+        // The path-suffixed form names the resource the challenge was for.
+        let mut facts = facts_for(&headers);
+        facts.path = "/.well-known/oauth-protected-resource/mcp/";
+        facts.path_and_query = facts.path;
+        match plan_request(&snap, facts, metrics()).await {
+            Plan::Respond(r) => assert!(std::str::from_utf8(&r.body).unwrap().starts_with(r#"{"resource":"http://llm.example.com/mcp","#)),
+            _ => panic!("expected the metadata document for /mcp"),
+        }
+        // A look-alike path is not metadata.
+        let mut facts = facts_for(&headers);
+        facts.path = "/.well-known/oauth-protected-resourceX";
+        facts.path_and_query = facts.path;
+        assert!(!matches!(plan_request(&snap, facts, metrics()).await, Plan::Respond(Reply { status: 200, .. })));
+        // A host without JWT routes answers the usual way (here: no route).
+        let plain = snapshot_with(vec![messages_route("x", None)]);
+        let mut facts = facts_for(&headers);
+        facts.path = OAUTH_METADATA_PATH;
+        facts.path_and_query = OAUTH_METADATA_PATH;
+        assert!(!matches!(plan_request(&plain, facts, metrics()).await, Plan::Respond(Reply { status: 200, .. })));
+    }
+
+    fn facts_for(headers: &HeaderMap) -> RequestFacts<'_, HeaderMap> {
+        facts(headers, None)
     }
 
     #[tokio::test]

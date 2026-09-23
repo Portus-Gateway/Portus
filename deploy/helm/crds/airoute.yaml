@@ -52,7 +52,30 @@ spec:
                     type: string
                 requireApiKey:
                   type: boolean
-                  description: "Requests must present a Portus API key (x-api-key or Authorization: Bearer) issued by the ledger"
+                  description: "Requests must present a Portus API key (x-api-key or Authorization: Bearer) issued by the ledger, or a token accepted by auth"
+                auth:
+                  type: object
+                  properties:
+                    jwt:
+                      type: object
+                      required: [issuer]
+                      description: "OAuth bearer tokens from one issuer are accepted in place of a Portus key; verified on the data plane against the issuer's JWKS (ledger: aiGateway.jwt.issuers)"
+                      properties:
+                        issuer:
+                          type: string
+                        audience:
+                          type: string
+                        tenantClaim:
+                          type: string
+                          description: "Claim naming the tenant; default groups"
+                        toolsClaim:
+                          type: string
+                          description: "Claim listing the MCP tools the subject may call; default scope"
+                        scopes:
+                          type: array
+                          items:
+                            type: string
+                          description: "Scopes MCP clients are told to request (metadata scopes_supported and the 401 challenge); default [openid, profile, email, groups]"
                 rules:
                   type: array
                   items:
@@ -85,6 +108,26 @@ spec:
                             stream:
                               type: boolean
                               description: "Matches the request body's top-level stream flag"
+                            method:
+                              type: object
+                              required: [value]
+                              description: "MCP: matches the JSON-RPC method (tools/call, tools/list, ...)"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
+                            tool:
+                              type: object
+                              required: [value]
+                              description: "MCP: matches params.name of a tools/call"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
                             headers:
                               type: array
                               items:

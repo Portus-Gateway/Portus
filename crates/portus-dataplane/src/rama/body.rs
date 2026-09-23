@@ -14,7 +14,7 @@ use rama::http::body::util::BodyExt;
 use rama::http::body::{Frame, SizeHint};
 use rama::http::{Body, StatusCode, StreamingBody};
 
-use portus_dataplane_core::ai::scan::{FieldScanner, Progress, Scalar};
+use portus_dataplane_core::ai::scan::Progress;
 use portus_dataplane_core::plan::BodyNeed;
 use portus_dataplane_core::router::BodyFields;
 
@@ -22,7 +22,7 @@ use portus_dataplane_core::router::BodyFields;
 /// malformed), holding at most `need.max_bytes`. Returns the fields and a
 /// body that yields everything read so far followed by the remainder.
 pub async fn scan_body(mut body: Body, need: BodyNeed) -> Result<(BodyFields, Body), StatusCode> {
-    let mut scanner = FieldScanner::new(need.keys);
+    let mut scanner = portus_dataplane_core::plan::body_scanner(&need);
     let mut held: VecDeque<Bytes> = VecDeque::new();
     let mut held_len = 0usize;
     let mut trailers = None;
@@ -53,17 +53,7 @@ pub async fn scan_body(mut body: Body, need: BodyNeed) -> Result<(BodyFields, Bo
             }
         }
     }
-    let mut fields: BodyFields = Vec::with_capacity(need.keys.len());
-    for key in need.keys {
-        let value = match scanner.get(key) {
-            Some(Scalar::Str(s)) => s.clone(),
-            Some(Scalar::Bool(b)) => b.to_string(),
-            Some(Scalar::Num(n)) => n.clone(),
-            Some(Scalar::Null) => "null".to_string(),
-            Some(Scalar::Compound | Scalar::Raw(_)) | None => continue,
-        };
-        fields.push((key, value));
-    }
+    let fields = portus_dataplane_core::plan::body_fields_from(&scanner, &need);
     let rest = if ended { None } else { Some(body) };
     let replay = Prefixed { held, held_len: held_len as u64, trailers, rest };
     Ok((fields, Body::new(replay)))
@@ -134,6 +124,14 @@ mod tests {
         assert_eq!(fields, vec![("model", "claude-opus-5".to_string()), ("stream", "true".to_string()), ("max_tokens", "1024".to_string())]);
         let replayed = body.collect().await.unwrap().to_bytes();
         assert_eq!(replayed, Bytes::from(parts.concat()));
+    }
+
+    #[tokio::test]
+    async fn an_mcp_tools_call_yields_method_and_tool_and_replays_unchanged() {
+        let parts = [r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","#, r#""params":{"name":"github.search","arguments":{"q":"{\"name\":\"decoy\"}"}}}"#];
+        let (fields, body) = scan_body(chunked(&parts), need()).await.unwrap();
+        assert_eq!(fields, vec![("method", "tools/call".to_string()), ("id", "3".to_string()), ("tool", "github.search".to_string())]);
+        assert_eq!(body.collect().await.unwrap().to_bytes(), Bytes::from(parts.concat()));
     }
 
     #[tokio::test]

@@ -21,6 +21,8 @@ use super::scan::{FieldScanner, Progress, Scalar};
 pub enum Dialect {
     Anthropic,
     OpenAi,
+    /// Model Context Protocol over Streamable HTTP (JSON-RPC); no tokens.
+    Mcp,
 }
 
 impl Dialect {
@@ -29,6 +31,7 @@ impl Dialect {
         match kind {
             "anthropic" => Some(Self::Anthropic),
             "openai" | "openai-compatible" => Some(Self::OpenAi),
+            "mcp" => Some(Self::Mcp),
             _ => None,
         }
     }
@@ -37,6 +40,7 @@ impl Dialect {
         match self {
             Self::Anthropic => "anthropic",
             Self::OpenAi => "openai",
+            Self::Mcp => "mcp",
         }
     }
 }
@@ -196,6 +200,8 @@ impl UsageTracker {
                     }
                 }
             }
+            // MCP responses carry no usage; the record counts the call.
+            Dialect::Mcp => {}
         }
     }
 }
@@ -204,6 +210,7 @@ fn parse_usage(dialect: Dialect, raw: &[u8]) -> Option<Tokens> {
     match dialect {
         Dialect::Anthropic => serde_json::from_slice::<AnthropicUsage>(raw).ok().map(Into::into),
         Dialect::OpenAi => serde_json::from_slice::<OpenAiUsage>(raw).ok().map(Into::into),
+        Dialect::Mcp => None,
     }
 }
 
@@ -305,6 +312,11 @@ pub struct UsageRecord {
     pub response_bytes: u64,
     /// The API key the request authenticated with; 0 until keys exist.
     pub key_id: u64,
+    /// The subject's tenant and name as the data plane knew them (a key's
+    /// tenant and name, or an OAuth token's claims), so the ledger can name
+    /// subjects it never issued a key for.
+    pub tenant: ArrayString<NAME_LEN>,
+    pub subject: ArrayString<NAME_LEN>,
     pub request_id: u64,
     /// Set when the gateway refused the request instead of forwarding it.
     pub refusal: Option<RefusalKind>,
@@ -315,6 +327,8 @@ pub struct UsageRecord {
 pub enum RefusalKind {
     Unauthenticated,
     ModelNotAllowed,
+    /// MCP: a known key that may not call this tool.
+    ToolNotAllowed,
     BudgetExhausted,
 }
 
@@ -323,6 +337,7 @@ impl RefusalKind {
         match self {
             Self::Unauthenticated => "unauthenticated",
             Self::ModelNotAllowed => "model_not_allowed",
+            Self::ToolNotAllowed => "tool_not_allowed",
             Self::BudgetExhausted => "budget_exhausted",
         }
     }
@@ -391,6 +406,18 @@ impl UsageRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_is_a_dialect_without_tokens_for_json_and_sse_responses() {
+        assert_eq!(Dialect::parse("mcp"), Some(Dialect::Mcp));
+        assert_eq!(Dialect::Mcp.as_str(), "mcp");
+        let mut t = UsageTracker::new(Dialect::Mcp, false);
+        t.feed(br#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":5}}}"#);
+        assert_eq!(t.finish(), Usage { tokens: None, model: None });
+        let mut t = UsageTracker::new(Dialect::Mcp, true);
+        t.feed(b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n");
+        assert_eq!(t.finish(), Usage { tokens: None, model: None });
+    }
 
     fn feed_chunked(tracker: &mut UsageTracker, body: &str, size: usize) {
         for c in body.as_bytes().chunks(size) {
@@ -479,7 +506,7 @@ mod tests {
 
     #[test]
     fn records_are_fixed_size_and_names_truncate_on_char_boundaries() {
-        assert!(std::mem::size_of::<UsageRecord>() <= 400, "{}", std::mem::size_of::<UsageRecord>());
+        assert!(std::mem::size_of::<UsageRecord>() <= 560, "{}", std::mem::size_of::<UsageRecord>());
         assert_eq!(UsageRecord::name("claude-opus-5").as_str(), "claude-opus-5");
         let long = format!("{}é", "a".repeat(63));
         assert_eq!(UsageRecord::name(&long).as_str(), "a".repeat(63));
@@ -497,6 +524,8 @@ mod tests {
             requested_model: UsageRecord::name("claude-opus-5"),
             served_model: ArrayString::new(),
             tokens: None,
+            tenant: ArrayString::new(),
+            subject: ArrayString::new(),
             request_bytes: 0,
             response_bytes: 0,
             key_id: 0,

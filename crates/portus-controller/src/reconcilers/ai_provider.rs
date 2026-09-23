@@ -15,15 +15,15 @@ use kube::runtime::controller::Action;
 use serde_json::json;
 
 use super::{ReconcileContext, ReconcileError};
-use crate::ai_types::AIProvider;
+use crate::ai_types::{AIProvider, AIProviderSpec};
 use crate::status;
-use crate::store::{AICredentialState, AIProviderState, ConfigStore, NamespacedName};
+use crate::store::{AICredentialState, AIProviderState, ConfigStore, NamespacedName, ServiceKey};
 use portus_types::BackendEndpoint;
 
 /// How often provider hostnames are re-resolved.
 pub const RESOLVE_INTERVAL: Duration = Duration::from_secs(30);
 
-const KINDS: &[&str] = &["anthropic", "openai", "openai-compatible"];
+const KINDS: &[&str] = &["anthropic", "openai", "openai-compatible", "mcp"];
 
 /// Parse `spec.url` into (tls, host, port). Only scheme and authority are
 /// allowed: a path prefix would have to be prepended to every request.
@@ -67,6 +67,17 @@ pub fn parse_provider_url(url: &str) -> Result<(bool, String, u16), String> {
     Ok((tls, host, port))
 }
 
+/// `spec.sessionAffinity`: `header` pins `Mcp-Session-Id` sessions to an
+/// endpoint, `none` load-balances every request. Defaults to `header` for
+/// MCP providers and `none` for LLM ones (those are stateless).
+fn session_affinity(spec: &AIProviderSpec) -> bool {
+    match spec.session_affinity.as_deref() {
+        Some("header") => true,
+        Some(_) => false,
+        None => spec.kind == "mcp",
+    }
+}
+
 /// Header and prefix a provider kind authenticates with unless overridden.
 fn default_credential_header(kind: &str) -> (&'static str, &'static str) {
     match kind {
@@ -89,6 +100,11 @@ pub fn reconcile_inner(provider: &AIProvider, store: &ConfigStore) -> Result<Vec
     let mut problems = Vec::new();
     if !KINDS.contains(&spec.kind.as_str()) {
         problems.push(format!("kind must be one of {}", KINDS.join(", ")));
+    }
+    if let Some(a) = spec.session_affinity.as_deref()
+        && !matches!(a, "header" | "none")
+    {
+        problems.push(format!("sessionAffinity must be header or none, not {a:?}"));
     }
     let parsed = parse_provider_url(&spec.url);
     if let Err(e) = &parsed {
@@ -120,6 +136,7 @@ pub fn reconcile_inner(provider: &AIProvider, store: &ConfigStore) -> Result<Vec
             host,
             port,
             credential,
+            session_affinity: session_affinity(spec),
             generation,
         };
         store.insert_and_notify(&store.ai_providers, key, state);
@@ -196,10 +213,65 @@ pub async fn reconcile_ai_provider(provider: Arc<AIProvider>, ctx: Arc<Reconcile
     Ok(if accepted { Action::await_change() } else { Action::requeue(std::time::Duration::from_secs(10)) })
 }
 
+/// A host that names a Kubernetes Service in this cluster: `name`,
+/// `name.namespace`, `name.namespace.svc` or `name.namespace.svc.cluster.local`
+/// (a bare name is a Service in the provider's own namespace). Returns
+/// (namespace, name).
+pub fn cluster_local_service(host: &str, own_namespace: &str) -> Option<(String, String)> {
+    let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
+    match labels.as_slice() {
+        [name] if !name.is_empty() => Some((own_namespace.to_string(), name.to_string())),
+        [name, ns, "svc"] | [name, ns, "svc", "cluster", "local"] => Some((ns.to_string(), name.to_string())),
+        _ => None,
+    }
+}
+
+/// For a provider whose host is a Service in this cluster, the Service's
+/// ready pod endpoints (via the EndpointSlice watcher and the port map) become
+/// the provider's endpoints, so the pool sees pods, not the ClusterIP: session
+/// affinity, outlier ejection and health checks then work per pod. Returns
+/// whether the provider is cluster-local (whatever happened to its endpoints).
+pub fn sync_cluster_local(store: &ConfigStore, provider: &AIProviderState) -> bool {
+    let Some((ns, name)) = cluster_local_service(&provider.host, &provider.namespace) else { return false };
+    let service_port = ServiceKey { namespace: ns.clone(), name: name.clone(), port: provider.port };
+    let target_port = store.service_port_map.get(&service_port).map(|p| *p).unwrap_or(provider.port);
+    let endpoints = store
+        .endpoints
+        .get(&ServiceKey { namespace: ns.clone(), name: name.clone(), port: target_port })
+        .map(|e| e.value().clone())
+        .unwrap_or_default();
+    if endpoints.is_empty() {
+        // Keep the last good set: a Service between rollouts must not empty the pool.
+        log::warn!("AIProvider {}/{}: Service {ns}/{name} port {} has no ready endpoints", provider.namespace, provider.name, provider.port);
+        return true;
+    }
+    if store.insert_and_notify(&store.endpoints, provider.service_key(), endpoints) {
+        log::info!("AIProvider {}/{}: endpoints follow Service {ns}/{name}", provider.namespace, provider.name);
+    }
+    true
+}
+
+/// An EndpointSlice or Service changed: providers fronting that Service
+/// follow it at once instead of at the next resolve tick.
+pub fn refresh_for_service(store: &ConfigStore, namespace: &str, service: &str) {
+    let providers: Vec<AIProviderState> = store
+        .ai_providers
+        .iter()
+        .filter(|e| cluster_local_service(&e.value().host, &e.value().namespace).is_some_and(|(ns, n)| ns == namespace && n == service))
+        .map(|e| e.value().clone())
+        .collect();
+    for provider in providers {
+        sync_cluster_local(store, &provider);
+    }
+}
+
 /// Resolve every provider host once and record the addresses that changed.
 pub async fn resolve_all(store: &ConfigStore) {
     let providers: Vec<AIProviderState> = store.ai_providers.iter().map(|e| e.value().clone()).collect();
     for provider in providers {
+        if sync_cluster_local(store, &provider) {
+            continue;
+        }
         let key = provider.service_key();
         match tokio::net::lookup_host((provider.host.as_str(), provider.port)).await {
             Ok(addrs) => {
@@ -249,7 +321,7 @@ mod tests {
                 generation: Some(1),
                 ..Default::default()
             },
-            spec: AIProviderSpec { kind: kind.into(), url: url.into(), credential },
+            spec: AIProviderSpec { kind: kind.into(), url: url.into(), credential, session_affinity: None },
             status: None,
         }
     }
@@ -299,6 +371,72 @@ mod tests {
         reconcile_inner(&openai, &store).unwrap();
         let cred = store.ai_providers.get(&NamespacedName { namespace: "llm".into(), name: "anthropic".into() }).unwrap().credential.clone().unwrap();
         assert_eq!((cred.header.as_str(), cred.prefix.as_str()), ("authorization", "Bearer "));
+
+        // An MCP server is a provider too: bearer credential, plain HTTP allowed.
+        let mcp = provider(
+            "mcp",
+            "http://github-mcp.tools:8080",
+            Some(AICredentialSpec { secret_ref: AISecretKeyRef { name: "anthropic-key".into(), key: None }, header: None, prefix: None }),
+        );
+        let conditions = reconcile_inner(&mcp, &store).unwrap();
+        assert_eq!(conditions[0].status, "True", "{}", conditions[0].message);
+        let state = store.ai_providers.get(&NamespacedName { namespace: "llm".into(), name: "anthropic".into() }).unwrap().clone();
+        assert_eq!((state.kind.as_str(), state.tls, state.host.as_str(), state.port), ("mcp", false, "github-mcp.tools", 8080));
+        assert_eq!(state.credential.unwrap().header, "authorization");
+        assert!(state.session_affinity, "MCP providers pin sessions by default");
+        let llm = store.ai_providers.get(&NamespacedName { namespace: "llm".into(), name: "anthropic".into() });
+        drop(llm);
+        let mut off = provider("mcp", "http://github-mcp.tools:8080", None);
+        off.spec.session_affinity = Some("none".into());
+        reconcile_inner(&off, &store).unwrap();
+        assert!(!store.ai_providers.get(&NamespacedName { namespace: "llm".into(), name: "anthropic".into() }).unwrap().session_affinity);
+        let mut bad = provider("mcp", "http://github-mcp.tools:8080", None);
+        bad.spec.session_affinity = Some("cookie".into());
+        let conditions = reconcile_inner(&bad, &store).unwrap();
+        assert_eq!(conditions[0].status, "False");
+        assert!(conditions[0].message.contains("sessionAffinity"), "{}", conditions[0].message);
+    }
+
+    #[test]
+    fn cluster_local_hosts_are_recognised_in_their_four_forms_only() {
+        assert_eq!(cluster_local_service("everything.bench.svc.cluster.local", "x"), Some(("bench".into(), "everything".into())));
+        assert_eq!(cluster_local_service("everything.bench.svc", "x"), Some(("bench".into(), "everything".into())));
+        assert_eq!(cluster_local_service("everything.bench.svc.cluster.local.", "x"), Some(("bench".into(), "everything".into())));
+        assert_eq!(cluster_local_service("everything", "bench"), Some(("bench".into(), "everything".into())));
+        assert_eq!(cluster_local_service("api.anthropic.com", "x"), None);
+        assert_eq!(cluster_local_service("mcp.internal", "x"), None, "two labels could be a real domain");
+        assert_eq!(cluster_local_service("a.b.c.d", "x"), None);
+    }
+
+    #[test]
+    fn a_provider_fronting_a_service_takes_the_services_pod_endpoints() {
+        let store = ConfigStore::new();
+        // Service everything: port 3001 -> targetPort 8080, two ready pods.
+        store.service_port_map.insert(ServiceKey { namespace: "bench".into(), name: "everything".into(), port: 3001 }, 8080);
+        store.endpoints.insert(
+            ServiceKey { namespace: "bench".into(), name: "everything".into(), port: 8080 },
+            vec![BackendEndpoint { address: "10.42.0.5".into(), port: 8080 }, BackendEndpoint { address: "10.42.0.9".into(), port: 8080 }],
+        );
+        let mut p = provider("mcp", "http://everything.bench.svc.cluster.local:3001", None);
+        p.metadata.namespace = Some("bench".into());
+        reconcile_inner(&p, &store).unwrap();
+        let state = store.ai_providers.get(&NamespacedName { namespace: "bench".into(), name: "anthropic".into() }).unwrap().clone();
+        assert!(sync_cluster_local(&store, &state));
+        let eps = store.endpoints.get(&state.service_key()).unwrap().clone();
+        assert_eq!(eps.iter().map(|e| (e.address.as_str(), e.port)).collect::<Vec<_>>(), vec![("10.42.0.5", 8080), ("10.42.0.9", 8080)]);
+
+        // A pod goes away: the EndpointSlice path refreshes the provider at once.
+        store.endpoints.insert(ServiceKey { namespace: "bench".into(), name: "everything".into(), port: 8080 }, vec![BackendEndpoint { address: "10.42.0.9".into(), port: 8080 }]);
+        refresh_for_service(&store, "bench", "everything");
+        assert_eq!(store.endpoints.get(&state.service_key()).unwrap().len(), 1);
+        // No ready pods: the last good set stays.
+        store.endpoints.remove(&ServiceKey { namespace: "bench".into(), name: "everything".into(), port: 8080 });
+        refresh_for_service(&store, "bench", "everything");
+        assert_eq!(store.endpoints.get(&state.service_key()).unwrap().len(), 1);
+        // An internet host is not cluster-local.
+        let ext = store.ai_providers.get(&NamespacedName { namespace: "bench".into(), name: "anthropic".into() }).unwrap().clone();
+        let ext = AIProviderState { host: "api.anthropic.com".into(), ..ext };
+        assert!(!sync_cluster_local(&store, &ext));
     }
 
     #[test]

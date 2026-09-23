@@ -1,0 +1,8 @@
+# The MCP reference "everything" server over Streamable HTTP, for the MCP
+# gateway end-to-end tests. The Docker Hub image (mcp/everything) predates the
+# Streamable HTTP transport, so the npm package is installed instead.
+FROM node:22-alpine
+RUN npm install -g @modelcontextprotocol/server-everything@latest
+ENV PORT=3001
+EXPOSE 3001
+CMD ["mcp-server-everything", "streamableHttp"]

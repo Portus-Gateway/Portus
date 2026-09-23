@@ -19,6 +19,9 @@ spec:
         - name: Tokens
           type: integer
           jsonPath: .spec.budget.tokens
+        - name: Calls
+          type: integer
+          jsonPath: .spec.budget.calls
         - name: Window
           type: string
           jsonPath: .spec.budget.window
@@ -51,12 +54,16 @@ spec:
                       type: string
                 budget:
                   type: object
-                  required: [tokens, window]
+                  required: [window]
                   properties:
                     tokens:
                       type: integer
                       minimum: 1
-                      description: "Tokens per window: input + output + cache read + cache creation"
+                      description: "Tokens per window: input + output + cache read + cache creation (LLM routes); exactly one of tokens and calls"
+                    calls:
+                      type: integer
+                      minimum: 1
+                      description: "Requests that reached the server per window (MCP routes); exactly one of tokens and calls"
                     window:
                       type: string
                       enum: [Hourly, Daily, Monthly]

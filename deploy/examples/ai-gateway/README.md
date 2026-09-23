@@ -4,12 +4,13 @@ The AI gateway routes LLM requests on fields of their JSON body, checks
 Portus API keys, enforces token budgets and records usage in the ledger.
 Clients keep speaking the provider's native API.
 
-1. Install with the Rama stack and the ledger:
-   `helm upgrade --install portus deploy/helm -n portus --create-namespace --set dataplane.networkStack=rama --set aiGateway.enabled=true`
-   (an existing install: add `--reset-then-reuse-values` and delete the
-   generated `portus-portus-gateway-grpc-tls` Secret first so it is
-   regenerated with the ledger's names). Apply the CRDs by hand:
-   `kubectl apply -f deploy/helm/crds/aiprovider.yaml -f deploy/helm/crds/airoute.yaml -f deploy/helm/crds/aiusagepolicy.yaml`.
+1. Install with the ledger:
+   `helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.5 -n portus --create-namespace --set aiGateway.enabled=true`.
+   A fresh install carries the AI CRDs. An existing install: apply
+   `deploy/helm/crds/aiprovider.yaml`, `airoute.yaml` and `aiusagepolicy.yaml`
+   by hand (Helm does not upgrade CRDs), add `--reset-then-reuse-values`, and
+   delete the generated `portus-portus-gateway-grpc-tls` Secret first so it
+   is regenerated with the ledger's names.
 2. Put your provider key in the Secret and apply `provider-and-route.yaml`,
    then `budget.yaml`.
 3. Issue a client key through the ledger's admin API:
@@ -26,6 +27,12 @@ Clients keep speaking the provider's native API.
    `ANTHROPIC_BASE_URL=https://llm.example.com ANTHROPIC_API_KEY=portus_sk_… claude`
 5. Read usage: `curl localhost:8083/export.jsonl?limit=100` (one JSON row
    per request: model, tokens, key id, status, latency) and `/metrics`.
+
+6. MCP: `mcp.yaml` puts an MCP server behind the same gateway. Issue a key
+   with `"allowed_tools":["github.*"]`, then in Claude Code:
+   `claude mcp add --transport http github https://mcp.example.com/mcp --header "Authorization: Bearer portus_sk_…"`.
+   A `calls` budget counts JSON-RPC requests; a disallowed tool or a spent
+   budget comes back as a JSON-RPC error on 200 so the session survives.
 
 Refusals come back in the provider's error shape: 401 for a missing or
 unknown key, 403 for a model outside the key's list, 429 with `Retry-After`

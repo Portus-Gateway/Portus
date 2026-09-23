@@ -91,6 +91,8 @@ pub fn reconcile_endpointslice_inner(
     if changed {
         store.notify_change();
     }
+    // AI providers fronting this Service follow its pods.
+    super::ai_provider::refresh_for_service(store, namespace, &service_name);
     Ok(())
 }
 

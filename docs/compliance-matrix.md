@@ -127,43 +127,40 @@ These are the request routing and traffic management features defined in the Gat
 
 ## 2. Policy Support Matrix
 
-Portus implements policies as Kubernetes CRDs that attach to Gateways and routes. The controller reconciles policy CRDs and compiles them into the proto config alongside route data. The dataplane enforces policies in the request path.
+Policies are CRDs that attach to Gateways, routes and Services with a `targetRef`; the controller compiles them into the route config and the data plane enforces them on the request path. Field reference and examples: [`policies.md`](policies.md); the AI gateway policies: [`ai-gateway.md`](ai-gateway.md).
 
-### Implemented Policies
+### Implemented
 
-All five implemented policies have CRDs in `deploy/helm/crds/`, dedicated reconcilers in the controller, and enforcement logic in the dataplane.
+| Policy | Targets | Notes |
+|--------|---------|-------|
+| TimeoutPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | Request, backend-request and connect deadlines |
+| RetryPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | Connection-time replay (`connect-failure`); response-code retries via the rule's `retry.codes` |
+| RateLimitPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | Token bucket, per route or per client IP; limiters survive reloads |
+| CircuitBreakerPolicy | HTTPRoute, GRPCRoute, Service | Closed/Open/HalfOpen on consecutive 5xx |
+| ConnectionPolicy | Service, HTTPRoute | Max in-flight requests |
+| HealthCheckPolicy | Service | Active `GET` probes with thresholds |
+| CORSPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | Preflight and response headers |
+| IPAllowlistPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | Allow/deny CIDRs, trusted proxies for `X-Forwarded-For` |
+| RequestBodySizeLimitPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | 413 on `Content-Length` and on streamed bodies |
+| BasicAuthPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | bcrypt hashes in a Secret, cost ≥ 10 |
+| ApiKeyAuthPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | Header against Secret values |
+| AIUsagePolicy | AIRoute | Token or call budgets per key, tenant or route (0.2.4) |
+| BackendTLSPolicy | Service | Gateway API v1: CA bundle, hostname and SAN validation; client certificate from `Gateway.spec.tls.backend` |
 
-| Policy | Status | Notes |
-|--------|--------|-------|
-| RateLimitPolicy | Implemented | Token bucket algorithm. Per-route rate limiting with configurable RPS. Rate limiters survive config rebuilds when path+RPS match. |
-| CircuitBreakerPolicy | Implemented | Three-state circuit breaker (Closed/Open/HalfOpen). Configurable failure threshold, success threshold, and open-state timeout. Only exists where a policy is attached; without one, backend 5xx responses are passed through untouched. |
-| ConnectionPolicy | Implemented | Per-service max concurrent connection limiting. Only exists where a policy is attached (no implicit default). |
-| BasicAuthPolicy | Implemented | Username/password authentication. Credentials stored as bcrypt hashes. Configurable realm. |
-| ApiKeyAuthPolicy | Implemented | API key validation via configurable header (default `X-API-Key`). O(1) key lookup via HashSet. |
+### Planned
 
-### Planned Policies (v2)
-
-These are policies where we either have partial infrastructure already (e.g., retries exist as a field, CORS works but isn't a standalone CRD) or where Pingora provides the building blocks and we just need the CRD + reconciler wiring.
-
-| Policy | Status | Notes |
-|--------|--------|-------|
-| BackendTLSPolicy | Implemented | Gateway API v1. CA certificates from ConfigMaps, hostname and SAN validation (`BackendTLSPolicy`, `BackendTLSPolicySANValidation` conformance). Client certificate from `Gateway.spec.tls.backend.clientCertificateRef` (`GatewayBackendClientCertificate`). |
-| RetryPolicy | Supported | `maxRetries` + `retryOn` (`connect-failure`, `gateway-error`): connection-time retries only. Ignored on rules that carry their own `retry`. |
-| HealthCheckPolicy | Planned | Pingora has built-in health checking for upstreams. Needs CRD + reconciler to expose configuration. |
-| LoadBalancerPolicy | Planned | Currently hardcoded to round-robin. Pingora supports weighted round-robin, consistent hashing, and least connections. Needs CRD to select algorithm per-service. |
-| IPAllowlistPolicy | Planned | `client_addr` is available in `request_filter`. Implementation is straightforward — check source IP against CIDR allowlist/denylist. |
-| RequestBodySizeLimitPolicy | Planned | Check Content-Length header in request_filter, reject oversized requests before proxying. |
-| JWTAuthPolicy | Planned | Token validation with JWKS endpoint fetching. More complex than Basic/ApiKey — needs key rotation, clock skew handling, claim validation. |
-| ExtAuthPolicy | Planned | External authorization service callout before proxying. This is the big one — it unlocks OAuth2, OIDC, LDAP, and SAML by delegating auth decisions to an external service. |
-| CORSPolicy (as CRD) | Planned | CORS is fully implemented in the router and works via route-level config. The planned work is promoting it to a standalone policy CRD for easier management. |
-| TimeoutPolicy (as CRD) | Planned | Timeouts work via route config fields today. A standalone CRD would allow timeout configuration independent of route definitions. |
+| Policy | Notes |
+|--------|-------|
+| JWTAuthPolicy | Local verification against a JWKS the ledger refreshes (in design for 0.2.5 alongside OAuth for MCP clients) |
+| LoadBalancerPolicy | Round-robin is the default; keyed selection exists for MCP session affinity and will be exposed as a policy |
+| ExtAuthPolicy | External authorization callout |
 
 ### Not Planned
 
-| Policy | Status | Notes |
-|--------|--------|-------|
-| Fault injection | Not planned | Deliberately injecting errors/delays. We don't see a use case for this in production gateway deployments. Use a service mesh if you need chaos testing. |
-| Request body transformation | Not planned | Modifying request/response bodies in-flight. This is an API gateway pattern (like Kong/Apigee) that doesn't align with Portus's role as a Gateway API implementation. |
+| Policy | Notes |
+|--------|-------|
+| Fault injection | Use a service mesh for chaos testing |
+| Request body transformation | An API-gateway pattern outside a Gateway API implementation's role |
 
 ---
 
@@ -194,7 +191,7 @@ These are proxy-level features in the Pingora-based dataplane, independent of Ga
 | HTTP redirects | Supported | Full control over scheme, host, port, path, status code (301/302/303/307/308). |
 | Request timeout | Supported | Per-rule request lifecycle timeout. |
 | Backend request timeout | Supported | Per-rule backend connection timeout. |
-| Max retries | Supported | Wired through proto config. Currently not exposed as a CRD. |
+| Max retries | Supported | `RetryPolicy` (connection-time) and the HTTPRoute rule's `retry` (response codes). |
 
 ### Resilience and Security
 
@@ -208,8 +205,8 @@ These are proxy-level features in the Pingora-based dataplane, independent of Ga
 | API key auth | Supported | Header-based key validation, O(1) lookup. |
 | JWT auth | Planned | Token validation, JWKS fetching, claim extraction. |
 | External auth (ExtAuth) | Planned | Callout to external authorization service. |
-| IP allowlist/denylist | Planned | Source IP filtering against CIDR ranges. |
-| Request body size limit | Planned | Content-Length check in request filter. |
+| IP allowlist/denylist | Supported | `IPAllowlistPolicy`: allow and deny CIDRs, trusted proxy CIDRs for `X-Forwarded-For`. |
+| Request body size limit | Supported | `RequestBodySizeLimitPolicy`: `Content-Length` and streamed bodies. |
 
 ### Infrastructure
 
@@ -217,8 +214,8 @@ These are proxy-level features in the Pingora-based dataplane, independent of Ga
 |------------|--------|-------|
 | Zero-downtime config reload | Supported | `ArcSwap` for lock-free atomic config swap. In-flight requests always see a consistent snapshot. |
 | Connection pooling (upstream keepalive) | Supported | 1024-connection upstream pool. |
-| Load balancing (round-robin) | Supported | Default and currently only algorithm. |
-| Load balancing (consistent hash, least conn) | Planned | Pingora supports these natively; needs CRD configuration. |
+| Load balancing (round-robin) | Supported | Default. |
+| Load balancing (keyed / consistent) | Supported for MCP | Rendezvous hashing on `Mcp-Session-Id` for `AIProvider kind: mcp`; a general LoadBalancerPolicy is planned. |
 | Prometheus metrics | Supported | Exposed on configurable metrics port (default 9090). |
 | Health/readiness probes | Supported | Dedicated health port (default 8081). |
 | PodDisruptionBudget | Supported | Helm chart creates PDB with configurable minAvailable. |

@@ -267,6 +267,10 @@ pub struct AiBackend {
     pub key_required: bool,
     /// Token budget from an AIUsagePolicy, enforced with ledger grants.
     pub budget: Option<crate::ai::budget::BudgetPolicy>,
+    /// MCP: pin a session (`Mcp-Session-Id`) to the endpoint that created it.
+    pub session_affinity: bool,
+    /// OAuth bearer tokens accepted in place of a Portus API key.
+    pub jwt: Option<crate::ai::jwt::JwtPolicy>,
 }
 
 impl PathRoute {
@@ -324,6 +328,16 @@ pub struct HostRoutes {
     /// ([`BODY_FIELD_HEADER_PREFIX`]), so a request with a body must be
     /// scanned before it can be matched.
     pub needs_body: bool,
+    /// The OAuth policy a route on this host accepts tokens under, served
+    /// at `/.well-known/oauth-protected-resource` so MCP clients find the
+    /// login.
+    pub oauth: Option<crate::ai::jwt::JwtPolicy>,
+}
+
+/// The OAuth policy to advertise for a set of routes: the first route with
+/// one.
+pub fn oauth_of<'a>(routes: impl Iterator<Item = &'a PathRoute>) -> Option<crate::ai::jwt::JwtPolicy> {
+    routes.filter_map(|r| r.ai.as_ref()).filter_map(|ai| ai.jwt.as_ref()).next().cloned()
 }
 
 /// Header-match names with this prefix are matched against fields the body
@@ -1284,6 +1298,7 @@ pub fn build_route_map(
                 rules: prefix_rules,
                 catch_all,
                 needs_body: false,
+                oauth: None,
             },
         );
     }
@@ -1405,7 +1420,8 @@ mod tests {
         }
         let needs_body = exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter())
             .any(|r| needs_body_fields(&r.header_matches));
-        HostRoutes { exact_map, rules: prefix_rules, catch_all, needs_body }
+        let oauth = oauth_of(exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter()));
+        HostRoutes { exact_map, rules: prefix_rules, catch_all, needs_body, oauth }
     }
 
     #[test]

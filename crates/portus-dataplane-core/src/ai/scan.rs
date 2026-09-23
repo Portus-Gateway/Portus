@@ -100,6 +100,9 @@ pub struct FieldScanner {
     consumed: usize,
     /// Copy the raw bytes of a wanted key's object or array value.
     capture_compound: bool,
+    /// Largest compound value copied; beyond it the value is reported as
+    /// [`Scalar::Compound`] and the copy is dropped.
+    capture_limit: usize,
     /// The wanted key whose compound value is being copied into `token`.
     capturing: Option<usize>,
 }
@@ -115,6 +118,7 @@ impl FieldScanner {
             current: None,
             consumed: 0,
             capture_compound: false,
+            capture_limit: usize::MAX,
             capturing: None,
         }
     }
@@ -124,6 +128,14 @@ impl FieldScanner {
     /// response's `usage` object, which is small; never for a request body.
     pub fn capturing_compounds(mut self) -> Self {
         self.capture_compound = true;
+        self
+    }
+
+    /// Cap the bytes kept for one captured compound value. A request body's
+    /// `params` can be anything a client sends; beyond `bytes` it is skipped
+    /// like an unwanted value and reported as [`Scalar::Compound`].
+    pub fn capture_limit(mut self, bytes: usize) -> Self {
+        self.capture_limit = bytes;
         self
     }
 
@@ -275,8 +287,13 @@ impl FieldScanner {
                 }
                 State::InNested { depth, in_string, escaped } => {
                     let (next, state) = skip_nested_part(chunk, i, depth, in_string, escaped);
-                    if self.capturing.is_some() {
+                    if let Some(w) = self.capturing {
                         self.token.extend_from_slice(&chunk[i..next]);
+                        if self.token.len() > self.capture_limit {
+                            self.capturing = None;
+                            self.token.clear();
+                            self.record(w, Scalar::Compound);
+                        }
                     }
                     i = next;
                     self.state = match state {
@@ -285,9 +302,9 @@ impl FieldScanner {
                             if let Some(w) = self.capturing.take() {
                                 let raw = std::mem::take(&mut self.token);
                                 self.record(w, Scalar::Raw(raw));
-                                if self.found == self.keys.len() {
-                                    return self.finish(Progress::Complete);
-                                }
+                            }
+                            if self.found == self.keys.len() {
+                                return self.finish(Progress::Complete);
                             }
                             State::AfterValue
                         }
@@ -626,6 +643,29 @@ mod tests {
                 "split {split}"
             );
         }
+    }
+
+    #[test]
+    fn a_captured_compound_over_the_limit_is_dropped_and_scanning_goes_on() {
+        const KEYS: &[&str] = &["params", "method"];
+        let big = format!(r#"{{"params":{{"name":"x","arguments":{{"blob":"{}"}}}},"method":"tools/call"}}"#, "y".repeat(200));
+        for split in [1usize, 13, big.len()] {
+            let mut s = FieldScanner::new(KEYS).capturing_compounds().capture_limit(64);
+            let mut p = Progress::NeedMore;
+            for c in big.as_bytes().chunks(split) {
+                p = s.feed(c);
+                if p != Progress::NeedMore {
+                    break;
+                }
+            }
+            assert_eq!(p, Progress::Complete, "split {split}");
+            assert_eq!(s.get("params"), Some(&Scalar::Compound), "split {split}");
+            assert_eq!(s.get("method").unwrap().as_str(), Some("tools/call"), "split {split}");
+        }
+        // Under the limit the bytes come out whole.
+        let mut s = FieldScanner::new(KEYS).capturing_compounds().capture_limit(64);
+        assert_eq!(s.feed(br#"{"params":{"name":"x"},"method":"m"}"#), Progress::Complete);
+        assert_eq!(s.get("params"), Some(&Scalar::Raw(br#"{"name":"x"}"#.to_vec())));
     }
 
     #[test]

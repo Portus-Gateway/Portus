@@ -92,6 +92,17 @@ impl Endpoint {
     }
 }
 
+/// Length of an [`endpoint_tag`].
+pub const TAG_LEN: usize = 16;
+
+/// A short stable name for an endpoint address, the same on every pod, safe
+/// in a header value: the first 16 hex characters of its SHA-256.
+pub fn endpoint_tag(addr: &SocketAddr) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(addr.to_string().as_bytes());
+    digest[..TAG_LEN / 2].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Round-robin pool over the endpoints of one Service port.
 #[derive(Debug)]
 pub struct Pool {
@@ -137,6 +148,30 @@ impl Pool {
         (0..n)
             .map(|i| &self.endpoints[(start + i) % n])
             .find(|ep| ep.ready())
+            .map(|ep| ep.addr)
+    }
+
+    /// The ready endpoint whose [`endpoint_tag`] is `tag`, if any.
+    pub fn endpoint_by_tag(&self, tag: &str) -> Option<SocketAddr> {
+        self.endpoints.iter().find(|ep| ep.ready() && endpoint_tag(&ep.addr) == tag).map(|ep| ep.addr)
+    }
+
+    /// The ready endpoint `key` maps to, the same on every pod for the same
+    /// endpoint set (rendezvous hashing: the endpoint with the highest
+    /// hash(key, addr) wins). Removing an endpoint moves only the keys that
+    /// mapped to it; adding one moves about 1/n of them. `None` when no
+    /// endpoint is ready.
+    pub fn select_by_key(&self, key: &[u8]) -> Option<SocketAddr> {
+        use std::hash::{Hash, Hasher};
+        self.endpoints
+            .iter()
+            .filter(|ep| ep.ready())
+            .max_by_key(|ep| {
+                let mut h = std::hash::DefaultHasher::new();
+                key.hash(&mut h);
+                ep.addr.hash(&mut h);
+                h.finish()
+            })
             .map(|ep| ep.addr)
     }
 
@@ -276,6 +311,48 @@ mod tests {
         assert!(!p.ready(&addr("10.0.0.3:80")));
         assert!(p.set_enabled(&addr("10.0.0.2:80"), true));
         assert!(p.ready(&addr("10.0.0.2:80")));
+    }
+
+    #[test]
+    fn keyed_selection_is_stable_across_pools_and_moves_only_the_removed_endpoints_keys() {
+        let a = pool(&["10.0.0.1:80", "10.0.0.2:80", "10.0.0.3:80", "10.0.0.4:80"]);
+        let b = pool(&["10.0.0.4:80", "10.0.0.3:80", "10.0.0.2:80", "10.0.0.1:80"]);
+        let keys: Vec<String> = (0..400).map(|i| format!("session-{i}")).collect();
+        let picks_a: Vec<_> = keys.iter().map(|k| a.select_by_key(k.as_bytes()).unwrap()).collect();
+        let picks_b: Vec<_> = keys.iter().map(|k| b.select_by_key(k.as_bytes()).unwrap()).collect();
+        assert_eq!(picks_a, picks_b, "the same set in another order picks the same endpoints");
+        for ep in a.endpoints() {
+            let share = picks_a.iter().filter(|p| **p == ep.addr).count();
+            assert!((50..=150).contains(&share), "{} got {share} of 400", ep.addr);
+        }
+        // Take one endpoint out: its keys move, nobody else's do.
+        let gone = addr("10.0.0.3:80");
+        assert!(a.set_enabled(&gone, false));
+        for (k, before) in keys.iter().zip(&picks_a) {
+            let after = a.select_by_key(k.as_bytes()).unwrap();
+            if *before == gone {
+                assert_ne!(after, gone);
+            } else {
+                assert_eq!(after, *before, "{k} moved although its endpoint stayed");
+            }
+        }
+        // Different keys spread; the same key repeats.
+        assert_eq!(a.select_by_key(b"x"), a.select_by_key(b"x"));
+        assert!(pool(&[]).select_by_key(b"x").is_none());
+    }
+
+    #[test]
+    fn endpoint_tags_are_stable_hex_and_resolve_only_to_ready_endpoints() {
+        let p = pool(&["10.0.0.1:80", "10.0.0.2:80"]);
+        let tag = endpoint_tag(&addr("10.0.0.2:80"));
+        assert_eq!(tag.len(), TAG_LEN);
+        assert!(tag.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(tag, endpoint_tag(&addr("10.0.0.2:80")));
+        assert_ne!(tag, endpoint_tag(&addr("10.0.0.1:80")));
+        assert_eq!(p.endpoint_by_tag(&tag), Some(addr("10.0.0.2:80")));
+        p.set_enabled(&addr("10.0.0.2:80"), false);
+        assert_eq!(p.endpoint_by_tag(&tag), None, "a session cannot be pinned to an endpoint that is out");
+        assert_eq!(p.endpoint_by_tag("nope"), None);
     }
 
     #[test]

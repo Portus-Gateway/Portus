@@ -112,3 +112,8 @@ aiGateway:
         memory: 64Mi
       limits:
         memory: 512Mi
+  # OAuth issuers whose bearer tokens AIRoutes may accept (AIRoute
+  # spec.auth.jwt.issuer must be one of them). The ledger fetches each
+  # issuer's JWKS every 5 minutes and pushes it to the data planes.
+  jwt:
+    issuers: []

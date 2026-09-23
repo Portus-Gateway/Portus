@@ -20,6 +20,8 @@ use super::budget::Budgets;
 use super::keys::KeySet;
 use super::usage::{UsageRecord, UsageRing};
 
+/// Verified OAuth tokens remembered per pod.
+const TOKEN_CACHE_CAPACITY: usize = 65_536;
 /// Records held per pod between drains.
 pub const RING_CAPACITY: usize = 65_536;
 /// Records per batch, and the ring depth that triggers an early drain.
@@ -50,6 +52,8 @@ pub struct LedgerReporter {
     pub keys: Arc<ArcSwap<KeySet>>,
     /// Token allowances per policy and subject, refilled by ledger grants.
     pub budgets: Arc<Budgets>,
+    /// OAuth tokens verified on this pod, until they expire.
+    pub tokens: Arc<super::jwt::TokenCache>,
 }
 
 impl LedgerReporter {
@@ -67,6 +71,7 @@ impl LedgerReporter {
             stats: Arc::new(LedgerStats::default()),
             keys: Arc::new(ArcSwap::from_pointee(KeySet::default())),
             budgets: Budgets::start(addr.clone(), node.clone()),
+            tokens: Arc::new(super::jwt::TokenCache::new(TOKEN_CACHE_CAPACITY)),
         });
         tokio::spawn(drain_loop(addr.clone(), node.clone(), Arc::clone(&reporter.ring), Arc::clone(&reporter.stats)));
         tokio::spawn(watch_keys_loop(addr, node, Arc::clone(&reporter.keys)));
@@ -99,6 +104,8 @@ pub fn to_wire(r: &UsageRecord) -> WireRecord {
         request_bytes: r.request_bytes,
         response_bytes: r.response_bytes,
         key_id: r.key_id,
+        tenant: r.tenant.to_string(),
+        subject: r.subject.to_string(),
         request_id: r.request_id,
         refusal: r.refusal.map_or("", |k| k.as_str()).to_string(),
     }
@@ -199,7 +206,7 @@ async fn watch_keys_loop(addr: String, node: String, keys: Arc<ArcSwap<KeySet>>)
                             if first || snapshot.version > current.version || current.is_empty() {
                                 first = false;
                                 let set = KeySet::from_snapshot(&snapshot);
-                                log::info!("API key snapshot v{} applied: {} keys", set.version, set.len());
+                                log::info!("API key snapshot v{} applied: {} keys, {} OAuth issuers", set.version, set.len(), set.jwks.issuer_count());
                                 keys.store(Arc::new(set));
                             }
                         }
@@ -240,11 +247,14 @@ mod tests {
             request_bytes: 100,
             response_bytes: 200,
             key_id: 7,
+            tenant: UsageRecord::name("team-a"),
+            subject: UsageRecord::name("alice@example.com"),
             request_id: 42,
             refusal: None,
         };
         let w = to_wire(&r);
         assert_eq!(w.refusal, "");
+        assert_eq!((w.tenant.as_str(), w.subject.as_str()), ("team-a", "alice@example.com"));
         assert_eq!((w.status, w.dialect.as_str(), w.stream, w.has_usage), (200, "openai", true, true));
         assert_eq!((w.input_tokens, w.output_tokens, w.cache_read_tokens), (9, 12, 3));
         assert_eq!((w.provider.as_str(), w.route_host.as_str(), w.requested_model.as_str(), w.served_model.as_str()), ("echo", "llm.bench", "gpt-5", ""));

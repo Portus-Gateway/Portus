@@ -167,6 +167,11 @@ message RouteConfig {
   bool ai_key_required = 38;
   // Token budget from an AIUsagePolicy targeting the route.
   optional AiBudget ai_budget = 39;
+  // MCP providers: requests carrying an Mcp-Session-Id go to the endpoint
+  // the session hashes to (rendezvous hashing over the ready endpoints).
+  bool ai_session_affinity = 40;
+  // OAuth bearer tokens the route accepts in place of a Portus API key.
+  optional AiJwt ai_jwt = 41;
 
   // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
   // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.
@@ -243,11 +248,24 @@ message BackendEndpoint {
 // AI gateway: a token budget the data plane enforces with grants from the
 // ledger. `window` is HOURLY | DAILY | MONTHLY (fixed, UTC); `per` is
 // KEY | TENANT | ROUTE, the subject each counter belongs to.
+// An AIRoute's `auth.jwt`: tokens from `issuer` (and for `audience` when
+// set) are verified against the issuer's JWKS from the key snapshot; the
+// tenant and the MCP tool list come from the named claims.
+message AiJwt {
+  string issuer = 1;
+  string audience = 2;
+  string tenant_claim = 3;
+  string tools_claim = 4;
+  // Space-separated scopes clients are told to request (metadata and challenge).
+  string scopes = 5;
+}
+
 message AiBudget {
   string policy = 1;        // namespace/name of the AIUsagePolicy
-  uint64 tokens = 2;
+  uint64 limit = 2;         // units per window
   string window = 3;
   string per = 4;
+  string unit = 6;          // TOKENS | CALLS ("" = TOKENS)
   // When the ledger cannot be reached and no allowance is held: let the
   // request through (true) or refuse it (false).
   bool fail_open = 5;

@@ -40,8 +40,13 @@ use super::body::scan_body;
 use super::client::{Upstream, UpstreamTarget};
 use super::usage::{observe, record_refusal, RequestSide};
 use portus_dataplane_core::ai::usage::RefusalKind;
-use portus_dataplane_core::ai::budget::{estimate, exhausted_reply, now_micros, Scope, Verdict, REMAINING_HEADER};
-use portus_dataplane_core::ai::keys::{authorize, Refusal};
+use portus_dataplane_core::ai::budget::{cost, exhausted_reply, now_micros, remaining_header, Scope, Verdict};
+use portus_dataplane_core::ai::keys::{authorize, check_access, presented_key, Access, KeyInfo, Refusal};
+use portus_dataplane_core::ai::jwt::{challenge_header, looks_like_jwt};
+use portus_dataplane_core::readiness::unix_now;
+use portus_dataplane_core::ai::usage::Dialect;
+use portus_dataplane_core::ai::mcp::{split_session, tag_session};
+use portus_dataplane_core::pool::endpoint_tag;
 use portus_dataplane_core::ai::ledger::LedgerReporter;
 use super::tls::{client_auth_for, upstream_tls_for};
 
@@ -248,29 +253,78 @@ impl ProxyService {
         // route's mutations set the provider's own.
         let mut key_id = 0;
         let mut tenant: Option<Arc<str>> = None;
-        let model = body_fields.as_ref().and_then(|f| f.iter().find(|(k, _)| *k == "model")).map(|(_, v)| v.as_str());
+        let mut who_name: Option<Arc<str>> = None;
+        let field = |key: &str| body_fields.as_ref().and_then(|f| f.iter().find(|(k, _)| *k == key)).map(|(_, v)| v.as_str());
+        let model = field("model");
+        // The JSON-RPC id, as JSON text, for MCP refusals to echo.
+        let request_id = field("id");
+        // What the key's allow lists judge: the model for LLM requests, the
+        // tool for an MCP tools/call, nothing else for the rest of MCP.
+        let access = match plan.ai.as_ref().map(|ai| ai.dialect) {
+            Some(Dialect::Mcp) if field("method") == Some("tools/call") => Access::ToolCall(field("tool")),
+            Some(Dialect::Mcp) => Access::Other,
+            _ => Access::Model(model),
+        };
+        let subject = match access {
+            Access::ToolCall(t) => t,
+            _ => model,
+        };
         if let Some(ai) = plan.ai.as_ref().filter(|ai| ai.key_required) {
-            let verdict = match self.ledger.as_ref() {
-                Some(ledger) => authorize(&ledger.keys.load(), &Headers(req.headers()), model).map(|k| (k.id, Arc::clone(&k.tenant))),
+            // Who is calling: a Portus key from the snapshot, or, on a route
+            // with auth.jwt, a bearer JWT verified against the issuer's keys
+            // (cached by hash once verified). Then what they may do.
+            let identity: Result<KeyInfo, Refusal> = match self.ledger.as_ref() {
+                Some(ledger) => {
+                    let keys = ledger.keys.load();
+                    let request_headers = Headers(req.headers());
+                    let bearer = presented_key(&request_headers);
+                    match (ai.jwt.as_ref(), bearer) {
+                        (Some(policy), Some(token)) if looks_like_jwt(token) => {
+                            ledger.tokens.get_or_verify(token, policy, &keys.jwks, unix_now()).ok_or(Refusal::Unauthenticated)
+                        }
+                        _ => authorize(&keys, &request_headers, Access::Other).cloned(),
+                    }
+                }
                 None => Err(Refusal::Unauthenticated),
             };
+            let known: Option<KeyInfo> = identity.as_ref().ok().cloned();
+            let verdict = identity.and_then(|info| check_access(&info, access).map(|_| info));
             match verdict {
-                Ok((id, t)) => {
-                    key_id = id;
-                    tenant = Some(t);
+                Ok(info) => {
+                    key_id = info.id;
+                    tenant = Some(Arc::clone(&info.tenant));
+                    who_name = Some(Arc::clone(&info.name));
                 }
                 Err(refusal) => {
-                    let reply = refusal.reply(ai.dialect, model);
+                    let mut reply = refusal.reply(ai.dialect, subject, request_id);
+                    // A route that accepts OAuth tokens tells the client where
+                    // its metadata is, so the login flow can start from here.
+                    if refusal == Refusal::Unauthenticated
+                        && let Some(policy) = ai.jwt.as_ref()
+                    {
+                        let scheme = if socket_is_tls { "https" } else { "http" };
+                        let path_only = req.uri().path().map(|p| p.as_encoded_str().into_owned()).unwrap_or_else(|| "/".to_string());
+                        let presented = presented_key(&Headers(req.headers())).is_some();
+                        if let Ok(v) = http::HeaderValue::from_str(&challenge_header(scheme, host, &path_only, policy, presented)) {
+                            reply = reply.with_header(http::header::WWW_AUTHENTICATE, v);
+                        }
+                    }
                     let status = reply.status;
                     self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                     if let Some(ledger) = self.ledger.as_ref() {
-                        // A model refusal knows its key; an authentication one does not.
-                        let key_id = if refusal == Refusal::ModelNotAllowed {
-                            authorize(&ledger.keys.load(), &Headers(req.headers()), None).map(|k| k.id).unwrap_or(0)
-                        } else {
-                            0
+                        // A model or tool refusal knows its subject; an authentication one does not.
+                        let key_id = known.as_ref().map(|k| k.id).unwrap_or(0);
+                        let side = RequestSide {
+                            ai,
+                            host,
+                            body_fields: body_fields.as_ref(),
+                            request_bytes,
+                            start,
+                            key_id,
+                            tenant: known.as_ref().map(|k| k.tenant.as_ref()),
+                            subject: known.as_ref().map(|k| k.name.as_ref()),
+                            reservation: None,
                         };
-                        let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation: None };
                         record_refusal(status, refusal.kind(), side, &ledger.ring);
                     }
                     if let Some((method, path)) = &logged {
@@ -286,7 +340,7 @@ impl ProxyService {
         // (one atomic), settle to the real count when the response ends. The
         // counter syncs with the ledger in the background.
         let mut reservation = None;
-        let mut remaining_header: Option<i64> = None;
+        let mut remaining_after: Option<i64> = None;
         if let (Some(ai), Some(budget)) = (plan.ai.as_ref(), plan.ai.as_ref().and_then(|ai| ai.budget.as_ref())) {
             let subject: Arc<str> = match budget.per {
                 Scope::Key if key_id != 0 => Arc::from(key_id.to_string()),
@@ -294,11 +348,8 @@ impl ProxyService {
                 Scope::Tenant => tenant.clone().unwrap_or_else(|| Arc::from("anonymous")),
                 Scope::Route => Arc::from("route"),
             };
-            let max_tokens = body_fields
-                .as_ref()
-                .and_then(|f| f.iter().find(|(k, _)| *k == "max_tokens"))
-                .and_then(|(_, v)| v.parse::<u64>().ok());
-            let cost = estimate(max_tokens, request_bytes);
+            let max_tokens = field("max_tokens").and_then(|v| v.parse::<u64>().ok());
+            let cost = cost(budget.unit, max_tokens, request_bytes);
             let verdict = match self.ledger.as_ref() {
                 Some(ledger) => {
                     let mut v = ledger.budgets.check(budget, &subject, cost, now_micros());
@@ -315,7 +366,7 @@ impl ProxyService {
             };
             let refuse = match verdict {
                 Verdict::Allow(r) => {
-                    remaining_header = Some(r.remaining());
+                    remaining_after = Some(r.remaining());
                     reservation = Some(r);
                     None
                 }
@@ -324,11 +375,11 @@ impl ProxyService {
                 Verdict::Unknown => Some((1, 0, cost)),
             };
             if let Some((retry, remaining, needed)) = refuse {
-                let reply = exhausted_reply(ai.dialect, retry, remaining, needed);
+                let reply = exhausted_reply(ai.dialect, budget.unit, retry, remaining, needed, request_id);
                 let status = reply.status;
                 self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                 if let Some(ledger) = self.ledger.as_ref() {
-                    let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation: None };
+                    let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: who_name.as_deref(), reservation: None };
                     record_refusal(status, RefusalKind::BudgetExhausted, side, &ledger.ring);
                 }
                 if let Some((method, path)) = &logged {
@@ -340,13 +391,13 @@ impl ProxyService {
         let mut response = self.forward(req, &plan, peer_ip, authority).await;
 
         let status = response.status().as_u16();
-        if let Some(remaining) = remaining_header
-            && let Some(n) = rama_name(&REMAINING_HEADER)
+        if let (Some(remaining), Some(budget)) = (remaining_after, plan.ai.as_ref().and_then(|ai| ai.budget.as_ref()))
+            && let Some(n) = rama_name(remaining_header(budget.unit))
         {
             response.headers_mut().insert(n, HeaderValue::from(remaining.max(0)));
         }
         if let (Some(ai), Some(ledger)) = (plan.ai.as_ref(), self.ledger.as_ref()) {
-            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation };
+            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: who_name.as_deref(), reservation };
             let body = std::mem::replace(response.body_mut(), Body::empty());
             *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring));
         }
@@ -453,9 +504,34 @@ impl ProxyService {
         let retrying = buffered.is_some();
         let mut retries_left = if retrying { plan.max_retries } else { 0 };
         let incoming = Incoming { method, version, uri };
+        // An MCP session stays on the endpoint that created it: the session
+        // id a client holds is the endpoint's tag in front of the server's own
+        // id. The server sees only its id; the tag picks the endpoint.
+        let pin_sessions = plan.ai.as_ref().is_some_and(|ai| ai.session_affinity);
+        let mut session_tag: Option<String> = None;
+        let mut session_present = false;
+        if pin_sessions
+            && let Some(value) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string)
+        {
+            session_present = true;
+            let (tag, server_id) = split_session(&value);
+            session_tag = tag.map(str::to_string);
+            if tag.is_some()
+                && let Ok(v) = HeaderValue::from_str(server_id)
+            {
+                headers.insert("mcp-session-id", v);
+            }
+        }
 
         let mut response = loop {
-            let Some(backend) = pool.select() else {
+            let picked = match session_tag.as_deref().and_then(|t| pool.endpoint_by_tag(t)) {
+                Some(pinned) => Some(pinned),
+                // No tag, or the pinned endpoint is gone: any endpoint; the
+                // server answers 404 for a session it does not know and the
+                // client re-initialises.
+                None => pool.select(),
+            };
+            let Some(backend) = picked else {
                 return status_response(StatusCode::INTERNAL_SERVER_ERROR);
             };
             let body = match (&buffered, streaming.take()) {
@@ -471,8 +547,27 @@ impl ProxyService {
             // else its backend-request (read) timeout, else the connect timeout.
             let deadline = plan.request_timeout.or(plan.read_timeout).or(plan.connect_timeout);
             match self.attempt(upstream, deadline).await {
-                Ok(resp) => {
+                Ok(mut resp) => {
                     let status = resp.status().as_u16();
+                    if pin_sessions {
+                        // The spec says 404 for a session the server does not
+                        // know; the TypeScript SDK answers 400. Either way the
+                        // client re-initialises.
+                        if (status == 404 || status == 400)
+                            && session_present
+                            && let Some(ai) = plan.ai.as_ref()
+                        {
+                            self.metrics.mcp_session_rehomed_total.with_label_values(&[ai.provider.as_ref()]).inc();
+                        }
+                        // A session the server created (or echoed) leaves
+                        // tagged with the endpoint that holds it.
+                        if let Some(id) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string)
+                            && split_session(&id).0.is_none()
+                            && let Ok(v) = HeaderValue::from_str(&tag_session(&endpoint_tag(&backend), &id))
+                        {
+                            resp.headers_mut().insert("mcp-session-id", v);
+                        }
+                    }
                     if let Some(out) = self.outliers.responded(pool, &backend, status) {
                         self.note_ejection(plan, &backend, out, &format!("{status} responses in a row"));
                     }

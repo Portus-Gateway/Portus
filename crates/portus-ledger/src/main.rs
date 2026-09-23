@@ -13,6 +13,7 @@
 //!   client certificates (the data planes present the config-stream cert).
 
 mod budget;
+mod jwks;
 mod keys;
 mod store;
 
@@ -57,7 +58,7 @@ enum Op {
     Export { since: u64, limit: usize, done: Done<Vec<store::Row>> },
     Summary { since: u64, done: Done<Vec<store::KeySummary>> },
     Count(Done<u64>),
-    IssueKey { tenant: String, name: String, models: Vec<String>, plaintext: Option<String>, done: Done<(KeyRow, String)> },
+    IssueKey { tenant: String, name: String, models: Vec<String>, tools: Vec<String>, plaintext: Option<String>, done: Done<(KeyRow, String)> },
     RevokeKey { id: u64, done: Done<bool> },
     ListKeys(Done<Vec<KeyRow>>),
     /// Advance the persisted version and build the snapshot at it.
@@ -81,8 +82,8 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
             Op::Count(done) => {
                 let _ = done.send(store.count());
             }
-            Op::IssueKey { tenant, name, models, plaintext, done } => {
-                let _ = done.send(store.issue_key(&tenant, &name, &models, plaintext.as_deref()));
+            Op::IssueKey { tenant, name, models, tools, plaintext, done } => {
+                let _ = done.send(store.issue_key(&tenant, &name, &models, &tools, plaintext.as_deref()));
             }
             Op::RevokeKey { id, done } => {
                 let _ = done.send(store.revoke_key(id));
@@ -111,6 +112,8 @@ struct Shared {
     keys: watch::Sender<Arc<KeySnapshot>>,
     key_version: AtomicU64,
     admin_token: Option<String>,
+    /// OAuth issuers' JWKS as last fetched, attached to every key snapshot.
+    jwks: std::sync::Mutex<Vec<portus_types::proto::portus::ledger::v1::JwksEntry>>,
 }
 
 impl Shared {
@@ -128,9 +131,10 @@ impl Shared {
     /// persisted by the store, so a restarted ledger never republishes a
     /// number a data plane has already seen.
     async fn publish_keys(&self) -> Result<(), String> {
-        let snapshot = self.run(Op::NextKeySnapshot).await?;
+        let mut snapshot = self.run(Op::NextKeySnapshot).await?;
+        snapshot.issuers = self.jwks.lock().map(|j| j.clone()).unwrap_or_default();
         self.key_version.store(snapshot.version, Ordering::Relaxed);
-        log::info!("key snapshot v{}: {} live keys", snapshot.version, snapshot.keys.len());
+        log::info!("key snapshot v{}: {} live keys, {} OAuth issuers", snapshot.version, snapshot.keys.len(), snapshot.issuers.len());
         // send_replace, not send: `send` leaves the value untouched when no
         // data plane is connected, and the next one to connect would get a
         // stale snapshot.
@@ -227,6 +231,9 @@ struct IssueKeyRequest {
     name: String,
     #[serde(default)]
     allowed_models: Vec<String>,
+    /// MCP tools the key may call (`tools/call` names, exact or `prefix.*`).
+    #[serde(default)]
+    allowed_tools: Vec<String>,
     /// An externally issued key to accept as-is; omitted to generate one.
     #[serde(default)]
     key: Option<String>,
@@ -340,6 +347,7 @@ async fn issue_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Json(r
             tenant: req.tenant.trim().to_string(),
             name: req.name.trim().to_string(),
             models: req.allowed_models.clone(),
+            tools: req.allowed_tools.clone(),
             plaintext: req.key.as_deref().map(str::trim).map(str::to_string),
             done,
         })
@@ -412,6 +420,8 @@ fn server_tls() -> Option<tonic::transport::ServerTlsConfig> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // tonic and reqwest both use rustls; one process-wide provider, chosen here.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     let db_path = PathBuf::from(env_or("LEDGER_DB_PATH", "/data/ledger.db"));
     let grpc_addr: std::net::SocketAddr = env_or("LEDGER_GRPC_ADDR", "0.0.0.0:9444").parse()?;
@@ -429,9 +439,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::Builder::new().name("ledger-storage".into()).spawn(move || storage_thread(store, ops_rx))?;
     let (keys_tx, _keys_rx) = watch::channel(Arc::new(initial));
     let initial_version = keys_tx.borrow().version;
-    let shared = Arc::new(Shared { ops: ops_tx, stats: Stats::default(), keys: keys_tx, key_version: AtomicU64::new(initial_version), admin_token });
+    let shared = Arc::new(Shared { ops: ops_tx, stats: Stats::default(), keys: keys_tx, key_version: AtomicU64::new(initial_version), admin_token, jwks: std::sync::Mutex::new(Vec::new()) });
     if shared.admin_token.is_none() {
         log::warn!("LEDGER_ADMIN_TOKEN is not set; the key admin API is disabled");
+    }
+    // OAuth issuers: fetch their JWKS now and every few minutes; a change
+    // goes out in a new key snapshot.
+    let issuers = jwks::issuers_from_env(&std::env::var("LEDGER_JWT_ISSUERS").unwrap_or_default());
+    if !issuers.is_empty() {
+        log::info!("OAuth issuers: {}", issuers.join(", "));
+        let refresher = Arc::clone(&shared);
+        tokio::spawn(async move {
+            let client = jwks::client();
+            let mut tick = tokio::time::interval(jwks::REFRESH_INTERVAL);
+            loop {
+                tick.tick().await;
+                let current = refresher.jwks.lock().map(|j| j.clone()).unwrap_or_default();
+                let fresh = jwks::refresh(&client, &issuers, &current).await;
+                if fresh != current {
+                    if let Ok(mut j) = refresher.jwks.lock() {
+                        *j = fresh;
+                    }
+                    if let Err(e) = refresher.publish_keys().await {
+                        log::warn!("publishing JWKS: {e}");
+                    }
+                }
+            }
+        });
     }
 
     let listener = tokio::net::TcpListener::bind(&http_addr).await?;
@@ -490,6 +524,7 @@ mod tests {
             keys: keys_tx,
             key_version: AtomicU64::new(1),
             admin_token: Some("secret-admin".into()),
+            jwks: std::sync::Mutex::new(Vec::new()),
         });
         (router(Arc::clone(&shared)), shared)
     }
@@ -514,7 +549,7 @@ mod tests {
         let mut rx = shared.keys.subscribe();
         assert_eq!(rx.borrow_and_update().keys.len(), 0);
 
-        let (status, body) = call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"tenant":"team-a","name":"ci","allowed_models":["claude-haiku-4-5"]}"#)).await;
+        let (status, body) = call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"tenant":"team-a","name":"ci","allowed_models":["claude-haiku-4-5"],"allowed_tools":["github.*"]}"#)).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
         let key = issued["key"].as_str().unwrap().to_string();
@@ -526,6 +561,7 @@ mod tests {
         assert_eq!((snap.version, snap.keys.len()), (2, 1));
         assert_eq!(snap.keys[0].hash_sha256, keys::hash_key(&key).to_vec());
         assert_eq!(snap.keys[0].allowed_models, vec!["claude-haiku-4-5".to_string()]);
+        assert_eq!(snap.keys[0].allowed_tools, vec!["github.*".to_string()]);
 
         let (status, body) = call(&app, "GET", "/v1/keys", Some("Bearer secret-admin"), None).await;
         assert_eq!(status, StatusCode::OK);

@@ -4,6 +4,21 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.5] - 2026-09-23
+
+### Added
+
+- **MCP gateway.** `AIProvider` accepts `kind: mcp` (a Model Context Protocol server over Streamable HTTP). `AIRoute` matches gain `method` (the JSON-RPC method) and `tool` (`params.name` of a `tools/call`), read from the body like `model` and `stream`. Keys carry `allowed_tools` (exact or `prefix.*`) next to `allowed_models`; `AIUsagePolicy.budget.calls` counts requests instead of tokens (`x-portus-calls-remaining`). Sessions stay on the server pod that created them: the `Mcp-Session-Id` a client receives carries the gateway's tag for that endpoint in front of the server's id, and the tag picks the endpoint on every later request (`AIProvider.sessionAffinity`, default `header` for `mcp`; nothing shared between gateway pods, the server sees only its own id); `proxy_mcp_session_rehomed_total{provider}` counts sessions a server no longer knew. MCP refusals are JSON-RPC errors: 401 for a missing or unknown key, 200 with `-32002` (tool not allowed) or `-32003` (budget spent, with `Retry-After`) echoing the request's `id`, so clients keep their session. Usage rows for MCP carry the method and tool where LLM rows carry the model.
+- **OAuth on AI routes.** `AIRoute.auth.jwt {issuer, audience, tenantClaim, toolsClaim}` accepts bearer JWTs from one issuer in place of a Portus key. The ledger fetches each issuer's JWKS (`aiGateway.jwt.issuers`; OpenID discovery, `/keys` fallback) every five minutes and ships it in the key snapshot; the data plane verifies tokens locally and caches them by hash until they expire. Tenant and MCP tool list come from claims; the subject id is derived from `(issuer, sub)`. A request without a valid token on such a route gets a 401 with `WWW-Authenticate: Bearer resource_metadata="…"`, and the host publishes the RFC 9728 metadata (host-level and per path) with `scopes_supported` (`auth.jwt.scopes`), so claude.ai connectors and Claude Code can start the login from the gateway.
+- Usage rows and the summary carry the subject's tenant and name, so OAuth subjects (no key row) are named too.
+- An `AIProvider` whose `url` names a Service in the cluster (`name`, `name.ns.svc`, `name.ns.svc.cluster.local`) takes the Service's ready pod endpoints from the EndpointSlice watcher instead of resolving the ClusterIP, so session affinity, health checks and outlier ejection see pods.
+- Crate versions follow the chart (0.2.5).
+- `docs/ai-gateway.md`: field reference for the three AI CRDs, the key API, refusal shapes and the MCP transport handling. `deploy/examples/ai-gateway/mcp.yaml`.
+
+### Changed
+
+- The ledger's `api_keys` table gains `allowed_tools` (migrated in place on start); `AiBudget` on the wire carries `limit` and `unit` instead of `tokens`.
+
 ## [0.2.4] - 2026-09-23
 
 ### Added

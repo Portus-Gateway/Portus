@@ -39,6 +39,10 @@ message UsageRecord {
   // Why the gateway refused the request before forwarding it; empty when
   // it was forwarded. unauthenticated | model_not_allowed | budget_exhausted
   string refusal = 19;
+  // The subject's tenant and name as the data plane knew them: a key's, or
+  // an OAuth token's claims (the ledger has no key row for those).
+  string tenant = 20;
+  string subject = 21;
 }
 
 message ReportAck {
@@ -85,6 +89,14 @@ message KeySnapshot {
   // its version is higher than what it holds.
   uint64 version = 1;
   repeated KeyEntry keys = 2;
+  // OAuth issuers whose bearer tokens routes may accept, with their JWKS as
+  // the issuer published it. The data plane verifies tokens locally.
+  repeated JwksEntry issuers = 3;
+}
+
+message JwksEntry {
+  string issuer = 1;
+  string jwks_json = 2;
 }
 
 message KeyEntry {
@@ -94,4 +106,6 @@ message KeyEntry {
   string name = 4;
   // Empty: any model.
   repeated string allowed_models = 5;
+  // MCP: tools a tools/call may name, exact or "prefix.*". Empty: any.
+  repeated string allowed_tools = 6;
 }

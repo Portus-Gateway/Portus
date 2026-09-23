@@ -13,7 +13,7 @@ use rama::http::body::{Frame, SizeHint};
 use rama::http::{Body, StreamingBody};
 
 use portus_dataplane_core::ai::budget::Reservation;
-use portus_dataplane_core::ai::usage::{RefusalKind, UsageRecord, UsageRing, UsageTracker};
+use portus_dataplane_core::ai::usage::{Dialect, RefusalKind, UsageRecord, UsageRing, UsageTracker};
 use portus_dataplane_core::router::{AiBackend, BodyFields};
 
 /// What the handler knows about the request before the response body runs.
@@ -25,6 +25,9 @@ pub struct RequestSide<'a> {
     pub start: Instant,
     /// The Portus API key that authenticated the request; 0 when none.
     pub key_id: u64,
+    /// The subject's tenant and name, when known.
+    pub tenant: Option<&'a str>,
+    pub subject: Option<&'a str>,
     /// The budget reservation to settle with the response's tokens.
     pub reservation: Option<Reservation>,
 }
@@ -50,12 +53,22 @@ fn base_record(status: u16, req: &RequestSide<'_>) -> UsageRecord {
         stream,
         provider: UsageRecord::name(&req.ai.provider),
         route_host: UsageRecord::name(req.host),
-        requested_model: UsageRecord::name(field("model").unwrap_or("")),
-        served_model: UsageRecord::name(""),
+        // An MCP record carries the JSON-RPC method where an LLM record
+        // carries the model, and the tool where the served model would go.
+        requested_model: UsageRecord::name(match req.ai.dialect {
+            Dialect::Mcp => field("method").unwrap_or(""),
+            _ => field("model").unwrap_or(""),
+        }),
+        served_model: UsageRecord::name(match req.ai.dialect {
+            Dialect::Mcp => field("tool").unwrap_or(""),
+            _ => "",
+        }),
         tokens: None,
         request_bytes: req.request_bytes,
         response_bytes: 0,
         key_id: req.key_id,
+        tenant: UsageRecord::name(req.tenant.unwrap_or("")),
+        subject: UsageRecord::name(req.subject.unwrap_or("")),
         request_id: rand::random(),
         refusal: None,
     }
@@ -145,13 +158,31 @@ mod tests {
     use rama::http::body::util::{BodyExt, Full};
 
     fn side<'a>(ai: &'a AiBackend, fields: &'a BodyFields) -> RequestSide<'a> {
-        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, reservation: None }
+        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, tenant: Some("team-a"), subject: Some("ci"), reservation: None }
+    }
+
+    #[tokio::test]
+    async fn an_mcp_record_carries_the_method_and_tool_and_no_tokens() {
+        let ring = Arc::new(UsageRing::new(8));
+        let ai = AiBackend { dialect: Dialect::Mcp, provider: Arc::from("github-mcp"), key_required: false, budget: None, session_affinity: false, jwt: None };
+        let fields: BodyFields = vec![("method", "tools/call".into()), ("id", "3".into()), ("tool", "github.search".into())];
+        let side = RequestSide { ai: &ai, host: "mcp.example.com", body_fields: Some(&fields), request_bytes: 120, start: Instant::now(), key_id: 42, tenant: Some("team-mcp"), subject: Some("agent"), reservation: None };
+        let body = observe(Body::from(r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#), 200, side, Arc::clone(&ring));
+        let _ = body.collect().await.unwrap();
+        let mut out = Vec::new();
+        assert_eq!(ring.drain_into(&mut out, 10), 1);
+        let record = &out[0];
+        assert_eq!((record.dialect, record.status, record.key_id), (Dialect::Mcp, 200, 42));
+        assert_eq!((record.tenant.as_str(), record.subject.as_str()), ("team-mcp", "agent"));
+        assert_eq!((record.requested_model.as_str(), record.served_model.as_str()), ("tools/call", "github.search"));
+        assert_eq!(record.tokens, None);
+        assert!(record.response_bytes > 0);
     }
 
     #[tokio::test]
     async fn a_consumed_anthropic_response_produces_one_record_with_tokens() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None };
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("model", "claude-opus-5".into())];
         let body = Body::new(Full::new(Bytes::from_static(
             br#"{"id":"m","model":"claude-opus-5-served","usage":{"input_tokens":10,"output_tokens":4}}"#,
@@ -172,7 +203,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_stream_is_still_recorded_once() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false, budget: None };
+        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("model", "gpt-5".into()), ("stream", "true".into())];
         let body = Body::new(Full::new(Bytes::from_static(b"data: {\"model\":\"gpt-5\",\"usage\":null}\n\n")));
         let mut observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring));
@@ -188,7 +219,7 @@ mod tests {
     #[test]
     fn a_refusal_is_recorded_with_its_reason_and_no_tokens() {
         let ring = UsageRing::new(8);
-        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None };
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("model", "claude-opus-5".into())];
         record_refusal(429, RefusalKind::BudgetExhausted, side(&ai, &fields), &ring);
         let mut out = Vec::new();

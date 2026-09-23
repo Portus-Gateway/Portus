@@ -1,6 +1,6 @@
 [package]
 name = "portus-ledger"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version.workspace = true
 description = "Portus AI gateway ledger: receives usage records from data planes, stores them, exports them"
@@ -23,6 +23,8 @@ rand = "0.10"
 axum = { workspace = true }
 tokio-stream = { workspace = true }
 subtle = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots-no-provider", "json"] }
+rustls = { workspace = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
