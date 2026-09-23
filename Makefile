@@ -95,7 +95,14 @@ ifeq ($(PLATFORM),k3d)
 	  case " $$keep " in *" $$img "*) ;; *) docker exec $(K3D_NODE) crictl rmi "docker.io/$$img" >/dev/null 2>&1 && echo "removed $$img from $(K3D_NODE)";; esac; done
 endif
 	@$(DOCKER) image prune -f >/dev/null 2>&1 || true
+ifeq ($(PLATFORM),machine)
+	@# nerdctl has no `builder prune --filter`; buildctl keeps the cache mounts and drops records unused for 3 days.
+	@container machine run -n $(MACHINE) --user root -- buildctl prune --keep-duration 72h >/dev/null 2>&1 || true
+	@# Return the freed blocks to the host: the machine disk is a sparse file that only shrinks on trim.
+	@container machine run -n $(MACHINE) --user root -- fstrim / >/dev/null 2>&1 || true
+else
 	@$(DOCKER) builder prune -f --filter until=72h >/dev/null 2>&1 || true
+endif
 	@$(MAKE) --no-print-directory disk-report
 
 # ── Cluster ────────────────────────────────────────────────────────────────────
