@@ -17,9 +17,17 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 
 A fresh install carries the AI CRDs. On an existing install, `helm upgrade` does not
 touch CRDs: apply `deploy/helm/crds/aiprovider.yaml`, `airoute.yaml` and
-`aiusagepolicy.yaml` by hand, upgrade with `--reset-then-reuse-values`, and delete the
-generated `<release>-portus-gateway-grpc-tls` Secret once so it is regenerated with the
-ledger's names. The AI gateway runs on the Rama network stack, the default since 0.2.4.
+`aiusagepolicy.yaml` by hand. Pass your values with `-f` on every upgrade rather than
+`--reuse-values` or `--reset-then-reuse-values`: the reuse flags ignore new chart defaults,
+and after a failed revision they can drop values you had set (an install came up without
+its ledger that way). An install first created before 0.2.6 must also delete the generated
+`<release>-portus-gateway-grpc-tls` Secret once so it is regenerated with the ledger's
+names; from 0.2.6 the names are always in it. The AI gateway runs on the Rama network
+stack, the default since 0.2.4.
+
+If every key is refused with 401 right after enabling the AI gateway, the data planes
+have no key snapshot: their log says `cannot watch API keys at …` with the reason, and
+the most common one is that certificate.
 
 ## AIProvider
 
@@ -91,7 +99,9 @@ route; the oldest wins a conflict).
 | `budget.per` | `Key` (default), `Tenant`, `Route` | Whose counter the request spends from |
 | `onLedgerUnavailable` | `Open` (default), `Closed` | Before the first sync of a window with the ledger unreachable |
 
-Exactly one of `tokens` and `calls` is set. Each data plane keeps a counter per subject,
+Exactly one of `tokens` and `calls` is set. The gateway forwards `Accept-Encoding: identity`
+to providers on AI routes so it can read usage from the response; clients may still request
+compression, it just does not reach the provider. Each data plane keeps a counter per subject,
 reserves an estimate before forwarding (`max_tokens` plus a quarter of the request
 bytes, or one call), settles to the provider's reported usage when the response ends and
 syncs the delta with the ledger about once a second, so overrun is bounded by one sync

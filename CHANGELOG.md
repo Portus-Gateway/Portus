@@ -4,6 +4,14 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The config-stream certificate always names the ledger.** It was only added when `aiGateway.enabled` was set at first install; enabling the AI gateway later on a Secret regenerated without it left the data planes unable to reach the ledger over TLS, so no key snapshot arrived and every key was refused with a 401 that looked like a bad key. The data plane now says so in its log (once), and the ledger watcher's warning names the likely cause.
+- Docs: upgrade with values in a file, not `--reuse-values`/`--reset-then-reuse-values`; the reuse flags ignore new chart defaults and, after a failed revision, dropped `aiGateway.enabled` on a real install.
+- **Streamed provider responses were not metered when the client asked for compression.** SDKs send `Accept-Encoding: gzip`, Anthropic compresses SSE streams (small JSON replies stay plain), and the usage tracker read the raw bytes, so streamed calls were recorded with no tokens and no budget spend. AI routes now forward `Accept-Encoding: identity` to the provider; a provider that compresses anyway is recorded without tokens and logged once. Found by the first fleet on 0.2.5 (18 requests, zero tokens).
+
 ## [0.2.5] - 2026-09-23
 
 ### Added

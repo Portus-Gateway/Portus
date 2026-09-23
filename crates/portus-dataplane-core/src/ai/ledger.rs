@@ -218,7 +218,10 @@ async fn watch_keys_loop(addr: String, node: String, keys: Arc<ArcSwap<KeySet>>)
                     }
                 }
             }
-            Err(e) => log::warn!("cannot watch API keys at {addr}: {e}; retrying in {backoff:?}"),
+            Err(e) => log::warn!(
+                "cannot watch API keys at {addr}: {e}; retrying in {backoff:?}. Until a snapshot arrives every key is refused (401). \
+                 A TLS or transport error usually means the grpc-tls Secret predates the ledger: delete it once so the chart regenerates it with the ledger's names"
+            ),
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(RETRY_MAX);

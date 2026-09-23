@@ -375,7 +375,7 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
 | `grpcTls.enabled` | `true` | mTLS on the config stream. The chart generates a CA and controller certificate on first install and keeps them across upgrades; the controller copies the Secret into each Gateway's namespace |
 | `grpcTls.secretName` | `""` | Bring your own Secret (`ca.crt`, `tls.crt`, `tls.key`) instead of the generated one |
-| `aiGateway.enabled` | `false` | Deploy the ledger and enable AI routes; needs `dataplane.networkStack: rama`. On an existing install upgrade with `--reset-then-reuse-values` and delete the generated grpc-tls Secret once so it is regenerated with the ledger's names |
+| `aiGateway.enabled` | `false` | Deploy the ledger and enable AI routes (Rama stack). Upgrade with your values in a file (`-f`), not a reuse flag; installs first created before 0.2.6 delete the generated grpc-tls Secret once |
 | `aiGateway.ledger.storage.size` | `1Gi` | PersistentVolumeClaim for the ledger's SQLite file |
 | `aiGateway.ledger.adminTokenSecretName` | `""` | Bring your own admin token Secret (key `token`) for the key API |
 | `aiGateway.jwt.issuers` | `[]` | OAuth issuers whose tokens `AIRoute.auth.jwt` may accept; the ledger fetches their JWKS every 5 minutes |

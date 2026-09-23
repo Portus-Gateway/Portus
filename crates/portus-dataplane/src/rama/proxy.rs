@@ -50,6 +50,13 @@ use portus_dataplane_core::pool::endpoint_tag;
 use portus_dataplane_core::ai::ledger::LedgerReporter;
 use super::tls::{client_auth_for, upstream_tls_for};
 
+/// Set once the first compressed provider response was seen, so the warning
+/// is logged once per process.
+static UNREADABLE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once a key was refused before any ledger snapshot arrived, so the hint
+/// is logged once per process.
+static NO_SNAPSHOT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Request bodies up to this size are buffered when the route allows retries,
 /// so a failed attempt can be replayed. Larger bodies stream and get one
 /// attempt.
@@ -287,6 +294,13 @@ impl ProxyService {
                 }
                 None => Err(Refusal::Unauthenticated),
             };
+            if identity.is_err()
+                && let Some(ledger) = self.ledger.as_ref()
+                && ledger.keys.load().version == 0
+                && !NO_SNAPSHOT_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                warn!("refusing a key-requiring request: no key snapshot from the ledger has arrived yet (is the ledger reachable over gRPC?)");
+            }
             let known: Option<KeyInfo> = identity.as_ref().ok().cloned();
             let verdict = identity.and_then(|info| check_access(&info, access).map(|_| info));
             match verdict {
@@ -399,7 +413,16 @@ impl ProxyService {
         if let (Some(ai), Some(ledger)) = (plan.ai.as_ref(), self.ledger.as_ref()) {
             let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: who_name.as_deref(), reservation };
             let body = std::mem::replace(response.body_mut(), Body::empty());
-            *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring));
+            // A provider that compressed anyway cannot be metered; say so once.
+            let readable = response
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .is_none_or(|v| v.trim().eq_ignore_ascii_case("identity") || v.trim().is_empty());
+            if !readable && !UNREADABLE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!("provider {} answered with content-encoding {:?} despite accept-encoding: identity; its usage cannot be metered", ai.provider, response.headers().get("content-encoding"));
+            }
+            *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring), readable);
         }
         let host_label = plan.service_name.as_ref();
         self.metrics.request_total.with_label_values(&[host_label, status_label(status).as_str(), plan.protocol_label()]).inc();
@@ -487,6 +510,12 @@ impl ProxyService {
             headers.insert("host", v);
         }
         plan.request_headers.apply(&mut HeadersMut(&mut headers));
+        // The usage tracker reads the provider's response bytes, so the
+        // provider must not compress them: SDKs ask for gzip and Anthropic
+        // compresses SSE streams, which left streamed calls unmetered.
+        if plan.ai.is_some() {
+            headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+        }
 
         // Bodies are buffered for replay only when the route retries and the
         // body is small; otherwise the body streams once and there is no retry.

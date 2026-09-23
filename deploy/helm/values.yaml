@@ -85,10 +85,11 @@ serviceAccount:
 # in later releases, issues API keys and holds budgets). The data planes
 # report to it over the same mTLS CA as the config stream; on a fresh install
 # the generated certificate also names the ledger Service. An existing
-# install that turns this on must delete the generated grpc-tls Secret so it
-# is regenerated with the ledger's names, and upgrade with
-# --reset-then-reuse-values (plain --reuse-values ignores the new defaults
-# this block needs).
+# install first created before 0.2.6 must delete the generated grpc-tls
+# Secret once so it is regenerated with the ledger's names (from 0.2.6 the
+# names are always in it). Pass your values with -f on every upgrade rather
+# than --reuse-values: the reuse flags ignore new chart defaults, and after a
+# failed revision they can drop values you set, which turns this off again.
 aiGateway:
   enabled: false
   ledger:

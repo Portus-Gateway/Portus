@@ -75,16 +75,19 @@ fn base_record(status: u16, req: &RequestSide<'_>) -> UsageRecord {
 }
 
 /// Wrap `body` so its usage is recorded into `ring` when it completes.
-pub fn observe(body: Body, status: u16, req: RequestSide<'_>, ring: Arc<UsageRing>) -> Body {
+/// `readable` is false when the provider compressed the body: the record is
+/// still written (request, bytes, status) but carries no tokens.
+pub fn observe(body: Body, status: u16, req: RequestSide<'_>, ring: Arc<UsageRing>, readable: bool) -> Body {
     let stream = req.body_fields.and_then(|f| f.iter().find(|(k, _)| *k == "stream")).is_some_and(|(_, v)| v == "true");
     let record = base_record(status, &req);
     Body::new(Observed {
         inner: body,
-        tracker: Some(UsageTracker::new(req.ai.dialect, stream)),
+        tracker: readable.then(|| UsageTracker::new(req.ai.dialect, stream)),
         record,
         start: req.start,
         ring,
         reservation: req.reservation,
+        finished: false,
     })
 }
 
@@ -95,12 +98,16 @@ struct Observed {
     start: Instant,
     ring: Arc<UsageRing>,
     reservation: Option<Reservation>,
+    finished: bool,
 }
 
 impl Observed {
     fn finish(&mut self) {
-        let Some(tracker) = self.tracker.take() else { return };
-        let usage = tracker.finish();
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        let usage = self.tracker.take().map(UsageTracker::finish).unwrap_or_default();
         let mut record = self.record.clone();
         record.duration_micros = self.start.elapsed().as_micros() as u64;
         record.tokens = usage.tokens;
@@ -167,7 +174,7 @@ mod tests {
         let ai = AiBackend { dialect: Dialect::Mcp, provider: Arc::from("github-mcp"), key_required: false, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("method", "tools/call".into()), ("id", "3".into()), ("tool", "github.search".into())];
         let side = RequestSide { ai: &ai, host: "mcp.example.com", body_fields: Some(&fields), request_bytes: 120, start: Instant::now(), key_id: 42, tenant: Some("team-mcp"), subject: Some("agent"), reservation: None };
-        let body = observe(Body::from(r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#), 200, side, Arc::clone(&ring));
+        let body = observe(Body::from(r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#), 200, side, Arc::clone(&ring), true);
         let _ = body.collect().await.unwrap();
         let mut out = Vec::new();
         assert_eq!(ring.drain_into(&mut out, 10), 1);
@@ -180,6 +187,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_compressed_response_is_recorded_without_tokens_instead_of_being_misread() {
+        let ring = Arc::new(UsageRing::new(8));
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None };
+        let fields: BodyFields = vec![("model", "claude-opus-5".into()), ("stream", "true".into())];
+        // What a gzip body looks like to a parser: not SSE, not JSON.
+        let body = Body::new(Full::new(Bytes::from_static(b"\x1f\x8b\x08\x00garbage-that-is-not-sse")));
+        let observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring), false);
+        let bytes = observed.collect().await.unwrap().to_bytes();
+        assert_eq!(bytes.len(), 27, "the body still passes through unchanged");
+        let mut out = Vec::new();
+        assert_eq!(ring.drain_into(&mut out, 10), 1, "the request is still recorded");
+        assert_eq!((out[0].status, out[0].tokens, out[0].response_bytes), (200, None, 27));
+    }
+
+    #[tokio::test]
     async fn a_consumed_anthropic_response_produces_one_record_with_tokens() {
         let ring = Arc::new(UsageRing::new(8));
         let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None };
@@ -187,7 +209,7 @@ mod tests {
         let body = Body::new(Full::new(Bytes::from_static(
             br#"{"id":"m","model":"claude-opus-5-served","usage":{"input_tokens":10,"output_tokens":4}}"#,
         )));
-        let observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring));
+        let observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring), true);
         let bytes = observed.collect().await.unwrap().to_bytes();
         assert_eq!(bytes.len(), 87, "the body passes through unchanged");
         let mut out = Vec::new();
@@ -206,7 +228,7 @@ mod tests {
         let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("model", "gpt-5".into()), ("stream", "true".into())];
         let body = Body::new(Full::new(Bytes::from_static(b"data: {\"model\":\"gpt-5\",\"usage\":null}\n\n")));
-        let mut observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring));
+        let mut observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring), true);
         let _ = observed.frame().await;
         drop(observed);
         let mut out = Vec::new();
