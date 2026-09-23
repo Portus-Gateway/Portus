@@ -63,6 +63,9 @@ pub struct BodyNeed {
     pub max_bytes: usize,
 }
 
+/// Where a host with OAuth-protected AI routes publishes its metadata.
+pub const OAUTH_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+
 /// Top-level JSON keys an AI route can match on: the LLM ones (`model`,
 /// `stream`, `max_tokens`) and the MCP ones (`method`, `id`, `params`, the
 /// last captured so `params.name` becomes the `tool` field).
@@ -332,6 +335,18 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
             .or_else(|| lookup_domain_wildcard_bucket(host, &b.domain_wildcards))
             .or(b.catch_all.as_ref())
     });
+    // OAuth protected-resource metadata (RFC 9728): how an MCP client finds
+    // the authorization server for a host whose routes accept its tokens.
+    if facts.path == OAUTH_METADATA_PATH
+        && let Some(issuer) = host_routes.and_then(|hr| hr.oauth_issuer.as_ref())
+    {
+        let body = format!(
+            r#"{{"resource":"{scheme}://{host}","authorization_servers":[{issuer}],"bearer_methods_supported":["header"]}}"#,
+            scheme = original_scheme,
+            issuer = serde_json::to_string(issuer.as_ref()).unwrap_or_default()
+        );
+        return Plan::Respond(Reply::json(200, body));
+    }
     if facts.body_fields.is_none()
         && host_routes.is_some_and(|hr| hr.needs_body)
         && has_request_body(facts.headers)
@@ -741,7 +756,7 @@ mod tests {
         );
         let mut exact_map = HashMap::new();
         exact_map.insert(Arc::from("/v1/messages"), routes);
-        let host_routes = HostRoutes { exact_map, rules: Vec::new(), catch_all: None, needs_body };
+        let host_routes = HostRoutes { exact_map, rules: Vec::new(), catch_all: None, needs_body, oauth_issuer: None };
         let bucket = ListenerBucket {
             listener_hostname: Arc::from(""),
             exact: HashMap::from([("llm.example.com".to_string(), host_routes)]),
@@ -807,6 +822,48 @@ mod tests {
         // Arguments past the capture limit still leave method routable.
         let huge = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"big","arguments":{{"blob":"{}"}}}}}}"#, "z".repeat(crate::ai::mcp::PARAMS_CAPTURE_LIMIT + 10));
         assert_eq!(fields_of(&huge), vec![("method", "tools/call".to_string()), ("id", "1".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn a_host_with_a_jwt_route_publishes_its_oauth_metadata() {
+        let mut route = messages_route("mcp", None);
+        route.ai = Some(crate::router::AiBackend {
+            dialect: crate::ai::usage::Dialect::Mcp,
+            provider: Arc::from("tools"),
+            key_required: true,
+            budget: None,
+            session_affinity: true,
+            jwt: Some(crate::ai::jwt::JwtPolicy { issuer: Arc::from("https://dex.example.com"), audience: None, tenant_claim: Arc::from("groups"), tools_claim: Arc::from("scope") }),
+        });
+        let mut snap = snapshot_with(vec![route]);
+        // The test builder does not compute the issuer; the receiver does.
+        let bucket = snap.listeners_by_port.get_mut(&80).unwrap();
+        let hr = bucket[0].exact.get_mut("llm.example.com").unwrap();
+        hr.oauth_issuer = crate::router::oauth_issuer_of(hr.exact_map.values().flatten());
+        assert_eq!(hr.oauth_issuer.as_deref(), Some("https://dex.example.com"));
+        let headers = HeaderMap::new();
+        let mut facts = facts(&headers, None);
+        facts.path = OAUTH_METADATA_PATH;
+        facts.path_and_query = OAUTH_METADATA_PATH;
+        facts.method = "GET";
+        match plan_request(&snap, facts, metrics()).await {
+            Plan::Respond(r) => {
+                assert_eq!(r.status, 200);
+                assert_eq!(std::str::from_utf8(&r.body).unwrap(), r#"{"resource":"http://llm.example.com","authorization_servers":["https://dex.example.com"],"bearer_methods_supported":["header"]}"#);
+            }
+            Plan::Forward(_) => panic!("expected the metadata document, got a forward"),
+            Plan::NeedsBody(_) => panic!("expected the metadata document, got a body request"),
+        }
+        // A host without JWT routes answers the usual way (here: no route).
+        let plain = snapshot_with(vec![messages_route("x", None)]);
+        let mut facts = facts_for(&headers);
+        facts.path = OAUTH_METADATA_PATH;
+        facts.path_and_query = OAUTH_METADATA_PATH;
+        assert!(!matches!(plan_request(&plain, facts, metrics()).await, Plan::Respond(Reply { status: 200, .. })));
+    }
+
+    fn facts_for(headers: &HeaderMap) -> RequestFacts<'_, HeaderMap> {
+        facts(headers, None)
     }
 
     #[tokio::test]

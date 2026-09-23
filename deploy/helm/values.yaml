@@ -101,6 +101,11 @@ aiGateway:
     # Bring your own Secret (key `token`) for the key admin API; empty
     # generates one on first install.
     adminTokenSecretName: ""
+  # OAuth issuers whose bearer tokens AIRoutes may accept (AIRoute
+  # spec.auth.jwt.issuer must be one of them). The ledger fetches each
+  # issuer's JWKS every 5 minutes and pushes it to the data planes.
+  jwt:
+    issuers: []
     # Persistent volume for the SQLite ledger. Empty storageClassName uses
     # the cluster default.
     storage:

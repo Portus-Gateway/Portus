@@ -159,7 +159,7 @@ mod tests {
     #[tokio::test]
     async fn an_mcp_record_carries_the_method_and_tool_and_no_tokens() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::Mcp, provider: Arc::from("github-mcp"), key_required: false, budget: None, session_affinity: false };
+        let ai = AiBackend { dialect: Dialect::Mcp, provider: Arc::from("github-mcp"), key_required: false, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("method", "tools/call".into()), ("id", "3".into()), ("tool", "github.search".into())];
         let side = RequestSide { ai: &ai, host: "mcp.example.com", body_fields: Some(&fields), request_bytes: 120, start: Instant::now(), key_id: 42, reservation: None };
         let body = observe(Body::from(r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#), 200, side, Arc::clone(&ring));
@@ -176,7 +176,7 @@ mod tests {
     #[tokio::test]
     async fn a_consumed_anthropic_response_produces_one_record_with_tokens() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false };
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("model", "claude-opus-5".into())];
         let body = Body::new(Full::new(Bytes::from_static(
             br#"{"id":"m","model":"claude-opus-5-served","usage":{"input_tokens":10,"output_tokens":4}}"#,
@@ -197,7 +197,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_stream_is_still_recorded_once() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false, budget: None, session_affinity: false };
+        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("model", "gpt-5".into()), ("stream", "true".into())];
         let body = Body::new(Full::new(Bytes::from_static(b"data: {\"model\":\"gpt-5\",\"usage\":null}\n\n")));
         let mut observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring));
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn a_refusal_is_recorded_with_its_reason_and_no_tokens() {
         let ring = UsageRing::new(8);
-        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false };
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None };
         let fields: BodyFields = vec![("model", "claude-opus-5".into())];
         record_refusal(429, RefusalKind::BudgetExhausted, side(&ai, &fields), &ring);
         let mut out = Vec::new();

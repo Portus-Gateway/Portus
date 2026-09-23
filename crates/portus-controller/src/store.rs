@@ -562,7 +562,18 @@ pub struct AIRouteState {
     pub parent_refs: Vec<ParentRefState>,
     pub rules: Vec<AIRouteRuleState>,
     pub require_api_key: bool,
+    /// `auth.jwt`, normalised (claims defaulted).
+    pub jwt: Option<AIJwtState>,
     pub generation: i64,
+}
+
+/// An AIRoute's OAuth acceptance as the compiler needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AIJwtState {
+    pub issuer: String,
+    pub audience: Option<String>,
+    pub tenant_claim: String,
+    pub tools_claim: String,
 }
 
 /// An `AIUsagePolicy`: a token budget on an AIRoute.

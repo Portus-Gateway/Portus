@@ -27,11 +27,19 @@ pub struct KeyInfo {
     pub allowed_tools: Arc<[String]>,
 }
 
-/// Every live key, by hash. Replaced whole on each snapshot.
-#[derive(Debug, Default)]
+/// Every live key, by hash, and every OAuth issuer's public keys. Replaced
+/// whole on each snapshot.
+#[derive(Default)]
 pub struct KeySet {
     pub version: u64,
     keys: HashMap<KeyHash, KeyInfo>,
+    pub jwks: super::jwt::Jwks,
+}
+
+impl std::fmt::Debug for KeySet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeySet(v{}, {} keys, {} issuers)", self.version, self.keys.len(), self.jwks.issuer_count())
+    }
 }
 
 impl KeySet {
@@ -50,7 +58,8 @@ impl KeySet {
                 },
             );
         }
-        Self { version: snapshot.version, keys }
+        let jwks = super::jwt::Jwks::from_entries(snapshot.issuers.iter().map(|e| (e.issuer.as_str(), e.jwks_json.as_str())));
+        Self { version: snapshot.version, keys, jwks }
     }
 
     pub fn len(&self) -> usize {
@@ -151,6 +160,12 @@ pub fn authorize<'k>(
 ) -> Result<&'k KeyInfo, Refusal> {
     let presented = presented_key(headers).ok_or(Refusal::Unauthenticated)?;
     let info = keys.lookup(presented).ok_or(Refusal::Unauthenticated)?;
+    check_access(info, access)?;
+    Ok(info)
+}
+
+/// Whether a known subject may do what the request wants.
+pub fn check_access(info: &KeyInfo, access: Access<'_>) -> Result<(), Refusal> {
     match access {
         Access::Model(model) if !info.allowed_models.is_empty() => {
             let Some(m) = model else { return Err(Refusal::ModelNotAllowed) };
@@ -166,7 +181,7 @@ pub fn authorize<'k>(
         }
         Access::Model(_) | Access::ToolCall(_) | Access::Other => {}
     }
-    Ok(info)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -177,6 +192,7 @@ mod tests {
     fn snapshot() -> KeySnapshot {
         KeySnapshot {
             version: 3,
+            issuers: vec![],
             keys: vec![
                 KeyEntry { id: 1, hash_sha256: hash_key("portus_sk_any").to_vec(), tenant: "team-a".into(), name: "ci".into(), allowed_models: vec![], allowed_tools: vec![] },
                 KeyEntry {

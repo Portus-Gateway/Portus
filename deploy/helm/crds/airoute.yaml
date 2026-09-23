@@ -52,7 +52,25 @@ spec:
                     type: string
                 requireApiKey:
                   type: boolean
-                  description: "Requests must present a Portus API key (x-api-key or Authorization: Bearer) issued by the ledger"
+                  description: "Requests must present a Portus API key (x-api-key or Authorization: Bearer) issued by the ledger, or a token accepted by auth"
+                auth:
+                  type: object
+                  properties:
+                    jwt:
+                      type: object
+                      required: [issuer]
+                      description: "OAuth bearer tokens from one issuer are accepted in place of a Portus key; verified on the data plane against the issuer's JWKS (ledger: aiGateway.jwt.issuers)"
+                      properties:
+                        issuer:
+                          type: string
+                        audience:
+                          type: string
+                        tenantClaim:
+                          type: string
+                          description: "Claim naming the tenant; default groups"
+                        toolsClaim:
+                          type: string
+                          description: "Claim listing the MCP tools the subject may call; default scope"
                 rules:
                   type: array
                   items:

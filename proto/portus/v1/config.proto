@@ -170,6 +170,8 @@ message RouteConfig {
   // MCP providers: requests carrying an Mcp-Session-Id go to the endpoint
   // the session hashes to (rendezvous hashing over the ready endpoints).
   bool ai_session_affinity = 40;
+  // OAuth bearer tokens the route accepts in place of a Portus API key.
+  optional AiJwt ai_jwt = 41;
 
   // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
   // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.
@@ -246,6 +248,16 @@ message BackendEndpoint {
 // AI gateway: a token budget the data plane enforces with grants from the
 // ledger. `window` is HOURLY | DAILY | MONTHLY (fixed, UTC); `per` is
 // KEY | TENANT | ROUTE, the subject each counter belongs to.
+// An AIRoute's `auth.jwt`: tokens from `issuer` (and for `audience` when
+// set) are verified against the issuer's JWKS from the key snapshot; the
+// tenant and the MCP tool list come from the named claims.
+message AiJwt {
+  string issuer = 1;
+  string audience = 2;
+  string tenant_claim = 3;
+  string tools_claim = 4;
+}
+
 message AiBudget {
   string policy = 1;        // namespace/name of the AIUsagePolicy
   uint64 limit = 2;         // units per window

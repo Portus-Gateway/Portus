@@ -83,8 +83,36 @@ pub struct AIRouteSpec {
     /// Requests must present a Portus API key issued by the ledger.
     #[serde(rename = "requireApiKey", default)]
     pub require_api_key: bool,
+    /// Other credentials the route accepts in place of a Portus key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AIRouteAuth>,
     #[serde(default)]
     pub rules: Vec<AIRouteRule>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AIRouteAuth {
+    /// OAuth bearer tokens (JWTs) from one issuer, verified on the data
+    /// plane against the issuer's JWKS, which the ledger fetches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt: Option<AIJwtSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AIJwtSpec {
+    /// The token's `iss`, an `https://` URL the ledger is configured with
+    /// (`aiGateway.jwt.issuers`).
+    pub issuer: String,
+    /// Required `aud` when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    /// Claim naming the tenant; default `groups` (first entry of an array).
+    #[serde(rename = "tenantClaim", default, skip_serializing_if = "Option::is_none")]
+    pub tenant_claim: Option<String>,
+    /// Claim listing the MCP tools the subject may call (array or
+    /// space-separated string); default `scope`.
+    #[serde(rename = "toolsClaim", default, skip_serializing_if = "Option::is_none")]
+    pub tools_claim: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

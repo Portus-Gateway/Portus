@@ -887,6 +887,22 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
             )
         })
         .collect();
+    let jwts: HashMap<(String, String), portus_types::AiJwt> = store
+        .ai_routes
+        .iter()
+        .filter_map(|e| {
+            let j = e.value().jwt.as_ref()?;
+            Some((
+                (e.key().namespace.clone(), e.key().name.clone()),
+                portus_types::AiJwt {
+                    issuer: j.issuer.clone(),
+                    audience: j.audience.clone().unwrap_or_default(),
+                    tenant_claim: j.tenant_claim.clone(),
+                    tools_claim: j.tools_claim.clone(),
+                },
+            ))
+        })
+        .collect();
     for (route, source) in routes.iter_mut().zip(route_sources.iter()) {
         if source.kind != "AIRoute" {
             continue;
@@ -894,6 +910,9 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         let key = (source.namespace.clone(), source.name.clone());
         if key_required.contains(&key) {
             route.ai_key_required = true;
+        }
+        if let Some(j) = jwts.get(&key) {
+            route.ai_jwt = Some(j.clone());
         }
         if let Some(b) = budgets.get(&key) {
             route.ai_budget = Some(b.clone());
@@ -2372,6 +2391,7 @@ mod tests {
                     provider: NamespacedName { namespace: "default".into(), name: "anthropic".into() },
                 }],
                 require_api_key: true,
+                jwt: Some(crate::store::AIJwtState { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: "groups".into(), tools_claim: "scope".into() }),
                 generation: 1,
             },
         );
@@ -2432,6 +2452,7 @@ mod tests {
         assert_eq!(config.routes.len(), 1);
         let route = &config.routes[0];
         assert!(route.ai_key_required);
+        assert_eq!(route.ai_jwt.as_ref().map(|j| (j.issuer.as_str(), j.audience.as_str(), j.tenant_claim.as_str(), j.tools_claim.as_str())), Some(("https://dex.example.com", "", "groups", "scope")));
         assert_eq!(route.request_timeout_ms, 600_000, "TimeoutPolicy targeting the AIRoute applies");
         assert_eq!(route.rate_limit.as_ref().map(|r| (r.requests_per_second, r.per_client)), Some((5, true)), "RateLimitPolicy targeting the AIRoute applies, the HTTPRoute one does not");
         let budget = route.ai_budget.as_ref().expect("budget attached");

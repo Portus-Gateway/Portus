@@ -85,6 +85,14 @@ message KeySnapshot {
   // its version is higher than what it holds.
   uint64 version = 1;
   repeated KeyEntry keys = 2;
+  // OAuth issuers whose bearer tokens routes may accept, with their JWKS as
+  // the issuer published it. The data plane verifies tokens locally.
+  repeated JwksEntry issuers = 3;
+}
+
+message JwksEntry {
+  string issuer = 1;
+  string jwks_json = 2;
 }
 
 message KeyEntry {

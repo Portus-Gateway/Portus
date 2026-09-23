@@ -13,6 +13,7 @@
 //!   client certificates (the data planes present the config-stream cert).
 
 mod budget;
+mod jwks;
 mod keys;
 mod store;
 
@@ -111,6 +112,8 @@ struct Shared {
     keys: watch::Sender<Arc<KeySnapshot>>,
     key_version: AtomicU64,
     admin_token: Option<String>,
+    /// OAuth issuers' JWKS as last fetched, attached to every key snapshot.
+    jwks: std::sync::Mutex<Vec<portus_types::proto::portus::ledger::v1::JwksEntry>>,
 }
 
 impl Shared {
@@ -128,9 +131,10 @@ impl Shared {
     /// persisted by the store, so a restarted ledger never republishes a
     /// number a data plane has already seen.
     async fn publish_keys(&self) -> Result<(), String> {
-        let snapshot = self.run(Op::NextKeySnapshot).await?;
+        let mut snapshot = self.run(Op::NextKeySnapshot).await?;
+        snapshot.issuers = self.jwks.lock().map(|j| j.clone()).unwrap_or_default();
         self.key_version.store(snapshot.version, Ordering::Relaxed);
-        log::info!("key snapshot v{}: {} live keys", snapshot.version, snapshot.keys.len());
+        log::info!("key snapshot v{}: {} live keys, {} OAuth issuers", snapshot.version, snapshot.keys.len(), snapshot.issuers.len());
         // send_replace, not send: `send` leaves the value untouched when no
         // data plane is connected, and the next one to connect would get a
         // stale snapshot.
@@ -433,9 +437,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::thread::Builder::new().name("ledger-storage".into()).spawn(move || storage_thread(store, ops_rx))?;
     let (keys_tx, _keys_rx) = watch::channel(Arc::new(initial));
     let initial_version = keys_tx.borrow().version;
-    let shared = Arc::new(Shared { ops: ops_tx, stats: Stats::default(), keys: keys_tx, key_version: AtomicU64::new(initial_version), admin_token });
+    let shared = Arc::new(Shared { ops: ops_tx, stats: Stats::default(), keys: keys_tx, key_version: AtomicU64::new(initial_version), admin_token, jwks: std::sync::Mutex::new(Vec::new()) });
     if shared.admin_token.is_none() {
         log::warn!("LEDGER_ADMIN_TOKEN is not set; the key admin API is disabled");
+    }
+    // OAuth issuers: fetch their JWKS now and every few minutes; a change
+    // goes out in a new key snapshot.
+    let issuers = jwks::issuers_from_env(&std::env::var("LEDGER_JWT_ISSUERS").unwrap_or_default());
+    if !issuers.is_empty() {
+        log::info!("OAuth issuers: {}", issuers.join(", "));
+        let refresher = Arc::clone(&shared);
+        tokio::spawn(async move {
+            let client = jwks::client();
+            let mut tick = tokio::time::interval(jwks::REFRESH_INTERVAL);
+            loop {
+                tick.tick().await;
+                let current = refresher.jwks.lock().map(|j| j.clone()).unwrap_or_default();
+                let fresh = jwks::refresh(&client, &issuers, &current).await;
+                if fresh != current {
+                    if let Ok(mut j) = refresher.jwks.lock() {
+                        *j = fresh;
+                    }
+                    if let Err(e) = refresher.publish_keys().await {
+                        log::warn!("publishing JWKS: {e}");
+                    }
+                }
+            }
+        });
     }
 
     let listener = tokio::net::TcpListener::bind(&http_addr).await?;
@@ -494,6 +522,7 @@ mod tests {
             keys: keys_tx,
             key_version: AtomicU64::new(1),
             admin_token: Some("secret-admin".into()),
+            jwks: std::sync::Mutex::new(Vec::new()),
         });
         (router(Arc::clone(&shared)), shared)
     }

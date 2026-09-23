@@ -15,7 +15,7 @@ use super::{ReconcileContext, ReconcileError};
 use crate::ai_types::{AIRoute, AIRouteMatch, AIStringMatch};
 use crate::status;
 use crate::store::{
-    AIRouteRuleState, AIRouteState, BackendRefState, ConfigStore, HTTPRouteMatchState, NamespacedName, RouteKind,
+    AIJwtState, AIRouteRuleState, AIRouteState, BackendRefState, ConfigStore, HTTPRouteMatchState, NamespacedName, RouteKind,
 };
 
 /// Header-match name the data plane resolves from the body's `model`.
@@ -80,6 +80,28 @@ fn string_match(field: &str, m: &AIStringMatch) -> Result<(String, String), Stri
     }
 }
 
+/// `auth.jwt` normalised: an `https://` (or `http://`) issuer without a
+/// trailing slash, claim names defaulted to `groups` and `scope`.
+pub fn jwt_state(spec: &crate::ai_types::AIJwtSpec) -> Result<AIJwtState, String> {
+    let issuer = spec.issuer.trim().trim_end_matches('/');
+    if !(issuer.starts_with("https://") || issuer.starts_with("http://")) || issuer.len() < 9 {
+        return Err(format!("issuer {:?} must be an https:// URL", spec.issuer));
+    }
+    let claim = |v: &Option<String>, default: &str| -> Result<String, String> {
+        let c = v.as_deref().map(str::trim).unwrap_or(default);
+        if c.is_empty() || c.contains(|ch: char| ch.is_whitespace()) {
+            return Err(format!("claim name {c:?} is invalid"));
+        }
+        Ok(c.to_string())
+    };
+    Ok(AIJwtState {
+        issuer: issuer.to_string(),
+        audience: spec.audience.as_deref().map(str::trim).filter(|a| !a.is_empty()).map(str::to_string),
+        tenant_claim: claim(&spec.tenant_claim, "groups")?,
+        tools_claim: claim(&spec.tools_claim, "scope")?,
+    })
+}
+
 /// Build the route state and its status conditions without touching the API.
 pub fn reconcile_inner(route: &AIRoute, store: &ConfigStore) -> Result<(AIRouteState, Vec<Condition>), ReconcileError> {
     let name = route.metadata.name.as_deref().ok_or_else(|| ReconcileError::MissingField("metadata.name".into()))?;
@@ -132,6 +154,16 @@ pub fn reconcile_inner(route: &AIRoute, store: &ConfigStore) -> Result<(AIRouteS
         rules.push(AIRouteRuleState { matches, backend_refs, provider });
     }
 
+    let jwt = match route.spec.auth.as_ref().and_then(|a| a.jwt.as_ref()) {
+        Some(j) => match jwt_state(j) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                problems.push(format!("auth.jwt: {e}"));
+                None
+            }
+        },
+        None => None,
+    };
     let resolved = problems.is_empty();
     let accepted = parent_refs.iter().any(|p| p.accepted);
     let state = AIRouteState {
@@ -140,6 +172,7 @@ pub fn reconcile_inner(route: &AIRoute, store: &ConfigStore) -> Result<(AIRouteS
         parent_refs,
         rules,
         require_api_key: route.spec.require_api_key,
+        jwt,
         generation,
     };
 
@@ -269,10 +302,30 @@ mod tests {
                 parent_refs: vec![ParentReference { name: "gw".into(), ..Default::default() }],
                 hostnames: vec!["llm.example.com".into()],
                 require_api_key: false,
+                auth: None,
                 rules,
             },
             status: None,
         }
+    }
+
+    #[test]
+    fn auth_jwt_is_normalised_onto_the_route_and_bad_issuers_are_reported() {
+        use crate::ai_types::{AIJwtSpec, AIRouteAuth};
+        let store = ConfigStore::new();
+        gateway(&store);
+        provider(&store, "anthropic");
+        let mut r = route(vec![rule(None, None, &["anthropic"])]);
+        r.spec.require_api_key = true;
+        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com/".into(), audience: Some("portus".into()), tenant_claim: None, tools_claim: Some("tools".into()) }) });
+        let (state, conditions) = reconcile_inner(&r, &store).unwrap();
+        assert_eq!(conditions[1].status, "True", "{}", conditions[1].message);
+        assert_eq!(state.jwt, Some(AIJwtState { issuer: "https://dex.example.com".into(), audience: Some("portus".into()), tenant_claim: "groups".into(), tools_claim: "tools".into() }));
+        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None }) });
+        let (state, conditions) = reconcile_inner(&r, &store).unwrap();
+        assert_eq!(conditions[1].status, "False");
+        assert!(conditions[1].message.contains("auth.jwt"), "{}", conditions[1].message);
+        assert!(state.jwt.is_none());
     }
 
     fn rule(model: Option<AIStringMatch>, stream: Option<bool>, providers: &[&str]) -> AIRouteRule {

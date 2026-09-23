@@ -88,6 +88,10 @@ spec:
               value: "0.0.0.0:{{ .Values.aiGateway.ledger.httpPort }}"
             - name: LEDGER_DB_PATH
               value: /data/ledger.db
+            {{- with .Values.aiGateway.jwt.issuers }}
+            - name: LEDGER_JWT_ISSUERS
+              value: {{ join "," . | quote }}
+            {{- end }}
             - name: LEDGER_ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:

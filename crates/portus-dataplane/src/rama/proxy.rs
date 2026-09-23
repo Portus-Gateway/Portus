@@ -41,7 +41,9 @@ use super::client::{Upstream, UpstreamTarget};
 use super::usage::{observe, record_refusal, RequestSide};
 use portus_dataplane_core::ai::usage::RefusalKind;
 use portus_dataplane_core::ai::budget::{cost, exhausted_reply, now_micros, remaining_header, Scope, Verdict};
-use portus_dataplane_core::ai::keys::{authorize, Access, Refusal};
+use portus_dataplane_core::ai::keys::{authorize, check_access, presented_key, Access, KeyInfo, Refusal};
+use portus_dataplane_core::ai::jwt::looks_like_jwt;
+use portus_dataplane_core::readiness::unix_now;
 use portus_dataplane_core::ai::usage::Dialect;
 use portus_dataplane_core::ai::mcp::{split_session, tag_session};
 use portus_dataplane_core::pool::endpoint_tag;
@@ -267,26 +269,37 @@ impl ProxyService {
             _ => model,
         };
         if let Some(ai) = plan.ai.as_ref().filter(|ai| ai.key_required) {
-            let verdict = match self.ledger.as_ref() {
-                Some(ledger) => authorize(&ledger.keys.load(), &Headers(req.headers()), access).map(|k| (k.id, Arc::clone(&k.tenant))),
+            // Who is calling: a Portus key from the snapshot, or, on a route
+            // with auth.jwt, a bearer JWT verified against the issuer's keys
+            // (cached by hash once verified). Then what they may do.
+            let identity: Result<KeyInfo, Refusal> = match self.ledger.as_ref() {
+                Some(ledger) => {
+                    let keys = ledger.keys.load();
+                    let request_headers = Headers(req.headers());
+                    let bearer = presented_key(&request_headers);
+                    match (ai.jwt.as_ref(), bearer) {
+                        (Some(policy), Some(token)) if looks_like_jwt(token) => {
+                            ledger.tokens.get_or_verify(token, policy, &keys.jwks, unix_now()).ok_or(Refusal::Unauthenticated)
+                        }
+                        _ => authorize(&keys, &request_headers, Access::Other).cloned(),
+                    }
+                }
                 None => Err(Refusal::Unauthenticated),
             };
+            let known_id = identity.as_ref().map(|i| i.id).unwrap_or(0);
+            let verdict = identity.and_then(|info| check_access(&info, access).map(|_| info));
             match verdict {
-                Ok((id, t)) => {
-                    key_id = id;
-                    tenant = Some(t);
+                Ok(info) => {
+                    key_id = info.id;
+                    tenant = Some(Arc::clone(&info.tenant));
                 }
                 Err(refusal) => {
                     let reply = refusal.reply(ai.dialect, subject, request_id);
                     let status = reply.status;
                     self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                     if let Some(ledger) = self.ledger.as_ref() {
-                        // A model or tool refusal knows its key; an authentication one does not.
-                        let key_id = if refusal != Refusal::Unauthenticated {
-                            authorize(&ledger.keys.load(), &Headers(req.headers()), Access::Other).map(|k| k.id).unwrap_or(0)
-                        } else {
-                            0
-                        };
+                        // A model or tool refusal knows its subject; an authentication one does not.
+                        let key_id = known_id;
                         let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, reservation: None };
                         record_refusal(status, refusal.kind(), side, &ledger.ring);
                     }
@@ -513,7 +526,10 @@ impl ProxyService {
                 Ok(mut resp) => {
                     let status = resp.status().as_u16();
                     if pin_sessions {
-                        if status == 404
+                        // The spec says 404 for a session the server does not
+                        // know; the TypeScript SDK answers 400. Either way the
+                        // client re-initialises.
+                        if (status == 404 || status == 400)
                             && session_present
                             && let Some(ai) = plan.ai.as_ref()
                         {

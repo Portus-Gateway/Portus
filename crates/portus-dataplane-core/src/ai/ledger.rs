@@ -20,6 +20,8 @@ use super::budget::Budgets;
 use super::keys::KeySet;
 use super::usage::{UsageRecord, UsageRing};
 
+/// Verified OAuth tokens remembered per pod.
+const TOKEN_CACHE_CAPACITY: usize = 65_536;
 /// Records held per pod between drains.
 pub const RING_CAPACITY: usize = 65_536;
 /// Records per batch, and the ring depth that triggers an early drain.
@@ -50,6 +52,8 @@ pub struct LedgerReporter {
     pub keys: Arc<ArcSwap<KeySet>>,
     /// Token allowances per policy and subject, refilled by ledger grants.
     pub budgets: Arc<Budgets>,
+    /// OAuth tokens verified on this pod, until they expire.
+    pub tokens: Arc<super::jwt::TokenCache>,
 }
 
 impl LedgerReporter {
@@ -67,6 +71,7 @@ impl LedgerReporter {
             stats: Arc::new(LedgerStats::default()),
             keys: Arc::new(ArcSwap::from_pointee(KeySet::default())),
             budgets: Budgets::start(addr.clone(), node.clone()),
+            tokens: Arc::new(super::jwt::TokenCache::new(TOKEN_CACHE_CAPACITY)),
         });
         tokio::spawn(drain_loop(addr.clone(), node.clone(), Arc::clone(&reporter.ring), Arc::clone(&reporter.stats)));
         tokio::spawn(watch_keys_loop(addr, node, Arc::clone(&reporter.keys)));
@@ -199,7 +204,7 @@ async fn watch_keys_loop(addr: String, node: String, keys: Arc<ArcSwap<KeySet>>)
                             if first || snapshot.version > current.version || current.is_empty() {
                                 first = false;
                                 let set = KeySet::from_snapshot(&snapshot);
-                                log::info!("API key snapshot v{} applied: {} keys", set.version, set.len());
+                                log::info!("API key snapshot v{} applied: {} keys, {} OAuth issuers", set.version, set.len(), set.jwks.issuer_count());
                                 keys.store(Arc::new(set));
                             }
                         }

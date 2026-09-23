@@ -143,7 +143,7 @@ pub fn snapshot(conn: &Connection, version: u64) -> rusqlite::Result<KeySnapshot
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(KeySnapshot { version, keys })
+    Ok(KeySnapshot { version, keys, issuers: Vec::new() })
 }
 
 #[cfg(test)]
