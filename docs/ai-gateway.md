@@ -11,7 +11,7 @@ the request path.
 ## Install
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.6 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.7 \
   --namespace portus --create-namespace --set aiGateway.enabled=true
 ```
 
