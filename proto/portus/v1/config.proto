@@ -256,6 +256,8 @@ message AiJwt {
   string audience = 2;
   string tenant_claim = 3;
   string tools_claim = 4;
+  // Space-separated scopes clients are told to request (metadata and challenge).
+  string scopes = 5;
 }
 
 message AiBudget {

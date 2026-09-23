@@ -11,7 +11,7 @@ the request path.
 ## Install
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.4 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.5 \
   --namespace portus --create-namespace --set aiGateway.enabled=true
 ```
 
@@ -72,6 +72,7 @@ key (see [OAuth clients](#oauth-clients)).
 | `audience` | string | Required `aud` when set |
 | `tenantClaim` | claim name, default `groups` | A string claim, or the first entry of an array claim |
 | `toolsClaim` | claim name, default `scope` | The MCP tools the subject may call: an array of strings or a space-separated string |
+| `scopes` | list, default `[openid, profile, email, groups]` | What clients are told to request: `scopes_supported` in the metadata document and `scope` in the 401 challenge. Dex behind an upstream connector needs `federated:id` added when the token's `federated_claims` matter |
 
 The body is scanned as it streams for `model`, `stream`, `max_tokens`, `method`, `id`
 and `params` (`params` kept up to 64 KiB to read the tool name). Bodies over 8 MiB are
@@ -130,9 +131,14 @@ Routes with `auth.jwt` accept bearer JWTs without any call-out on the request pa
   its display name is `email`, `preferred_username` or `name` when the token has one, else
   `sub`; tenant and tool list come from `tenantClaim` and `toolsClaim`. A Portus key on the
   same route keeps working.
-- A host with such a route answers `GET /.well-known/oauth-protected-resource` (RFC 9728)
-  with the issuer as its authorization server, which is how MCP clients discover the login
-  flow.
+- The login flow starts from the gateway itself. A request without a valid token on such a
+  route gets 401 with `WWW-Authenticate: Bearer realm="portus",
+  resource_metadata="https://host/.well-known/oauth-protected-resource/<path>", scope="…"`
+  (`error="invalid_token"` when a token was presented). That document (RFC 9728) names the
+  route's resource, the issuer as its authorization server and `scopes_supported`; the
+  host-level `/.well-known/oauth-protected-resource` answers too. From there the client reads
+  the issuer's OpenID configuration and runs the authorization-code flow with PKCE. This is the
+  chain claude.ai connectors and Claude Code follow.
 
 ```yaml
 spec:

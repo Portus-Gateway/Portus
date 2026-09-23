@@ -113,6 +113,12 @@ pub struct AIJwtSpec {
     /// space-separated string); default `scope`.
     #[serde(rename = "toolsClaim", default, skip_serializing_if = "Option::is_none")]
     pub tools_claim: Option<String>,
+    /// Scopes MCP clients are told to request (protected-resource metadata
+    /// `scopes_supported` and the 401 challenge); default
+    /// `[openid, profile, email, groups]`. Dex behind an upstream connector
+    /// may need `federated:id` as well.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

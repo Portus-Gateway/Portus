@@ -26,6 +26,37 @@ pub struct JwtPolicy {
     /// Claim listing the MCP tools the subject may call: an array of
     /// strings or a space-separated string (OAuth `scope` style).
     pub tools_claim: Arc<str>,
+    /// Scopes a client should request from the issuer, space-separated:
+    /// advertised as `scopes_supported` in the protected-resource metadata
+    /// and in the 401 challenge.
+    pub scopes: Arc<str>,
+}
+
+/// The `WWW-Authenticate` value a 401 carries on a route that accepts
+/// OAuth tokens (RFC 9728 §5.1 / MCP authorization): where the metadata
+/// document for this request path lives, the scopes to ask for, and
+/// `invalid_token` when a token was presented and refused.
+pub fn challenge_header(scheme: &str, host: &str, path: &str, policy: &JwtPolicy, token_presented: bool) -> String {
+    let path = path.trim_end_matches('/');
+    let mut v = format!(r#"Bearer realm="portus", resource_metadata="{scheme}://{host}/.well-known/oauth-protected-resource{path}""#);
+    if !policy.scopes.is_empty() {
+        v.push_str(&format!(r#", scope="{}""#, policy.scopes));
+    }
+    if token_presented {
+        v.push_str(r#", error="invalid_token""#);
+    }
+    v
+}
+
+/// The protected-resource metadata document (RFC 9728) for `resource`.
+pub fn metadata_document(resource: &str, issuer: &str, scopes: &str) -> String {
+    let scopes: Vec<&str> = scopes.split_whitespace().collect();
+    format!(
+        r#"{{"resource":{},"authorization_servers":[{}],"bearer_methods_supported":["header"],"scopes_supported":{},"resource_name":"Portus"}}"#,
+        serde_json::to_string(resource).unwrap_or_default(),
+        serde_json::to_string(issuer).unwrap_or_default(),
+        serde_json::to_string(&scopes).unwrap_or_default()
+    )
 }
 
 /// One issuer's public keys.
@@ -254,7 +285,23 @@ mod tests {
             audience: aud.map(Arc::from),
             tenant_claim: Arc::from("groups"),
             tools_claim: Arc::from("scope"),
+            scopes: Arc::from("openid profile email groups"),
         }
+    }
+
+    #[test]
+    fn the_challenge_points_at_the_metadata_for_the_request_path_and_names_the_scopes() {
+        let p = policy(Some("portus"));
+        assert_eq!(
+            challenge_header("https", "mcp.example.com", "/mcp", &p, false),
+            r#"Bearer realm="portus", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp", scope="openid profile email groups""#
+        );
+        assert!(challenge_header("http", "h", "/mcp/", &p, true).ends_with(r#", error="invalid_token""#));
+        assert!(challenge_header("http", "h", "/", &p, false).contains("oauth-protected-resource\""));
+        assert_eq!(
+            metadata_document("https://mcp.example.com/mcp", "https://dex.example.com", "openid email federated:id"),
+            r#"{"resource":"https://mcp.example.com/mcp","authorization_servers":["https://dex.example.com"],"bearer_methods_supported":["header"],"scopes_supported":["openid","email","federated:id"],"resource_name":"Portus"}"#
+        );
     }
 
     #[test]
@@ -262,10 +309,11 @@ mod tests {
         let (key, jwks) = issuer_keys("k1");
         let set = Jwks::from_entries([("https://dex.example.com", jwks.as_str())]);
         assert_eq!(set.issuer_count(), 1);
-        let t = token(&key, "k1", serde_json::json!({"iss":"https://dex.example.com","sub":"alice@example.com","aud":"portus","exp":now()+600,"groups":["team-a","eng"],"scope":"echo github.*"}));
+        let expires = now() + 600;
+        let t = token(&key, "k1", serde_json::json!({"iss":"https://dex.example.com","sub":"alice@example.com","aud":"portus","exp":expires,"groups":["team-a","eng"],"scope":"echo github.*"}));
         assert!(looks_like_jwt(&t));
         let (info, exp) = verify(&t, &policy(Some("portus")), &set, now()).expect("valid");
-        assert_eq!(exp, now() + 600);
+        assert_eq!(exp, expires);
         assert_eq!((info.tenant.as_ref(), info.name.as_ref()), ("team-a", "alice@example.com"), "sub is the name when no address claim exists");
         let t2 = token(&key, "k1", serde_json::json!({"iss":"https://dex.example.com","sub":"CiQw-opaque","aud":"portus","exp":now()+600,"email":"alice@example.com"}));
         let (info2, _) = verify(&t2, &policy(Some("portus")), &set, now()).expect("valid");

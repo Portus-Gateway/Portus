@@ -596,6 +596,7 @@ pub fn build_listener_buckets_from_proto(
                             audience: Some(j.audience.as_str()).filter(|a| !a.is_empty()).map(Arc::from),
                             tenant_claim: Arc::from(j.tenant_claim.as_str()),
                             tools_claim: Arc::from(j.tools_claim.as_str()),
+                            scopes: Arc::from(j.scopes.as_str()),
                         }),
                         budget: spec.ai_budget.as_ref().and_then(|b| {
                             Some(crate::ai::budget::BudgetPolicy {
@@ -669,13 +670,13 @@ pub fn build_listener_buckets_from_proto(
             .chain(prefix_rules.iter())
             .chain(catch_all.iter())
             .any(|r| crate::router::needs_body_fields(&r.header_matches));
-        let oauth_issuer = crate::router::oauth_issuer_of(exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter()));
+        let oauth = crate::router::oauth_of(exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter()));
         let host_routes = HostRoutes {
             exact_map,
             rules: prefix_rules,
             catch_all,
             needs_body,
-            oauth_issuer,
+            oauth,
         };
 
         // Place this HostRoutes into the right bucket slot based on the

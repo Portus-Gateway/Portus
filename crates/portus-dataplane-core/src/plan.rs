@@ -337,14 +337,15 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
     });
     // OAuth protected-resource metadata (RFC 9728): how an MCP client finds
     // the authorization server for a host whose routes accept its tokens.
-    if facts.path == OAUTH_METADATA_PATH
-        && let Some(issuer) = host_routes.and_then(|hr| hr.oauth_issuer.as_ref())
+    // `/.well-known/oauth-protected-resource` describes the host,
+    // `/.well-known/oauth-protected-resource/mcp` the resource at `/mcp`,
+    // which is what the 401 challenge points a client at.
+    if let Some(suffix) = facts.path.strip_prefix(OAUTH_METADATA_PATH)
+        && (suffix.is_empty() || suffix.starts_with('/'))
+        && let Some(oauth) = host_routes.and_then(|hr| hr.oauth.as_ref())
     {
-        let body = format!(
-            r#"{{"resource":"{scheme}://{host}","authorization_servers":[{issuer}],"bearer_methods_supported":["header"]}}"#,
-            scheme = original_scheme,
-            issuer = serde_json::to_string(issuer.as_ref()).unwrap_or_default()
-        );
+        let resource = format!("{original_scheme}://{host}{}", suffix.trim_end_matches('/'));
+        let body = crate::ai::jwt::metadata_document(&resource, &oauth.issuer, &oauth.scopes);
         return Plan::Respond(Reply::json(200, body));
     }
     if facts.body_fields.is_none()
@@ -756,7 +757,7 @@ mod tests {
         );
         let mut exact_map = HashMap::new();
         exact_map.insert(Arc::from("/v1/messages"), routes);
-        let host_routes = HostRoutes { exact_map, rules: Vec::new(), catch_all: None, needs_body, oauth_issuer: None };
+        let host_routes = HostRoutes { exact_map, rules: Vec::new(), catch_all: None, needs_body, oauth: None };
         let bucket = ListenerBucket {
             listener_hostname: Arc::from(""),
             exact: HashMap::from([("llm.example.com".to_string(), host_routes)]),
@@ -833,14 +834,14 @@ mod tests {
             key_required: true,
             budget: None,
             session_affinity: true,
-            jwt: Some(crate::ai::jwt::JwtPolicy { issuer: Arc::from("https://dex.example.com"), audience: None, tenant_claim: Arc::from("groups"), tools_claim: Arc::from("scope") }),
+            jwt: Some(crate::ai::jwt::JwtPolicy { issuer: Arc::from("https://dex.example.com"), audience: None, tenant_claim: Arc::from("groups"), tools_claim: Arc::from("scope"), scopes: Arc::from("openid profile email groups") }),
         });
         let mut snap = snapshot_with(vec![route]);
         // The test builder does not compute the issuer; the receiver does.
         let bucket = snap.listeners_by_port.get_mut(&80).unwrap();
         let hr = bucket[0].exact.get_mut("llm.example.com").unwrap();
-        hr.oauth_issuer = crate::router::oauth_issuer_of(hr.exact_map.values().flatten());
-        assert_eq!(hr.oauth_issuer.as_deref(), Some("https://dex.example.com"));
+        hr.oauth = crate::router::oauth_of(hr.exact_map.values().flatten());
+        assert_eq!(hr.oauth.as_ref().map(|o| o.issuer.as_ref()), Some("https://dex.example.com"));
         let headers = HeaderMap::new();
         let mut facts = facts(&headers, None);
         facts.path = OAUTH_METADATA_PATH;
@@ -849,11 +850,24 @@ mod tests {
         match plan_request(&snap, facts, metrics()).await {
             Plan::Respond(r) => {
                 assert_eq!(r.status, 200);
-                assert_eq!(std::str::from_utf8(&r.body).unwrap(), r#"{"resource":"http://llm.example.com","authorization_servers":["https://dex.example.com"],"bearer_methods_supported":["header"]}"#);
+                assert_eq!(std::str::from_utf8(&r.body).unwrap(), r#"{"resource":"http://llm.example.com","authorization_servers":["https://dex.example.com"],"bearer_methods_supported":["header"],"scopes_supported":["openid","profile","email","groups"],"resource_name":"Portus"}"#);
             }
             Plan::Forward(_) => panic!("expected the metadata document, got a forward"),
             Plan::NeedsBody(_) => panic!("expected the metadata document, got a body request"),
         }
+        // The path-suffixed form names the resource the challenge was for.
+        let mut facts = facts_for(&headers);
+        facts.path = "/.well-known/oauth-protected-resource/mcp/";
+        facts.path_and_query = facts.path;
+        match plan_request(&snap, facts, metrics()).await {
+            Plan::Respond(r) => assert!(std::str::from_utf8(&r.body).unwrap().starts_with(r#"{"resource":"http://llm.example.com/mcp","#)),
+            _ => panic!("expected the metadata document for /mcp"),
+        }
+        // A look-alike path is not metadata.
+        let mut facts = facts_for(&headers);
+        facts.path = "/.well-known/oauth-protected-resourceX";
+        facts.path_and_query = facts.path;
+        assert!(!matches!(plan_request(&snap, facts, metrics()).await, Plan::Respond(Reply { status: 200, .. })));
         // A host without JWT routes answers the usual way (here: no route).
         let plain = snapshot_with(vec![messages_route("x", None)]);
         let mut facts = facts_for(&headers);

@@ -71,6 +71,11 @@ spec:
                         toolsClaim:
                           type: string
                           description: "Claim listing the MCP tools the subject may call; default scope"
+                        scopes:
+                          type: array
+                          items:
+                            type: string
+                          description: "Scopes MCP clients are told to request (metadata scopes_supported and the 401 challenge); default [openid, profile, email, groups]"
                 rules:
                   type: array
                   items:

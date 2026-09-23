@@ -574,6 +574,8 @@ pub struct AIJwtState {
     pub audience: Option<String>,
     pub tenant_claim: String,
     pub tools_claim: String,
+    /// Space-separated.
+    pub scopes: String,
 }
 
 /// An `AIUsagePolicy`: a token budget on an AIRoute.

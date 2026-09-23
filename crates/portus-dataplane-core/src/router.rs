@@ -328,15 +328,16 @@ pub struct HostRoutes {
     /// ([`BODY_FIELD_HEADER_PREFIX`]), so a request with a body must be
     /// scanned before it can be matched.
     pub needs_body: bool,
-    /// The OAuth issuer a route on this host accepts tokens from, served at
-    /// `/.well-known/oauth-protected-resource` so MCP clients find the login.
-    pub oauth_issuer: Option<Arc<str>>,
+    /// The OAuth policy a route on this host accepts tokens under, served
+    /// at `/.well-known/oauth-protected-resource` so MCP clients find the
+    /// login.
+    pub oauth: Option<crate::ai::jwt::JwtPolicy>,
 }
 
-/// The issuer to advertise for a set of routes: the first route with a JWT
-/// policy.
-pub fn oauth_issuer_of<'a>(routes: impl Iterator<Item = &'a PathRoute>) -> Option<Arc<str>> {
-    routes.filter_map(|r| r.ai.as_ref()).filter_map(|ai| ai.jwt.as_ref()).map(|j| Arc::clone(&j.issuer)).next()
+/// The OAuth policy to advertise for a set of routes: the first route with
+/// one.
+pub fn oauth_of<'a>(routes: impl Iterator<Item = &'a PathRoute>) -> Option<crate::ai::jwt::JwtPolicy> {
+    routes.filter_map(|r| r.ai.as_ref()).filter_map(|ai| ai.jwt.as_ref()).next().cloned()
 }
 
 /// Header-match names with this prefix are matched against fields the body
@@ -1297,7 +1298,7 @@ pub fn build_route_map(
                 rules: prefix_rules,
                 catch_all,
                 needs_body: false,
-                oauth_issuer: None,
+                oauth: None,
             },
         );
     }
@@ -1419,8 +1420,8 @@ mod tests {
         }
         let needs_body = exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter())
             .any(|r| needs_body_fields(&r.header_matches));
-        let oauth_issuer = oauth_issuer_of(exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter()));
-        HostRoutes { exact_map, rules: prefix_rules, catch_all, needs_body, oauth_issuer }
+        let oauth = oauth_of(exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter()));
+        HostRoutes { exact_map, rules: prefix_rules, catch_all, needs_body, oauth }
     }
 
     #[test]

@@ -42,7 +42,7 @@ use super::usage::{observe, record_refusal, RequestSide};
 use portus_dataplane_core::ai::usage::RefusalKind;
 use portus_dataplane_core::ai::budget::{cost, exhausted_reply, now_micros, remaining_header, Scope, Verdict};
 use portus_dataplane_core::ai::keys::{authorize, check_access, presented_key, Access, KeyInfo, Refusal};
-use portus_dataplane_core::ai::jwt::looks_like_jwt;
+use portus_dataplane_core::ai::jwt::{challenge_header, looks_like_jwt};
 use portus_dataplane_core::readiness::unix_now;
 use portus_dataplane_core::ai::usage::Dialect;
 use portus_dataplane_core::ai::mcp::{split_session, tag_session};
@@ -296,7 +296,19 @@ impl ProxyService {
                     who_name = Some(Arc::clone(&info.name));
                 }
                 Err(refusal) => {
-                    let reply = refusal.reply(ai.dialect, subject, request_id);
+                    let mut reply = refusal.reply(ai.dialect, subject, request_id);
+                    // A route that accepts OAuth tokens tells the client where
+                    // its metadata is, so the login flow can start from here.
+                    if refusal == Refusal::Unauthenticated
+                        && let Some(policy) = ai.jwt.as_ref()
+                    {
+                        let scheme = if socket_is_tls { "https" } else { "http" };
+                        let path_only = req.uri().path().map(|p| p.as_encoded_str().into_owned()).unwrap_or_else(|| "/".to_string());
+                        let presented = presented_key(&Headers(req.headers())).is_some();
+                        if let Ok(v) = http::HeaderValue::from_str(&challenge_header(scheme, host, &path_only, policy, presented)) {
+                            reply = reply.with_header(http::header::WWW_AUTHENTICATE, v);
+                        }
+                    }
                     let status = reply.status;
                     self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                     if let Some(ledger) = self.ledger.as_ref() {

@@ -899,6 +899,7 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
                     audience: j.audience.clone().unwrap_or_default(),
                     tenant_claim: j.tenant_claim.clone(),
                     tools_claim: j.tools_claim.clone(),
+                    scopes: j.scopes.clone(),
                 },
             ))
         })
@@ -2391,7 +2392,7 @@ mod tests {
                     provider: NamespacedName { namespace: "default".into(), name: "anthropic".into() },
                 }],
                 require_api_key: true,
-                jwt: Some(crate::store::AIJwtState { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: "groups".into(), tools_claim: "scope".into() }),
+                jwt: Some(crate::store::AIJwtState { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: "groups".into(), tools_claim: "scope".into(), scopes: "openid profile email groups".into() }),
                 generation: 1,
             },
         );
