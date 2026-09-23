@@ -126,9 +126,10 @@ Routes with `auth.jwt` accept bearer JWTs without any call-out on the request pa
 - The data plane verifies signature, `exp`, `iss` and `aud` against those keys (RS*, PS*,
   ES*, EdDSA), then caches the verified token by hash until it expires; a cached token costs
   the same hash lookup as a Portus key.
-- The subject is `sub`; its id, used in usage rows and per-key budgets, is derived from
-  `(issuer, sub)`; tenant and tool list come from `tenantClaim` and `toolsClaim`. A
-  Portus key on the same route keeps working.
+- The subject's id, used in usage rows and per-key budgets, is derived from `(issuer, sub)`;
+  its display name is `email`, `preferred_username` or `name` when the token has one, else
+  `sub`; tenant and tool list come from `tenantClaim` and `toolsClaim`. A Portus key on the
+  same route keeps working.
 - A host with such a route answers `GET /.well-known/oauth-protected-resource` (RFC 9728)
   with the issuer as its authorization server, which is how MCP clients discover the login
   flow.

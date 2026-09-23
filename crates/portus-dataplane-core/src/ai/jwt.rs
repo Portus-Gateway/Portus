@@ -140,10 +140,16 @@ pub fn verify(token: &str, policy: &JwtPolicy, jwks: &Jwks, now_unix_secs: u64) 
         Some(serde_json::Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
         _ => Vec::new(),
     };
+    // The name people read in the ledger: an address or username when the
+    // token has one, else the opaque subject (dex's `sub` is a protobuf).
+    let name = ["email", "preferred_username", "name"]
+        .iter()
+        .find_map(|c| claims.get(*c).and_then(|v| v.as_str()).filter(|s| !s.is_empty()))
+        .unwrap_or(sub);
     let info = KeyInfo {
         id: subject_id(&policy.issuer, sub),
         tenant: Arc::from(tenant),
-        name: Arc::from(sub),
+        name: Arc::from(name),
         allowed_models: Arc::from(Vec::new()),
         allowed_tools: Arc::from(tools),
     };
@@ -260,7 +266,11 @@ mod tests {
         assert!(looks_like_jwt(&t));
         let (info, exp) = verify(&t, &policy(Some("portus")), &set, now()).expect("valid");
         assert_eq!(exp, now() + 600);
-        assert_eq!((info.tenant.as_ref(), info.name.as_ref()), ("team-a", "alice@example.com"));
+        assert_eq!((info.tenant.as_ref(), info.name.as_ref()), ("team-a", "alice@example.com"), "sub is the name when no address claim exists");
+        let t2 = token(&key, "k1", serde_json::json!({"iss":"https://dex.example.com","sub":"CiQw-opaque","aud":"portus","exp":now()+600,"email":"alice@example.com"}));
+        let (info2, _) = verify(&t2, &policy(Some("portus")), &set, now()).expect("valid");
+        assert_eq!(info2.name.as_ref(), "alice@example.com", "the email names the subject");
+        assert_eq!(info2.id, subject_id("https://dex.example.com", "CiQw-opaque"), "the id still follows sub");
         assert_eq!(info.allowed_tools.as_ref(), &["echo".to_string(), "github.*".to_string()]);
         assert!(info.allowed_models.is_empty());
         assert_eq!(info.id, subject_id("https://dex.example.com", "alice@example.com"));
