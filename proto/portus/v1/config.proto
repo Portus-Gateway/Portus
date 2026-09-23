@@ -248,9 +248,10 @@ message BackendEndpoint {
 // KEY | TENANT | ROUTE, the subject each counter belongs to.
 message AiBudget {
   string policy = 1;        // namespace/name of the AIUsagePolicy
-  uint64 tokens = 2;
+  uint64 limit = 2;         // units per window
   string window = 3;
   string per = 4;
+  string unit = 6;          // TOKENS | CALLS ("" = TOKENS)
   // When the ledger cannot be reached and no allowance is held: let the
   // request through (true) or refuse it (false).
   bool fail_open = 5;

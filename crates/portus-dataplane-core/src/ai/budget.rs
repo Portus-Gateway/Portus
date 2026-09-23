@@ -85,12 +85,47 @@ impl Scope {
     }
 }
 
+/// What a budget counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unit {
+    /// Input + output + cache tokens the provider reports (LLM routes).
+    Tokens,
+    /// Requests that reached the server (MCP routes: JSON-RPC calls).
+    Calls,
+}
+
+impl Unit {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "TOKENS" | "" => Some(Self::Tokens),
+            "CALLS" => Some(Self::Calls),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tokens => "TOKENS",
+            Self::Calls => "CALLS",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Tokens => "token",
+            Self::Calls => "call",
+        }
+    }
+}
+
 /// An AIUsagePolicy as compiled onto a route.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetPolicy {
     /// namespace/name of the AIUsagePolicy.
     pub id: Arc<str>,
-    pub tokens: u64,
+    /// Units per window.
+    pub limit: u64,
+    pub unit: Unit,
     pub window: Window,
     pub per: Scope,
     /// With no sync yet and the ledger unreachable: allow or refuse.
@@ -120,6 +155,7 @@ pub struct Counter {
     /// subject makes before its first decision.
     settled: Notify,
     budget: AtomicU64,
+    unit: Unit,
     window: std::sync::Mutex<Window>,
 }
 
@@ -133,7 +169,8 @@ impl Counter {
             synced: AtomicBool::new(false),
             syncing: AtomicBool::new(false),
             settled: Notify::new(),
-            budget: AtomicU64::new(policy.tokens),
+            budget: AtomicU64::new(policy.limit),
+            unit: policy.unit,
             window: std::sync::Mutex::new(policy.window),
         }
     }
@@ -201,12 +238,16 @@ pub struct Reservation {
 }
 
 impl Reservation {
-    /// Replace the estimate with what the provider reported.
+    /// Replace the estimate with what the provider reported. A call budget
+    /// spends one unit per settled response whatever it carried.
     pub fn settle(&self, tokens: Option<&Tokens>) {
         if self.settled.swap(true, Ordering::Relaxed) {
             return;
         }
-        let actual = tokens.map_or(0, |t| u64::from(t.input) + u64::from(t.output) + u64::from(t.cache_read) + u64::from(t.cache_creation));
+        let actual = match self.counter.unit {
+            Unit::Tokens => tokens.map_or(0, |t| u64::from(t.input) + u64::from(t.output) + u64::from(t.cache_read) + u64::from(t.cache_creation)),
+            Unit::Calls => 1,
+        };
         let _ = self.counter.reserved.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(self.estimate)));
         self.counter.unsynced_spent.fetch_add(actual, Ordering::Relaxed);
     }
@@ -218,7 +259,8 @@ impl Reservation {
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        // A request that never produced a response cost nothing.
+        // A request that never produced a response cost no tokens; a call
+        // budget still counts it (the server was reached).
         self.settle(None);
     }
 }
@@ -253,6 +295,14 @@ pub enum Verdict {
 /// the output plus roughly one token per four request bytes for the prompt.
 pub fn estimate(max_tokens: Option<u64>, request_bytes: u64) -> u64 {
     max_tokens.unwrap_or(0) + request_bytes / 4
+}
+
+/// What to reserve for a request under `unit`.
+pub fn cost(unit: Unit, max_tokens: Option<u64>, request_bytes: u64) -> u64 {
+    match unit {
+        Unit::Tokens => estimate(max_tokens, request_bytes),
+        Unit::Calls => 1,
+    }
 }
 
 pub(crate) struct SyncAsk {
@@ -290,7 +340,7 @@ impl Budgets {
             .entry((Arc::clone(&policy.id), Arc::clone(subject)))
             .or_insert_with(|| Arc::new(Counter::new(policy)))
             .clone();
-        c.budget.store(policy.tokens, Ordering::Relaxed);
+        c.budget.store(policy.limit, Ordering::Relaxed);
         c
     }
 
@@ -312,7 +362,7 @@ impl Budgets {
         }
         counter.reserved.fetch_add(estimate, Ordering::Relaxed);
         // Sync at once when a lot has piled up since the last one.
-        if counter.unsynced_spent.load(Ordering::Relaxed) * URGENT_SYNC_SHARE > policy.tokens {
+        if counter.unsynced_spent.load(Ordering::Relaxed) * URGENT_SYNC_SHARE > policy.limit {
             self.ask(&policy.id, subject, &counter);
         }
         Verdict::Allow(Reservation { counter, estimate, settled: AtomicBool::new(false) })
@@ -343,25 +393,39 @@ impl Budgets {
     }
 }
 
-/// The 429 a spent budget answers with, in the client's dialect.
-pub fn exhausted_reply(dialect: Dialect, retry_after_secs: u64, remaining: i64, needed: u64) -> Reply {
+/// The reply a spent budget answers with, in the client's dialect: 429 for
+/// LLM clients; for MCP a JSON-RPC error on 200 echoing the request's `id`
+/// (`request_id`, JSON text), because a non-2xx inside a session makes
+/// clients drop the session. Both carry `Retry-After` and the remaining
+/// header for the unit.
+pub fn exhausted_reply(dialect: Dialect, unit: Unit, retry_after_secs: u64, remaining: i64, needed: u64, request_id: Option<&str>) -> Reply {
+    let noun = unit.noun();
     let message = if remaining <= 0 {
-        "token budget for this window is exhausted".to_string()
+        format!("{noun} budget for this window is exhausted")
     } else {
-        format!("token budget cannot cover this request: about {needed} tokens needed, {remaining} remaining in this window")
+        format!("{noun} budget cannot cover this request: about {needed} {noun}s needed, {remaining} remaining in this window")
     };
-    let body = match dialect {
-        Dialect::Anthropic => format!(r#"{{"type":"error","error":{{"type":"rate_limit_error","message":"{message}"}}}}"#),
-        Dialect::OpenAi => format!(r#"{{"error":{{"message":"{message}","type":"insufficient_quota","code":"insufficient_quota"}}}}"#),
-        Dialect::Mcp => super::mcp::error_body(None, super::mcp::CODE_BUDGET_EXHAUSTED, &message),
+    let (status, body) = match dialect {
+        Dialect::Anthropic => (429, format!(r#"{{"type":"error","error":{{"type":"rate_limit_error","message":"{message}"}}}}"#)),
+        Dialect::OpenAi => (429, format!(r#"{{"error":{{"message":"{message}","type":"insufficient_quota","code":"insufficient_quota"}}}}"#)),
+        Dialect::Mcp => (200, super::mcp::error_body(request_id, super::mcp::CODE_BUDGET_EXHAUSTED, &message)),
     };
-    Reply::json(429, body)
+    Reply::json(status, body)
         .with_header(http::header::RETRY_AFTER, http::HeaderValue::from(retry_after_secs))
-        .with_header(REMAINING_HEADER.clone(), http::HeaderValue::from(remaining.max(0)))
+        .with_header(remaining_header(unit).clone(), http::HeaderValue::from(remaining.max(0)))
 }
 
 /// Response header carrying the subject's remaining tokens in the window.
-pub static REMAINING_HEADER: http::HeaderName = http::HeaderName::from_static("x-portus-tokens-remaining");
+pub static TOKENS_REMAINING_HEADER: http::HeaderName = http::HeaderName::from_static("x-portus-tokens-remaining");
+/// Response header carrying the subject's remaining calls in the window.
+pub static CALLS_REMAINING_HEADER: http::HeaderName = http::HeaderName::from_static("x-portus-calls-remaining");
+
+pub fn remaining_header(unit: Unit) -> &'static http::HeaderName {
+    match unit {
+        Unit::Tokens => &TOKENS_REMAINING_HEADER,
+        Unit::Calls => &CALLS_REMAINING_HEADER,
+    }
+}
 
 pub fn now_micros() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
@@ -445,7 +509,45 @@ mod tests {
     const NOW: u64 = 1_789_673_548_000_000; // 2026-09-17T19:32:28Z
 
     fn policy(tokens: u64) -> BudgetPolicy {
-        BudgetPolicy { id: Arc::from("llm/hourly"), tokens, window: Window::Hourly, per: Scope::Key, fail_open: true }
+        BudgetPolicy { id: Arc::from("llm/hourly"), limit: tokens, unit: Unit::Tokens, window: Window::Hourly, per: Scope::Key, fail_open: true }
+    }
+
+    fn calls(limit: u64) -> BudgetPolicy {
+        BudgetPolicy { id: Arc::from("mcp/hourly"), limit, unit: Unit::Calls, window: Window::Hourly, per: Scope::Key, fail_open: true }
+    }
+
+    #[test]
+    fn a_call_budget_spends_one_per_request_whatever_the_response_carried() {
+        let (budgets, _asks) = Budgets::detached();
+        let p = calls(3);
+        let subject: Arc<str> = Arc::from("k1");
+        let c = budgets.counter(&p, &subject);
+        c.apply_sync(0, Window::Hourly.end_of(NOW), 0);
+        assert_eq!(cost(Unit::Calls, Some(4096), 100_000), 1);
+        assert_eq!(cost(Unit::Tokens, Some(4096), 100_000), 29_096);
+        let Verdict::Allow(r1) = budgets.check(&p, &subject, 1, NOW) else { panic!("first call allowed") };
+        r1.settle(Some(&tokens(1_000_000)));
+        let Verdict::Allow(r2) = budgets.check(&p, &subject, 1, NOW) else { panic!("second call allowed") };
+        drop(r2); // no response at all: still one call
+        let Verdict::Allow(r3) = budgets.check(&p, &subject, 1, NOW) else { panic!("third call allowed") };
+        r3.settle(None);
+        match budgets.check(&p, &subject, 1, NOW) {
+            Verdict::Exhausted { remaining, needed, .. } => assert_eq!((remaining, needed), (0, 1)),
+            other => panic!("fourth call must be refused: {other:?}"),
+        }
+        assert_eq!(c.remaining(), 0);
+    }
+
+    #[test]
+    fn an_mcp_budget_refusal_is_a_json_rpc_error_on_200_with_the_request_id() {
+        let r = exhausted_reply(Dialect::Mcp, Unit::Calls, 30, 0, 1, Some("\"req-7\""));
+        assert_eq!(r.status, 200);
+        assert_eq!(std::str::from_utf8(&r.body).unwrap(), r#"{"jsonrpc":"2.0","id":"req-7","error":{"code":-32003,"message":"call budget for this window is exhausted"}}"#);
+        assert!(r.headers.iter().any(|(n, v)| n == http::header::RETRY_AFTER && v == "30"));
+        assert!(r.headers.iter().any(|(n, v)| *n == CALLS_REMAINING_HEADER && v == "0"));
+        assert_eq!(remaining_header(Unit::Tokens).as_str(), "x-portus-tokens-remaining");
+        assert_eq!(Unit::parse("CALLS"), Some(Unit::Calls));
+        assert_eq!(Unit::parse(""), Some(Unit::Tokens), "routes compiled before units existed are token budgets");
     }
 
     fn tokens(n: u32) -> Tokens {
@@ -574,13 +676,13 @@ mod tests {
 
     #[test]
     fn the_429_names_the_reset_and_the_remaining_tokens() {
-        let r = exhausted_reply(Dialect::Anthropic, 90, 12, 500);
+        let r = exhausted_reply(Dialect::Anthropic, Unit::Tokens, 90, 12, 500, None);
         assert_eq!(r.status, 429);
         assert!(r.headers.iter().any(|(n, v)| n == http::header::RETRY_AFTER && v == "90"));
-        assert!(r.headers.iter().any(|(n, v)| *n == REMAINING_HEADER && v == "12"));
+        assert!(r.headers.iter().any(|(n, v)| *n == TOKENS_REMAINING_HEADER && v == "12"));
         assert!(std::str::from_utf8(&r.body).unwrap().contains("rate_limit_error"));
         assert!(std::str::from_utf8(&r.body).unwrap().contains("about 500 tokens needed, 12 remaining"));
         assert!(r.headers.iter().any(|(n, v)| n == http::header::CONTENT_LENGTH && v == r.body.len().to_string().as_str()));
-        assert!(std::str::from_utf8(&exhausted_reply(Dialect::OpenAi, 1, -5, 10).body).unwrap().contains("is exhausted"));
+        assert!(std::str::from_utf8(&exhausted_reply(Dialect::OpenAi, Unit::Tokens, 1, -5, 10, None).body).unwrap().contains("is exhausted"));
     }
 }

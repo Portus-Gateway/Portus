@@ -57,7 +57,7 @@ enum Op {
     Export { since: u64, limit: usize, done: Done<Vec<store::Row>> },
     Summary { since: u64, done: Done<Vec<store::KeySummary>> },
     Count(Done<u64>),
-    IssueKey { tenant: String, name: String, models: Vec<String>, plaintext: Option<String>, done: Done<(KeyRow, String)> },
+    IssueKey { tenant: String, name: String, models: Vec<String>, tools: Vec<String>, plaintext: Option<String>, done: Done<(KeyRow, String)> },
     RevokeKey { id: u64, done: Done<bool> },
     ListKeys(Done<Vec<KeyRow>>),
     /// Advance the persisted version and build the snapshot at it.
@@ -81,8 +81,8 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
             Op::Count(done) => {
                 let _ = done.send(store.count());
             }
-            Op::IssueKey { tenant, name, models, plaintext, done } => {
-                let _ = done.send(store.issue_key(&tenant, &name, &models, plaintext.as_deref()));
+            Op::IssueKey { tenant, name, models, tools, plaintext, done } => {
+                let _ = done.send(store.issue_key(&tenant, &name, &models, &tools, plaintext.as_deref()));
             }
             Op::RevokeKey { id, done } => {
                 let _ = done.send(store.revoke_key(id));
@@ -227,6 +227,9 @@ struct IssueKeyRequest {
     name: String,
     #[serde(default)]
     allowed_models: Vec<String>,
+    /// MCP tools the key may call (`tools/call` names, exact or `prefix.*`).
+    #[serde(default)]
+    allowed_tools: Vec<String>,
     /// An externally issued key to accept as-is; omitted to generate one.
     #[serde(default)]
     key: Option<String>,
@@ -340,6 +343,7 @@ async fn issue_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Json(r
             tenant: req.tenant.trim().to_string(),
             name: req.name.trim().to_string(),
             models: req.allowed_models.clone(),
+            tools: req.allowed_tools.clone(),
             plaintext: req.key.as_deref().map(str::trim).map(str::to_string),
             done,
         })
@@ -514,7 +518,7 @@ mod tests {
         let mut rx = shared.keys.subscribe();
         assert_eq!(rx.borrow_and_update().keys.len(), 0);
 
-        let (status, body) = call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"tenant":"team-a","name":"ci","allowed_models":["claude-haiku-4-5"]}"#)).await;
+        let (status, body) = call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"tenant":"team-a","name":"ci","allowed_models":["claude-haiku-4-5"],"allowed_tools":["github.*"]}"#)).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let issued: serde_json::Value = serde_json::from_str(&body).unwrap();
         let key = issued["key"].as_str().unwrap().to_string();
@@ -526,6 +530,7 @@ mod tests {
         assert_eq!((snap.version, snap.keys.len()), (2, 1));
         assert_eq!(snap.keys[0].hash_sha256, keys::hash_key(&key).to_vec());
         assert_eq!(snap.keys[0].allowed_models, vec!["claude-haiku-4-5".to_string()]);
+        assert_eq!(snap.keys[0].allowed_tools, vec!["github.*".to_string()]);
 
         let (status, body) = call(&app, "GET", "/v1/keys", Some("Bearer secret-admin"), None).await;
         assert_eq!(status, StatusCode::OK);

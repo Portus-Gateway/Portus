@@ -118,6 +118,13 @@ impl Store {
             conn.execute_batch("ALTER TABLE usage ADD COLUMN refusal TEXT NOT NULL DEFAULT ''")?;
         }
         conn.execute_batch(keys::SCHEMA)?;
+        // Ledgers created before MCP lack the tool list on keys.
+        let has_tools: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('api_keys') WHERE name = 'allowed_tools'")?
+            .exists([])?;
+        if !has_tools {
+            conn.execute_batch("ALTER TABLE api_keys ADD COLUMN allowed_tools TEXT NOT NULL DEFAULT ''")?;
+        }
         conn.execute_batch(budget::SCHEMA)?;
         Ok(Self { conn })
     }
@@ -149,8 +156,8 @@ impl Store {
         Ok(next)
     }
 
-    pub fn issue_key(&self, tenant: &str, name: &str, models: &[String], plaintext: Option<&str>) -> rusqlite::Result<(KeyRow, String)> {
-        keys::issue(&self.conn, tenant, name, models, plaintext)
+    pub fn issue_key(&self, tenant: &str, name: &str, models: &[String], tools: &[String], plaintext: Option<&str>) -> rusqlite::Result<(KeyRow, String)> {
+        keys::issue(&self.conn, tenant, name, models, tools, plaintext)
     }
 
     pub fn revoke_key(&self, id: u64) -> rusqlite::Result<bool> {
@@ -319,7 +326,7 @@ mod tests {
     #[test]
     fn the_summary_totals_per_key_and_counts_refusals_separately() {
         let mut store = Store::in_memory().unwrap();
-        let (row, _) = store.issue_key("team-a", "ci", &[], None).unwrap();
+        let (row, _) = store.issue_key("team-a", "ci", &[], &[], None).unwrap();
         let mut ok1 = record(10, "claude-opus-5", Some((100, 20)));
         ok1.key_id = row.id;
         let mut ok2 = record(20, "claude-opus-5", Some((50, 5)));

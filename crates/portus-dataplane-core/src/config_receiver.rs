@@ -594,7 +594,8 @@ pub fn build_listener_buckets_from_proto(
                         budget: spec.ai_budget.as_ref().and_then(|b| {
                             Some(crate::ai::budget::BudgetPolicy {
                                 id: Arc::from(b.policy.as_str()),
-                                tokens: b.tokens,
+                                limit: b.limit,
+                                unit: crate::ai::budget::Unit::parse(&b.unit)?,
                                 window: crate::ai::budget::Window::parse(&b.window)?,
                                 per: crate::ai::budget::Scope::parse(&b.per)?,
                                 fail_open: b.fail_open,

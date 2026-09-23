@@ -40,8 +40,9 @@ use super::body::scan_body;
 use super::client::{Upstream, UpstreamTarget};
 use super::usage::{observe, record_refusal, RequestSide};
 use portus_dataplane_core::ai::usage::RefusalKind;
-use portus_dataplane_core::ai::budget::{estimate, exhausted_reply, now_micros, Scope, Verdict, REMAINING_HEADER};
-use portus_dataplane_core::ai::keys::{authorize, Refusal};
+use portus_dataplane_core::ai::budget::{cost, exhausted_reply, now_micros, remaining_header, Scope, Verdict};
+use portus_dataplane_core::ai::keys::{authorize, Access, Refusal};
+use portus_dataplane_core::ai::usage::Dialect;
 use portus_dataplane_core::ai::ledger::LedgerReporter;
 use super::tls::{client_auth_for, upstream_tls_for};
 
@@ -248,10 +249,24 @@ impl ProxyService {
         // route's mutations set the provider's own.
         let mut key_id = 0;
         let mut tenant: Option<Arc<str>> = None;
-        let model = body_fields.as_ref().and_then(|f| f.iter().find(|(k, _)| *k == "model")).map(|(_, v)| v.as_str());
+        let field = |key: &str| body_fields.as_ref().and_then(|f| f.iter().find(|(k, _)| *k == key)).map(|(_, v)| v.as_str());
+        let model = field("model");
+        // The JSON-RPC id, as JSON text, for MCP refusals to echo.
+        let request_id = field("id");
+        // What the key's allow lists judge: the model for LLM requests, the
+        // tool for an MCP tools/call, nothing else for the rest of MCP.
+        let access = match plan.ai.as_ref().map(|ai| ai.dialect) {
+            Some(Dialect::Mcp) if field("method") == Some("tools/call") => Access::ToolCall(field("tool")),
+            Some(Dialect::Mcp) => Access::Other,
+            _ => Access::Model(model),
+        };
+        let subject = match access {
+            Access::ToolCall(t) => t,
+            _ => model,
+        };
         if let Some(ai) = plan.ai.as_ref().filter(|ai| ai.key_required) {
             let verdict = match self.ledger.as_ref() {
-                Some(ledger) => authorize(&ledger.keys.load(), &Headers(req.headers()), model).map(|k| (k.id, Arc::clone(&k.tenant))),
+                Some(ledger) => authorize(&ledger.keys.load(), &Headers(req.headers()), access).map(|k| (k.id, Arc::clone(&k.tenant))),
                 None => Err(Refusal::Unauthenticated),
             };
             match verdict {
@@ -260,13 +275,13 @@ impl ProxyService {
                     tenant = Some(t);
                 }
                 Err(refusal) => {
-                    let reply = refusal.reply(ai.dialect, model);
+                    let reply = refusal.reply(ai.dialect, subject, request_id);
                     let status = reply.status;
                     self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                     if let Some(ledger) = self.ledger.as_ref() {
-                        // A model refusal knows its key; an authentication one does not.
-                        let key_id = if refusal == Refusal::ModelNotAllowed {
-                            authorize(&ledger.keys.load(), &Headers(req.headers()), None).map(|k| k.id).unwrap_or(0)
+                        // A model or tool refusal knows its key; an authentication one does not.
+                        let key_id = if refusal != Refusal::Unauthenticated {
+                            authorize(&ledger.keys.load(), &Headers(req.headers()), Access::Other).map(|k| k.id).unwrap_or(0)
                         } else {
                             0
                         };
@@ -286,7 +301,7 @@ impl ProxyService {
         // (one atomic), settle to the real count when the response ends. The
         // counter syncs with the ledger in the background.
         let mut reservation = None;
-        let mut remaining_header: Option<i64> = None;
+        let mut remaining_after: Option<i64> = None;
         if let (Some(ai), Some(budget)) = (plan.ai.as_ref(), plan.ai.as_ref().and_then(|ai| ai.budget.as_ref())) {
             let subject: Arc<str> = match budget.per {
                 Scope::Key if key_id != 0 => Arc::from(key_id.to_string()),
@@ -294,11 +309,8 @@ impl ProxyService {
                 Scope::Tenant => tenant.clone().unwrap_or_else(|| Arc::from("anonymous")),
                 Scope::Route => Arc::from("route"),
             };
-            let max_tokens = body_fields
-                .as_ref()
-                .and_then(|f| f.iter().find(|(k, _)| *k == "max_tokens"))
-                .and_then(|(_, v)| v.parse::<u64>().ok());
-            let cost = estimate(max_tokens, request_bytes);
+            let max_tokens = field("max_tokens").and_then(|v| v.parse::<u64>().ok());
+            let cost = cost(budget.unit, max_tokens, request_bytes);
             let verdict = match self.ledger.as_ref() {
                 Some(ledger) => {
                     let mut v = ledger.budgets.check(budget, &subject, cost, now_micros());
@@ -315,7 +327,7 @@ impl ProxyService {
             };
             let refuse = match verdict {
                 Verdict::Allow(r) => {
-                    remaining_header = Some(r.remaining());
+                    remaining_after = Some(r.remaining());
                     reservation = Some(r);
                     None
                 }
@@ -324,7 +336,7 @@ impl ProxyService {
                 Verdict::Unknown => Some((1, 0, cost)),
             };
             if let Some((retry, remaining, needed)) = refuse {
-                let reply = exhausted_reply(ai.dialect, retry, remaining, needed);
+                let reply = exhausted_reply(ai.dialect, budget.unit, retry, remaining, needed, request_id);
                 let status = reply.status;
                 self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                 if let Some(ledger) = self.ledger.as_ref() {
@@ -340,8 +352,8 @@ impl ProxyService {
         let mut response = self.forward(req, &plan, peer_ip, authority).await;
 
         let status = response.status().as_u16();
-        if let Some(remaining) = remaining_header
-            && let Some(n) = rama_name(&REMAINING_HEADER)
+        if let (Some(remaining), Some(budget)) = (remaining_after, plan.ai.as_ref().and_then(|ai| ai.budget.as_ref()))
+            && let Some(n) = rama_name(remaining_header(budget.unit))
         {
             response.headers_mut().insert(n, HeaderValue::from(remaining.max(0)));
         }

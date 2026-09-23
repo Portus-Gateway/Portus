@@ -569,7 +569,10 @@ pub struct AIRouteState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AIUsagePolicyState {
     pub target: PolicyTargetKey,
-    pub tokens: u64,
+    /// Units per window.
+    pub limit: u64,
+    /// TOKENS | CALLS
+    pub unit: String,
     /// HOURLY | DAILY | MONTHLY
     pub window: String,
     /// KEY | TENANT | ROUTE

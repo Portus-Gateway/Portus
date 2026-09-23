@@ -94,4 +94,6 @@ message KeyEntry {
   string name = 4;
   // Empty: any model.
   repeated string allowed_models = 5;
+  // MCP: tools a tools/call may name, exact or "prefix.*". Empty: any.
+  repeated string allowed_tools = 6;
 }

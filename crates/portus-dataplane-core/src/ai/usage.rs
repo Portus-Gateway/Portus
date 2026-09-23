@@ -322,6 +322,8 @@ pub struct UsageRecord {
 pub enum RefusalKind {
     Unauthenticated,
     ModelNotAllowed,
+    /// MCP: a known key that may not call this tool.
+    ToolNotAllowed,
     BudgetExhausted,
 }
 
@@ -330,6 +332,7 @@ impl RefusalKind {
         match self {
             Self::Unauthenticated => "unauthenticated",
             Self::ModelNotAllowed => "model_not_allowed",
+            Self::ToolNotAllowed => "tool_not_allowed",
             Self::BudgetExhausted => "budget_exhausted",
         }
     }

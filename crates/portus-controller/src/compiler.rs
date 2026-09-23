@@ -878,7 +878,8 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
                 (p.target.namespace.clone(), p.target.name.clone()),
                 portus_types::AiBudget {
                     policy: format!("{}/{}", e.key().namespace, e.key().name),
-                    tokens: p.tokens,
+                    limit: p.limit,
+                    unit: p.unit.clone(),
                     window: p.window.clone(),
                     per: p.per.clone(),
                     fail_open: p.fail_open,
@@ -2379,7 +2380,8 @@ mod tests {
             NamespacedName { namespace: "default".into(), name: "cap".into() },
             crate::store::AIUsagePolicyState {
                 target: crate::store::PolicyTargetKey { group: "portus-gateway.dev".into(), kind: "AIRoute".into(), namespace: "default".into(), name: "claude".into(), section_name: None },
-                tokens: 1_000_000,
+                limit: 1_000_000,
+                unit: "TOKENS".into(),
                 window: "DAILY".into(),
                 per: "KEY".into(),
                 fail_open: false,
@@ -2433,7 +2435,7 @@ mod tests {
         assert_eq!(route.request_timeout_ms, 600_000, "TimeoutPolicy targeting the AIRoute applies");
         assert_eq!(route.rate_limit.as_ref().map(|r| (r.requests_per_second, r.per_client)), Some((5, true)), "RateLimitPolicy targeting the AIRoute applies, the HTTPRoute one does not");
         let budget = route.ai_budget.as_ref().expect("budget attached");
-        assert_eq!((budget.policy.as_str(), budget.tokens, budget.window.as_str(), budget.per.as_str(), budget.fail_open), ("default/cap", 1_000_000, "DAILY", "KEY", false));
+        assert_eq!((budget.policy.as_str(), budget.limit, budget.unit.as_str(), budget.window.as_str(), budget.per.as_str(), budget.fail_open), ("default/cap", 1_000_000, "TOKENS", "DAILY", "KEY", false));
         assert_eq!(route.host, "llm.example.com");
         assert_eq!(route.service_name, "aiprovider/default/anthropic");
         assert_eq!(route.port, 443);

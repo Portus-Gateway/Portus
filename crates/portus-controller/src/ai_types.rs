@@ -161,7 +161,12 @@ pub struct AIUsagePolicySpec {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AIBudgetSpec {
     /// Tokens (input + output + cache read + cache creation) per window.
-    pub tokens: u64,
+    /// Exactly one of `tokens` and `calls` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+    /// Requests that reached the server per window (MCP routes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<u64>,
     /// `Hourly`, `Daily` or `Monthly`, fixed windows in UTC.
     pub window: String,
     /// Whose counter: `Key` (default), `Tenant` or `Route`.
