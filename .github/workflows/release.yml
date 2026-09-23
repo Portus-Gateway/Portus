@@ -2,6 +2,7 @@
 #
 #   ghcr.io/portus-gateway/controller:X.Y.Z (+ latest)   linux/amd64, linux/arm64
 #   ghcr.io/portus-gateway/dataplane:X.Y.Z  (+ latest)   linux/amd64, linux/arm64
+#   ghcr.io/portus-gateway/ledger:X.Y.Z     (+ latest)   linux/amd64, linux/arm64
 #   oci://ghcr.io/portus-gateway/charts/portus-gateway   version X.Y.Z
 #
 # Each architecture builds natively on its own runner (no QEMU) and pushes by
@@ -31,7 +32,7 @@ jobs:
       # native runner. (An include that itself introduced `arch` let the
       # second entry overwrite the first, and v0.2.0's first run built arm64 only.)
       matrix:
-        component: [controller, dataplane]
+        component: [controller, dataplane, ledger]
         arch: [amd64, arm64]
         include:
           - arch: amd64
@@ -75,7 +76,7 @@ jobs:
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        component: [controller, dataplane]
+        component: [controller, dataplane, ledger]
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -145,7 +146,7 @@ jobs:
             --namespace portus --create-namespace
           \`\`\`
 
-          Images: \`$IMAGE_NS/controller:$VERSION\`, \`$IMAGE_NS/dataplane:$VERSION\` (linux/amd64, linux/arm64).
+          Images: \`$IMAGE_NS/controller:$VERSION\`, \`$IMAGE_NS/dataplane:$VERSION\`, \`$IMAGE_NS/ledger:$VERSION\` (linux/amd64, linux/arm64).
 
           See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/$GITHUB_REF_NAME/CHANGELOG.md) for what changed.
           NOTES

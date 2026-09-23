@@ -85,7 +85,7 @@ kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
 # Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.3 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.4 \
   --namespace portus --create-namespace
 ```
 
@@ -172,12 +172,12 @@ Everything the data plane decides — routing, policies, TLS material, endpoint 
 
 | Stack | Status | Select with |
 |---|---|---|
-| [Pingora](https://github.com/cloudflare/pingora) 0.9 | The release stack; every published image and every number above | `dataplane.networkStack: pingora` (default) |
-| [Rama](https://github.com/plabayo/rama) 0.4 | Experimental. Passes the full conformance suite (130/130). Not in release images: build with `DATAPLANE_FEATURES=rama make build-dataplane` | `dataplane.networkStack: rama` |
+| [Rama](https://github.com/plabayo/rama) 0.4 | The release stack since 0.2.4: default in every published image, conformance 130/130, the AI gateway runs on it | `dataplane.networkStack: rama` (default) |
+| [Pingora](https://github.com/cloudflare/pingora) 0.9 | The stack behind every release up to 0.2.3 and every number in the tables above; still in the release image | `dataplane.networkStack: pingora` |
 
-Rama is there to be compared with Pingora on the same core, benchmarks and conformance suite; a value the image was not built with fails the pod at start with a log line naming it.
+Both stacks share the core, benchmarks and conformance suite; a value the image was not built with fails the pod at start with a log line naming it.
 
-Rama numbers from one round on the same 10 vCPU machine as the tables above, Pingora then Rama on the same 3 pods × 2 CPU (fortio, 10 s per rung, all requests 200). Rama ran with other load on the box (load average 7.4 against 2.7 for the Pingora pass), so its numbers are if anything understated; a single round still means differences under 5 % are noise.
+Rama against Pingora, one round on the same 10 vCPU machine as the tables above, Pingora then Rama on the same 3 pods × 2 CPU (fortio, 10 s per rung, all requests 200). Rama ran with other load on the box (load average 7.4 against 2.7 for the Pingora pass), so its numbers are if anything understated; a single round still means differences under 5 % are noise.
 
 | Ladder | Rung | Pingora | Rama | Δ |
 |---|---|---|---|---|
@@ -234,7 +234,7 @@ The ledger issues and revokes keys (`POST`/`GET`/`DELETE /v1/keys`, bearer token
 ### Helm Values
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.3 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.4 \
   --namespace portus --create-namespace \
   --set dataplane.replicasPerGateway=3
 ```

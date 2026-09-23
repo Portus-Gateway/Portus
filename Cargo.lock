@@ -5082,7 +5082,7 @@ dependencies = [
 
 [[package]]
 name = "portus-controller"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "criterion 0.5.1",
  "dashmap 6.2.1",
@@ -5110,7 +5110,7 @@ dependencies = [
 
 [[package]]
 name = "portus-dataplane"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -5141,7 +5141,7 @@ dependencies = [
 
 [[package]]
 name = "portus-dataplane-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -5178,7 +5178,7 @@ dependencies = [
 
 [[package]]
 name = "portus-ledger"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "axum",
  "env_logger",
@@ -5198,7 +5198,7 @@ dependencies = [
 
 [[package]]
 name = "portus-types"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "prost",
  "prost-types",
