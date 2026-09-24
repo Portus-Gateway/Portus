@@ -17,7 +17,13 @@ Two things the stock setup lacks, and how this fills them:
    24.04 image with systemd as PID 1, k3s as a service (traefik and servicelb
    off), and nerdctl + buildkitd pointed at k3s's containerd in the `k8s.io`
    namespace, so `docker build` inside the machine produces images the
-   cluster can run without an import step.
+   cluster can run without an import step. `buildkitd.toml` caps the build
+   cache at 20 GB (buildkitd's own GC); the machine's disk is a sparse file
+   on the host that only grows, and it reached 87 GB in a week of dev builds
+   before the cap. `make disk-prune PLATFORM=machine` applies the same cap
+   by hand and trims the file back (`fstrim`). A machine created before the
+   cap gets it with:
+   `container machine run -n portus -w $PWD --user root -- sh -c 'mkdir -p /etc/buildkit && cp deploy/machine/buildkitd.toml /etc/buildkit/ && systemctl restart buildkitd'`.
 
 ## One-time setup
 

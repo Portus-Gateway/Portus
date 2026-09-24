@@ -27,6 +27,7 @@ RUN curl -sfL https://github.com/containerd/nerdctl/releases/download/v${NERDCTL
       | tar -xz -C /tmp && install -m755 /tmp/bin/nerdctl /tmp/bin/buildkitd /tmp/bin/buildctl /usr/local/bin/ \
     && ln -s /usr/local/bin/nerdctl /usr/local/bin/docker && rm -rf /tmp/bin /tmp/lib /tmp/libexec /tmp/share
 COPY buildkitd.service /etc/systemd/system/buildkitd.service
+COPY buildkitd.toml /etc/buildkit/buildkitd.toml
 COPY k3s-node-identity.conf /etc/systemd/system/k3s.service.d/node-identity.conf
 COPY 10-node.netdev 10-node.network /etc/systemd/network/
 RUN systemctl enable systemd-networkd.service

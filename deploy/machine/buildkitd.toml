@@ -1,0 +1,9 @@
+# BuildKit garbage collection: the build cache lives in k3s's containerd on the
+# machine's sparse disk, which only grows on the host. Without a cap one week of
+# dev image builds took it past 80 GB. 20 GB keeps the cargo cache mounts of a
+# warm build; older records go first.
+[worker.containerd]
+  enabled = true
+  gc = true
+  gckeepstorage = 20000
+  namespace = "k8s.io"
