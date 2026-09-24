@@ -172,6 +172,8 @@ message RouteConfig {
   bool ai_session_affinity = 40;
   // OAuth bearer tokens the route accepts in place of a Portus API key.
   optional AiJwt ai_jwt = 41;
+  // A trusted caller may name the user it acts for.
+  optional AiOnBehalfOf ai_on_behalf_of = 42;
 
   // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
   // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.
@@ -251,6 +253,14 @@ message BackendEndpoint {
 // An AIRoute's `auth.jwt`: tokens from `issuer` (and for `audience` when
 // set) are verified against the issuer's JWKS from the key snapshot; the
 // tenant and the MCP tool list come from the named claims.
+// auth.onBehalfOf: a trusted caller (a hub, an orchestrator) names the
+// user it acts for in `header`; the gateway records that user as the
+// subject and can budget per subject. Only keys named in trusted_keys are
+// believed; from anyone else the header is dropped.
+message AiOnBehalfOf {
+  string header = 1;
+  repeated string trusted_keys = 2;
+}
 message AiJwt {
   string issuer = 1;
   string audience = 2;

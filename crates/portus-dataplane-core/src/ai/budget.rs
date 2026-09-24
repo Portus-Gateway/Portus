@@ -72,6 +72,9 @@ pub enum Scope {
     Key,
     Tenant,
     Route,
+    /// The user behind the call: the `auth.onBehalfOf` name when a trusted
+    /// caller gave one, else the key (or OAuth subject) itself.
+    Subject,
 }
 
 impl Scope {
@@ -80,6 +83,7 @@ impl Scope {
             "KEY" => Some(Self::Key),
             "TENANT" => Some(Self::Tenant),
             "ROUTE" => Some(Self::Route),
+            "SUBJECT" => Some(Self::Subject),
             _ => None,
         }
     }

@@ -28,6 +28,14 @@ pub struct RequestSide<'a> {
     /// The subject's tenant and name, when known.
     pub tenant: Option<&'a str>,
     pub subject: Option<&'a str>,
+    /// The user a trusted caller acted for (`auth.onBehalfOf`).
+    pub on_behalf_of: Option<&'a str>,
+    /// The gateway's id for this request, echoed to the client.
+    pub request_id: u64,
+    /// The client's own `x-portus-request-id`, when it sent one.
+    pub client_request_id: Option<&'a str>,
+    /// What refused the request (a policy id, `key`, `jwt`); None when forwarded.
+    pub rule: Option<&'a str>,
     /// The budget reservation to settle with the response's tokens.
     pub reservation: Option<Reservation>,
 }
@@ -69,8 +77,12 @@ fn base_record(status: u16, req: &RequestSide<'_>) -> UsageRecord {
         key_id: req.key_id,
         tenant: UsageRecord::name(req.tenant.unwrap_or("")),
         subject: UsageRecord::name(req.subject.unwrap_or("")),
-        request_id: rand::random(),
+        request_id: req.request_id,
         refusal: None,
+        rule: UsageRecord::name(req.rule.unwrap_or("")),
+        client_request_id: UsageRecord::name(req.client_request_id.unwrap_or("")),
+        first_byte_micros: 0,
+        on_behalf_of: UsageRecord::name(req.on_behalf_of.unwrap_or("")),
     }
 }
 
@@ -130,6 +142,9 @@ impl StreamingBody for Observed {
         match &polled {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
+                    if self.record.first_byte_micros == 0 {
+                        self.record.first_byte_micros = self.start.elapsed().as_micros().max(1) as u64;
+                    }
                     self.record.response_bytes += data.len() as u64;
                     if let Some(t) = self.tracker.as_mut() {
                         t.feed(data);
@@ -165,15 +180,33 @@ mod tests {
     use rama::http::body::util::{BodyExt, Full};
 
     fn side<'a>(ai: &'a AiBackend, fields: &'a BodyFields) -> RequestSide<'a> {
-        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, tenant: Some("team-a"), subject: Some("ci"), reservation: None }
+        RequestSide { ai, host: "llm.bench", body_fields: Some(fields), request_bytes: 321, start: Instant::now(), key_id: 9, tenant: Some("team-a"), subject: Some("ci"), on_behalf_of: None, request_id: 77, client_request_id: Some("turn-3"), rule: None, reservation: None }
+    }
+
+    #[tokio::test]
+    async fn the_record_carries_the_request_ids_the_first_byte_time_and_the_vouched_user() {
+        let ring = Arc::new(UsageRing::new(8));
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None, on_behalf_of: None };
+        let fields: BodyFields = vec![("model", "claude-opus-5".into())];
+        let mut side = side(&ai, &fields);
+        side.on_behalf_of = Some("alice@example.com");
+        side.subject = Some("alice@example.com");
+        let body = Body::new(Full::new(Bytes::from_static(br#"{"usage":{"input_tokens":1,"output_tokens":1}}"#)));
+        let _ = observe(body, 200, side, Arc::clone(&ring), true).collect().await.unwrap();
+        let mut out = Vec::new();
+        assert_eq!(ring.drain_into(&mut out, 10), 1);
+        let r = &out[0];
+        assert_eq!((r.request_id, r.client_request_id.as_str(), r.on_behalf_of.as_str(), r.subject.as_str(), r.key_id), (77, "turn-3", "alice@example.com", "alice@example.com", 9));
+        assert!(r.first_byte_micros > 0 && r.first_byte_micros <= r.duration_micros, "{} <= {}", r.first_byte_micros, r.duration_micros);
+        assert_eq!(r.rule.as_str(), "");
     }
 
     #[tokio::test]
     async fn an_mcp_record_carries_the_method_and_tool_and_no_tokens() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::Mcp, provider: Arc::from("github-mcp"), key_required: false, budget: None, session_affinity: false, jwt: None };
+        let ai = AiBackend { dialect: Dialect::Mcp, provider: Arc::from("github-mcp"), key_required: false, budget: None, session_affinity: false, jwt: None, on_behalf_of: None };
         let fields: BodyFields = vec![("method", "tools/call".into()), ("id", "3".into()), ("tool", "github.search".into())];
-        let side = RequestSide { ai: &ai, host: "mcp.example.com", body_fields: Some(&fields), request_bytes: 120, start: Instant::now(), key_id: 42, tenant: Some("team-mcp"), subject: Some("agent"), reservation: None };
+        let side = RequestSide { ai: &ai, host: "mcp.example.com", body_fields: Some(&fields), request_bytes: 120, start: Instant::now(), key_id: 42, tenant: Some("team-mcp"), subject: Some("agent"), on_behalf_of: None, request_id: 1, client_request_id: None, rule: None, reservation: None };
         let body = observe(Body::from(r#"{"jsonrpc":"2.0","id":3,"result":{"content":[]}}"#), 200, side, Arc::clone(&ring), true);
         let _ = body.collect().await.unwrap();
         let mut out = Vec::new();
@@ -189,7 +222,7 @@ mod tests {
     #[tokio::test]
     async fn a_compressed_response_is_recorded_without_tokens_instead_of_being_misread() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None };
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None, on_behalf_of: None };
         let fields: BodyFields = vec![("model", "claude-opus-5".into()), ("stream", "true".into())];
         // What a gzip body looks like to a parser: not SSE, not JSON.
         let body = Body::new(Full::new(Bytes::from_static(b"\x1f\x8b\x08\x00garbage-that-is-not-sse")));
@@ -204,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn a_consumed_anthropic_response_produces_one_record_with_tokens() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None };
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None, on_behalf_of: None };
         let fields: BodyFields = vec![("model", "claude-opus-5".into())];
         let body = Body::new(Full::new(Bytes::from_static(
             br#"{"id":"m","model":"claude-opus-5-served","usage":{"input_tokens":10,"output_tokens":4}}"#,
@@ -225,7 +258,7 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_stream_is_still_recorded_once() {
         let ring = Arc::new(UsageRing::new(8));
-        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false, budget: None, session_affinity: false, jwt: None };
+        let ai = AiBackend { dialect: Dialect::OpenAi, provider: Arc::from("echo"), key_required: false, budget: None, session_affinity: false, jwt: None, on_behalf_of: None };
         let fields: BodyFields = vec![("model", "gpt-5".into()), ("stream", "true".into())];
         let body = Body::new(Full::new(Bytes::from_static(b"data: {\"model\":\"gpt-5\",\"usage\":null}\n\n")));
         let mut observed = observe(body, 200, side(&ai, &fields), Arc::clone(&ring), true);
@@ -241,13 +274,16 @@ mod tests {
     #[test]
     fn a_refusal_is_recorded_with_its_reason_and_no_tokens() {
         let ring = UsageRing::new(8);
-        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None };
+        let ai = AiBackend { dialect: Dialect::Anthropic, provider: Arc::from("anthropic"), key_required: true, budget: None, session_affinity: false, jwt: None, on_behalf_of: None };
         let fields: BodyFields = vec![("model", "claude-opus-5".into())];
-        record_refusal(429, RefusalKind::BudgetExhausted, side(&ai, &fields), &ring);
+        let mut refused = side(&ai, &fields);
+        refused.rule = Some("llm/daily");
+        record_refusal(429, RefusalKind::BudgetExhausted, refused, &ring);
         let mut out = Vec::new();
         assert_eq!(ring.drain_into(&mut out, 10), 1);
         let r = &out[0];
         assert_eq!((r.status, r.key_id, r.refusal, r.tokens), (429, 9, Some(RefusalKind::BudgetExhausted), None));
+        assert_eq!((r.rule.as_str(), r.first_byte_micros), ("llm/daily", 0));
         assert_eq!((r.requested_model.as_str(), r.provider.as_str()), ("claude-opus-5", "anthropic"));
     }
 }

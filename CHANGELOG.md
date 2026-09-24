@@ -4,6 +4,27 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.8] - 2026-09-24
+
+What the first fleet asked for after a week on 0.2.5–0.2.7: who is behind a call, richer
+usage data, and key changes without restarts.
+
+### Added
+
+- **Who is behind a call.** `AIRoute.auth.onBehalfOf {header, trustedKeys}`: a caller holding one key for many users (a hub, an orchestrator) names the user it acts for in `x-portus-on-behalf-of` (or the configured header). The gateway records that user as the row's `subject` (the key stays on the row as the one that vouched, `on_behalf_of` repeats the name) and strips the header before forwarding. Only keys listed in `trustedKeys` (`name` or `tenant/name`) are believed; from any other key the header is ignored, so an agent cannot claim to be someone else.
+- **Per-user limits.** `AIUsagePolicy.budget.per: Subject` keeps one counter per user under the key that vouched for it (else per key or OAuth subject).
+- **Keys change in place and expire.** `PATCH /v1/keys/{id}` edits tenant, name, `allowed_models`, `allowed_tools` or `expires_in_secs` (0 clears); the plaintext keeps working and the data planes get the change within a second, so a policy change needs no new key and no pod restart. `POST /v1/keys` takes `expires_in_secs`; the ledger revokes expired keys within a minute and the data planes refuse them at the second. Rotation grace: issue the new key, give the old one an expiry.
+- **Usage data with shape.** `GET /v1/summary?by=key|subject|model|tool|tenant|route` groups totals; every row breaks refusals down by reason (`refused_unauthenticated`, `refused_model_not_allowed`, `refused_tool_not_allowed`, `refused_budget_exhausted`), counts `upstream_errors` (5xx from the provider) and sums wall time and time to first byte (`duration_micros_total`, `first_byte_micros_total`, `first_byte_samples`). `GET /v1/series?bucket_secs=&by=` gives the same per epoch-aligned time bucket for charts and spike detection.
+- **Correlation.** Every AI response carries `x-portus-request-id` (the ledger row's id, 16 hex); a client may send its own id in that header and finds it on the row as `client_request_id`.
+- **Refusal rules.** Rows carry `rule`: the AIUsagePolicy that refused (`namespace/name`) or `key`/`jwt` for an allow list.
+- **Rows carry** `first_byte_micros`, `on_behalf_of`, `rule`, `client_request_id` next to the existing fields; the ledger migrates existing files.
+- **`AIRoute` rules take `urlRewrite`** with the shape of HTTPRoute's URLRewrite filter (`ReplaceFullPath`, `ReplacePrefixMatch`), for servers that live at `/mcp` or `/` behind a route matched elsewhere.
+
+### Fixed
+
+- **Tool allow lists were not enforced on path-only MCP rules.** The request body was scanned only when a rule on the host matched on a body field (`model`, `method`, `tool`); an MCP route with plain path rules never read the body, so `allowed_tools` was never applied, `tools/call` rows carried no tool name and call budgets reserved without a JSON-RPC id. Every route backed by an AIProvider now reads the body. Found by the first fleet: a key with an allow list could call every tool on a production server.
+- Crate versions follow the chart (0.2.8).
+
 ## [0.2.7] - 2026-09-23
 
 ### Fixed

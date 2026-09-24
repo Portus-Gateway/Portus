@@ -6,9 +6,11 @@
 //! Configuration (environment):
 //! - `LEDGER_GRPC_ADDR` (default `0.0.0.0:9444`): ingest + key distribution.
 //! - `LEDGER_HTTP_ADDR` (default `0.0.0.0:8083`): `/healthz`, `/readyz` and
-//!   `/metrics` open; `/export.jsonl?since_us=<µs>&limit=<n>`, `/v1/summary`
-//!   and the key API `/v1/keys` behind bearer `LEDGER_ADMIN_TOKEN` (the
-//!   admin API is disabled when it is unset).
+//!   `/metrics` open; `/export.jsonl?since_us=<µs>&limit=<n>`,
+//!   `/v1/summary?hours=&by=key|subject|model|tool|tenant|route`,
+//!   `/v1/series?hours=&bucket_secs=&by=` and the key API `/v1/keys`
+//!   (GET, POST, PATCH `/v1/keys/{id}`, DELETE) behind bearer
+//!   `LEDGER_ADMIN_TOKEN` (the admin API is disabled when it is unset).
 //! - `LEDGER_OPEN_READS=true`: serve `/export.jsonl` and `/v1/summary`
 //!   without the token (usage rows name keys, tenants and subjects; only for
 //!   a ledger nothing but operators can reach).
@@ -40,8 +42,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Status};
 
-use keys::KeyRow;
-use store::Store;
+use keys::{KeyPatch, KeyRow};
+use store::{GroupBy, Store};
 
 #[derive(Default)]
 struct Stats {
@@ -60,10 +62,14 @@ type Done<T> = oneshot::Sender<rusqlite::Result<T>>;
 enum Op {
     Write { node: String, records: Vec<portus_types::proto::portus::ledger::v1::UsageRecord>, done: Done<usize> },
     Export { since: u64, limit: usize, done: Done<Vec<store::Row>> },
-    Summary { since: u64, done: Done<Vec<store::KeySummary>> },
+    Summary { since: u64, by: GroupBy, done: Done<Vec<store::Summary>> },
+    Series { since: u64, bucket_micros: u64, by: GroupBy, done: Done<Vec<store::Summary>> },
     Count(Done<u64>),
-    IssueKey { tenant: String, name: String, models: Vec<String>, tools: Vec<String>, plaintext: Option<String>, done: Done<(KeyRow, String)> },
+    IssueKey { tenant: String, name: String, models: Vec<String>, tools: Vec<String>, plaintext: Option<String>, expires_in_secs: Option<u64>, done: Done<(KeyRow, String)> },
+    UpdateKey { id: u64, patch: KeyPatch, done: Done<Option<KeyRow>> },
     RevokeKey { id: u64, done: Done<bool> },
+    /// Revoke keys whose expiry has passed; how many.
+    ExpireKeys { now_secs: u64, done: Done<usize> },
     ListKeys(Done<Vec<KeyRow>>),
     /// Advance the persisted version and build the snapshot at it.
     NextKeySnapshot(Done<KeySnapshot>),
@@ -80,17 +86,26 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
             Op::Export { since, limit, done } => {
                 let _ = done.send(store.export(since, limit));
             }
-            Op::Summary { since, done } => {
-                let _ = done.send(store.summary(since));
+            Op::Summary { since, by, done } => {
+                let _ = done.send(store.summary(since, by));
+            }
+            Op::Series { since, bucket_micros, by, done } => {
+                let _ = done.send(store.series(since, bucket_micros, by));
             }
             Op::Count(done) => {
                 let _ = done.send(store.count());
             }
-            Op::IssueKey { tenant, name, models, tools, plaintext, done } => {
-                let _ = done.send(store.issue_key(&tenant, &name, &models, &tools, plaintext.as_deref()));
+            Op::IssueKey { tenant, name, models, tools, plaintext, expires_in_secs, done } => {
+                let _ = done.send(store.issue_key(&tenant, &name, &models, &tools, plaintext.as_deref(), expires_in_secs));
+            }
+            Op::UpdateKey { id, patch, done } => {
+                let _ = done.send(store.update_key(id, &patch));
             }
             Op::RevokeKey { id, done } => {
                 let _ = done.send(store.revoke_key(id));
+            }
+            Op::ExpireKeys { now_secs, done } => {
+                let _ = done.send(store.expire_keys(now_secs));
             }
             Op::ListKeys(done) => {
                 let _ = done.send(store.list_keys());
@@ -243,6 +258,9 @@ struct IssueKeyRequest {
     /// An externally issued key to accept as-is; omitted to generate one.
     #[serde(default)]
     key: Option<String>,
+    /// Seconds until the key expires; omitted or 0: never.
+    #[serde(default)]
+    expires_in_secs: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -331,14 +349,35 @@ async fn export(State(shared): State<Arc<Shared>>, headers: HeaderMap, Query(p):
     }
 }
 
-/// Per-key totals over the last `hours` (default 24), newest spenders first.
+/// Totals over the last `hours` (default 24), grouped by `by` (default
+/// key), biggest spenders first.
 async fn summary(State(shared): State<Arc<Shared>>, headers: HeaderMap, Query(p): Query<SummaryParams>) -> Response {
     if let Err(r) = reads_ok(&shared, &headers) {
         return *r;
     }
+    let Some(by) = GroupBy::parse(p.by.as_deref().unwrap_or("")) else {
+        return (StatusCode::BAD_REQUEST, "by must be key, subject, model, tool, tenant or route").into_response();
+    };
+    let since = now_micros().saturating_sub(p.hours.unwrap_or(24).clamp(1, 24 * 366) * 3_600_000_000);
+    match shared.run(|done| Op::Summary { since, by, done }).await {
+        Ok(rows) => Json(rows).into_response(),
+        Err(e) => storage_error(e),
+    }
+}
+
+/// Totals per time bucket over the last `hours` (default 24), `bucket_secs`
+/// wide (default 3600, 60 s to 7 d), grouped by `by` inside each bucket.
+async fn series(State(shared): State<Arc<Shared>>, headers: HeaderMap, Query(p): Query<SummaryParams>) -> Response {
+    if let Err(r) = reads_ok(&shared, &headers) {
+        return *r;
+    }
+    let Some(by) = GroupBy::parse(p.by.as_deref().unwrap_or("")) else {
+        return (StatusCode::BAD_REQUEST, "by must be key, subject, model, tool, tenant or route").into_response();
+    };
     let hours = p.hours.unwrap_or(24).clamp(1, 24 * 366);
+    let bucket_secs = p.bucket_secs.unwrap_or(3600).clamp(60, 7 * 86_400);
     let since = now_micros().saturating_sub(hours * 3_600_000_000);
-    match shared.run(|done| Op::Summary { since, done }).await {
+    match shared.run(|done| Op::Series { since, bucket_micros: bucket_secs * 1_000_000, by, done }).await {
         Ok(rows) => Json(rows).into_response(),
         Err(e) => storage_error(e),
     }
@@ -347,6 +386,8 @@ async fn summary(State(shared): State<Arc<Shared>>, headers: HeaderMap, Query(p)
 #[derive(Deserialize, Default)]
 struct SummaryParams {
     hours: Option<u64>,
+    by: Option<String>,
+    bucket_secs: Option<u64>,
 }
 
 async fn issue_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Json(req): Json<IssueKeyRequest>) -> Response {
@@ -366,6 +407,7 @@ async fn issue_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Json(r
             models: req.allowed_models.clone(),
             tools: req.allowed_tools.clone(),
             plaintext: req.key.as_deref().map(str::trim).map(str::to_string),
+            expires_in_secs: req.expires_in_secs,
             done,
         })
         .await;
@@ -391,6 +433,26 @@ async fn list_keys(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Res
     }
 }
 
+/// Change a live key's tenant, name, allow lists or expiry in place; the
+/// plaintext stays valid and the data planes pick the change up with the
+/// next snapshot, so nothing restarts.
+async fn update_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Path(id): Path<u64>, Json(patch): Json<KeyPatch>) -> Response {
+    if let Err(r) = admin_ok(&shared, &headers) {
+        return *r;
+    }
+    if patch.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
+        return (StatusCode::BAD_REQUEST, "name cannot be empty").into_response();
+    }
+    match shared.run(|done| Op::UpdateKey { id, patch, done }).await {
+        Ok(Some(row)) => match shared.publish_keys().await {
+            Ok(()) => Json(row).into_response(),
+            Err(e) => storage_error(e),
+        },
+        Ok(None) => (StatusCode::NOT_FOUND, "no live key with that id").into_response(),
+        Err(e) => storage_error(e),
+    }
+}
+
 async fn revoke_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Path(id): Path<u64>) -> Response {
     if let Err(r) = admin_ok(&shared, &headers) {
         return *r;
@@ -412,8 +474,9 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/metrics", get(metrics))
         .route("/export.jsonl", get(export))
         .route("/v1/summary", get(summary))
+        .route("/v1/series", get(series))
         .route("/v1/keys", get(list_keys).post(issue_key))
-        .route("/v1/keys/{id}", axum::routing::delete(revoke_key))
+        .route("/v1/keys/{id}", axum::routing::delete(revoke_key).patch(update_key))
         .with_state(shared)
 }
 
@@ -492,6 +555,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&http_addr).await?;
     log::info!("ledger HTTP endpoint listening on {http_addr}");
     tokio::spawn(axum::serve(listener, router(Arc::clone(&shared))).into_future());
+    // Keys expire on their own: every minute, revoke the ones whose time has
+    // passed and push a snapshot without them.
+    let expirer = Arc::clone(&shared);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tick.tick().await;
+            match expirer.run(|done| Op::ExpireKeys { now_secs: now_micros() / 1_000_000, done }).await {
+                Ok(n) if n > 0 => {
+                    log::info!("{n} API key(s) expired");
+                    if let Err(e) = expirer.publish_keys().await {
+                        log::warn!("publishing keys after expiry: {e}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("expiring keys: {e}"),
+            }
+        }
+    });
     // Closed budget windows are dead weight; sweep them hourly.
     let sweeper = Arc::clone(&shared);
     tokio::spawn(async move {
@@ -607,6 +689,24 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"name\":\"ci\"") && !body.contains(&key), "listing never shows the plaintext: {body}");
 
+        // PATCH changes the lists in place: same key, new snapshot.
+        let (status, body) = call(&app, "PATCH", &format!("/v1/keys/{id}"), Some("Bearer secret-admin"), Some(r#"{"allowed_models":["claude-opus-5"],"expires_in_secs":3600}"#)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let patched: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(patched["allowed_models"], serde_json::json!(["claude-opus-5"]));
+        assert_eq!(patched["allowed_tools"], serde_json::json!(["github.*"]), "untouched fields stay");
+        assert!(patched["expires_unix_secs"].as_u64().is_some());
+        assert!(!body.contains(&key), "a patch never shows the plaintext");
+        rx.changed().await.unwrap();
+        let snap = rx.borrow_and_update().clone();
+        assert_eq!((snap.version, snap.keys.len()), (3, 1));
+        assert_eq!(snap.keys[0].hash_sha256, keys::hash_key(&key).to_vec(), "the same key keeps working");
+        assert_eq!(snap.keys[0].allowed_models, vec!["claude-opus-5".to_string()]);
+        assert!(snap.keys[0].expires_unix_secs > 0);
+        assert_eq!(call(&app, "PATCH", "/v1/keys/12345", Some("Bearer secret-admin"), Some("{}")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(call(&app, "PATCH", &format!("/v1/keys/{id}"), Some("Bearer secret-admin"), Some(r#"{"name":" "}"#)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&app, "PATCH", &format!("/v1/keys/{id}"), None, Some("{}")).await.0, StatusCode::UNAUTHORIZED);
+
         let (status, _) = call(&app, "DELETE", &format!("/v1/keys/{id}"), Some("Bearer secret-admin"), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         rx.changed().await.unwrap();
@@ -633,5 +733,9 @@ mod tests {
         let (status, body) = call(&app, "GET", "/v1/summary?hours=1", Some("Bearer secret-admin"), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "[]", "no usage yet");
+        assert_eq!(call(&app, "GET", "/v1/summary?by=subject", Some("Bearer secret-admin"), None).await.0, StatusCode::OK);
+        assert_eq!(call(&app, "GET", "/v1/summary?by=bogus", Some("Bearer secret-admin"), None).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&app, "GET", "/v1/series?bucket_secs=300&by=model", Some("Bearer secret-admin"), None).await, (StatusCode::OK, "[]".to_string()));
+        assert_eq!(call(&app, "GET", "/v1/series", None, None).await.0, StatusCode::UNAUTHORIZED, "the series is a usage read");
     }
 }

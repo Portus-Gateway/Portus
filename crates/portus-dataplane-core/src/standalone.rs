@@ -656,6 +656,7 @@ pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::Com
                     ai_budget: None,
                     ai_session_affinity: false,
                     ai_jwt: None,
+                    ai_on_behalf_of: None,
                 });
             }
         }

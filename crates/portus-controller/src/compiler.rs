@@ -887,6 +887,14 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
             )
         })
         .collect();
+    let on_behalf_ofs: HashMap<(String, String), portus_types::AiOnBehalfOf> = store
+        .ai_routes
+        .iter()
+        .filter_map(|e| {
+            let o = e.value().on_behalf_of.as_ref()?;
+            Some(((e.key().namespace.clone(), e.key().name.clone()), portus_types::AiOnBehalfOf { header: o.header.clone(), trusted_keys: o.trusted_keys.clone() }))
+        })
+        .collect();
     let jwts: HashMap<(String, String), portus_types::AiJwt> = store
         .ai_routes
         .iter()
@@ -914,6 +922,9 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         }
         if let Some(j) = jwts.get(&key) {
             route.ai_jwt = Some(j.clone());
+        }
+        if let Some(o) = on_behalf_ofs.get(&key) {
+            route.ai_on_behalf_of = Some(o.clone());
         }
         if let Some(b) = budgets.get(&key) {
             route.ai_budget = Some(b.clone());
@@ -1730,13 +1741,13 @@ fn ai_routes_as_http_routes(store: &ConfigStore) -> Vec<(NamespacedName, HTTPRou
                             }]
                         })
                         .unwrap_or_default();
+                    let mut filters = rule.filters.clone();
+                    if !set.is_empty() {
+                        filters.push(HTTPFilterState::RequestHeaderModifier { add: Vec::new(), set, remove: Vec::new() });
+                    }
                     HTTPRouteRuleState {
                         matches: rule.matches.clone(),
-                        filters: if set.is_empty() {
-                            Vec::new()
-                        } else {
-                            vec![HTTPFilterState::RequestHeaderModifier { add: Vec::new(), set, remove: Vec::new() }]
-                        },
+                        filters,
                         backend_refs,
                         request_timeout_ms: None,
                         backend_request_timeout_ms: None,
@@ -2390,9 +2401,11 @@ mod tests {
                     // provider existed; the compiler must still find it.
                     backend_refs: vec![],
                     provider: NamespacedName { namespace: "default".into(), name: "anthropic".into() },
+                    filters: vec![crate::store::HTTPFilterState::URLRewrite { hostname: None, path: Some("/mcp".into()), path_type: Some("ReplaceFullPath".into()) }],
                 }],
                 require_api_key: true,
                 jwt: Some(crate::store::AIJwtState { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: "groups".into(), tools_claim: "scope".into(), scopes: "openid profile email groups".into() }),
+                on_behalf_of: Some(crate::store::AIOnBehalfOfState { header: "x-portus-on-behalf-of".into(), trusted_keys: vec!["default/hub".into()] }),
                 generation: 1,
             },
         );
@@ -2470,6 +2483,8 @@ mod tests {
         assert!(tls.enabled && tls.verify_cert);
         assert_eq!(tls.sni, "api.anthropic.com");
         assert_eq!((route.ai_dialect.as_str(), route.ai_provider.as_str()), ("anthropic", "anthropic"));
+        assert_eq!(route.ai_on_behalf_of.as_ref().map(|o| (o.header.as_str(), o.trusted_keys.clone())), Some(("x-portus-on-behalf-of", vec!["default/hub".to_string()])));
+        assert_eq!(route.url_rewrite.as_ref().map(|r| (r.path.as_str(), r.path_type.as_str())), Some(("/mcp", "ReplaceFullPath")), "the rule's urlRewrite reaches the RouteConfig");
         let group = config.backends.iter().find(|b| b.service_name == "aiprovider/default/anthropic").expect("provider backend group");
         assert_eq!(group.port, 443);
         assert_eq!(group.endpoints.len(), 1);

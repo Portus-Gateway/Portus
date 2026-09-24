@@ -271,6 +271,8 @@ pub struct AiBackend {
     pub session_affinity: bool,
     /// OAuth bearer tokens accepted in place of a Portus API key.
     pub jwt: Option<crate::ai::jwt::JwtPolicy>,
+    /// A trusted caller may name the user it acts for.
+    pub on_behalf_of: Option<crate::ai::keys::OnBehalfOf>,
 }
 
 impl PathRoute {
@@ -353,6 +355,16 @@ pub type BodyFields = Vec<(&'static str, String)>;
 /// Whether any of `matches` needs the body scanned.
 pub fn needs_body_fields(matches: &[HeaderMatchEntry]) -> bool {
     matches.iter().any(|hm| hm.name.as_str().starts_with(BODY_FIELD_HEADER_PREFIX))
+}
+
+/// Whether a route needs the request body scanned: it matches on a body
+/// field, or it forwards to an AI provider at all. An AI route reads the
+/// body for the key's allow lists (model, tool), the budget estimate
+/// (`max_tokens`), the JSON-RPC id refusals echo and the usage row; a
+/// path-only MCP rule that skipped the scan let every tool through and
+/// recorded none of them.
+pub fn route_needs_body(route: &PathRoute) -> bool {
+    route.ai.is_some() || needs_body_fields(&route.header_matches)
 }
 
 fn body_field<'a>(body: Option<&'a BodyFields>, header_name: &str) -> Option<&'a str> {
@@ -1418,8 +1430,7 @@ mod tests {
                 _ => prefix_rules.push(rule),
             }
         }
-        let needs_body = exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter())
-            .any(|r| needs_body_fields(&r.header_matches));
+        let needs_body = exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter()).any(route_needs_body);
         let oauth = oauth_of(exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter()));
         HostRoutes { exact_map, rules: prefix_rules, catch_all, needs_body, oauth }
     }
@@ -1456,6 +1467,25 @@ mod tests {
         assert_eq!(svc(Some(&vec![("model", "gpt-5".to_string())])), Some("default-provider".into()));
         assert_eq!(svc(Some(&vec![])), Some("default-provider".into()), "a body without the key skips body routes");
         assert!(!make_host_routes(vec![make_path_route("/", PathMatchType::Prefix)], None).needs_body);
+    }
+
+    #[test]
+    fn a_path_only_ai_route_still_reads_the_body() {
+        // The tool allow list, the budget estimate and the usage row all come
+        // from the body; a path-only MCP rule must not skip the scan.
+        let mut mcp = make_path_route("/", PathMatchType::Prefix);
+        mcp.ai = Some(AiBackend {
+            dialect: crate::ai::usage::Dialect::Mcp,
+            provider: Arc::from("tools"),
+            key_required: true,
+            budget: None,
+            session_affinity: true,
+            jwt: None,
+            on_behalf_of: None,
+        });
+        assert!(route_needs_body(&mcp));
+        assert!(make_host_routes(vec![mcp], None).needs_body);
+        assert!(!route_needs_body(&make_path_route("/", PathMatchType::Prefix)), "an ordinary route does not pay for a scan");
     }
 
     #[test]

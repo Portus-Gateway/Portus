@@ -320,6 +320,15 @@ pub struct UsageRecord {
     pub request_id: u64,
     /// Set when the gateway refused the request instead of forwarding it.
     pub refusal: Option<RefusalKind>,
+    /// What refused it: the budget policy's id, or `key` / `jwt` for an
+    /// allow list. Empty when forwarded.
+    pub rule: ArrayString<NAME_LEN>,
+    /// The client's own `x-portus-request-id`, when it sent one.
+    pub client_request_id: ArrayString<NAME_LEN>,
+    /// Time to the first response body byte; 0 when there was none.
+    pub first_byte_micros: u64,
+    /// The user a trusted caller acted for (`auth.onBehalfOf`).
+    pub on_behalf_of: ArrayString<NAME_LEN>,
 }
 
 /// Why the gateway refused a request itself.
@@ -506,7 +515,7 @@ mod tests {
 
     #[test]
     fn records_are_fixed_size_and_names_truncate_on_char_boundaries() {
-        assert!(std::mem::size_of::<UsageRecord>() <= 560, "{}", std::mem::size_of::<UsageRecord>());
+        assert!(std::mem::size_of::<UsageRecord>() <= 768, "{}", std::mem::size_of::<UsageRecord>());
         assert_eq!(UsageRecord::name("claude-opus-5").as_str(), "claude-opus-5");
         let long = format!("{}é", "a".repeat(63));
         assert_eq!(UsageRecord::name(&long).as_str(), "a".repeat(63));
@@ -531,6 +540,10 @@ mod tests {
             key_id: 0,
             request_id: id,
             refusal: None,
+            rule: ArrayString::new(),
+            client_request_id: ArrayString::new(),
+            first_byte_micros: 0,
+            on_behalf_of: ArrayString::new(),
         }
     }
 

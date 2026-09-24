@@ -25,6 +25,47 @@ pub struct KeyInfo {
     pub allowed_models: Arc<[String]>,
     /// MCP: tools a `tools/call` may name, exact or `prefix.*`. Empty: any.
     pub allowed_tools: Arc<[String]>,
+    /// Unix seconds after which the key is refused; 0: never. The ledger
+    /// drops expired keys from the snapshot; this covers the gap between
+    /// snapshots.
+    pub expires_unix_secs: u64,
+}
+
+impl KeyInfo {
+    pub fn live_at(&self, now_unix_secs: u64) -> bool {
+        self.expires_unix_secs == 0 || now_unix_secs < self.expires_unix_secs
+    }
+}
+
+/// `auth.onBehalfOf`: a trusted caller names the user it acts for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnBehalfOf {
+    /// Lower-case header name.
+    pub header: Arc<str>,
+    /// Keys believed, by `name` or `tenant/name`.
+    pub trusted_keys: Arc<[String]>,
+}
+
+/// Default header a trusted caller names its user in.
+pub const ON_BEHALF_OF_HEADER: &str = "x-portus-on-behalf-of";
+
+impl OnBehalfOf {
+    pub fn trusts(&self, info: &KeyInfo) -> bool {
+        self.trusted_keys.iter().any(|k| match k.split_once('/') {
+            Some((tenant, name)) => tenant == info.tenant.as_ref() && name == info.name.as_ref(),
+            None => k == info.name.as_ref(),
+        })
+    }
+
+    /// The user named in the header when `info` is trusted to name one:
+    /// printable, non-empty, at most 64 bytes.
+    pub fn user<'h>(&self, headers: &'h (impl RequestHeaders + ?Sized), info: &KeyInfo) -> Option<&'h str> {
+        if !self.trusts(info) {
+            return None;
+        }
+        let v = std::str::from_utf8(headers.get(&self.header)?).ok()?.trim();
+        (!v.is_empty() && v.len() <= 64 && v.chars().all(|c| !c.is_control())).then_some(v)
+    }
 }
 
 /// Every live key, by hash, and every OAuth issuer's public keys. Replaced
@@ -55,6 +96,7 @@ impl KeySet {
                     name: Arc::from(k.name.as_str()),
                     allowed_models: Arc::from(k.allowed_models.clone()),
                     allowed_tools: Arc::from(k.allowed_tools.clone()),
+                    expires_unix_secs: k.expires_unix_secs,
                 },
             );
         }
@@ -152,14 +194,16 @@ fn tool_allowed(allowed: &[String], tool: &str) -> bool {
     allowed.iter().any(|a| a == tool || a.strip_suffix('*').is_some_and(|p| tool.len() > p.len() && tool.starts_with(p)))
 }
 
-/// Check a request against the key set. `Ok` is the key to charge.
+/// Check a request against the key set at `now_unix_secs`. `Ok` is the
+/// key to charge; an expired key is as good as unknown.
 pub fn authorize<'k>(
     keys: &'k KeySet,
     headers: &(impl RequestHeaders + ?Sized),
     access: Access<'_>,
+    now_unix_secs: u64,
 ) -> Result<&'k KeyInfo, Refusal> {
     let presented = presented_key(headers).ok_or(Refusal::Unauthenticated)?;
-    let info = keys.lookup(presented).ok_or(Refusal::Unauthenticated)?;
+    let info = keys.lookup(presented).filter(|k| k.live_at(now_unix_secs)).ok_or(Refusal::Unauthenticated)?;
     check_access(info, access)?;
     Ok(info)
 }
@@ -194,7 +238,8 @@ mod tests {
             version: 3,
             issuers: vec![],
             keys: vec![
-                KeyEntry { id: 1, hash_sha256: hash_key("portus_sk_any").to_vec(), tenant: "team-a".into(), name: "ci".into(), allowed_models: vec![], allowed_tools: vec![] },
+                KeyEntry { id: 1, hash_sha256: hash_key("portus_sk_any").to_vec(), tenant: "team-a".into(), name: "ci".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0 },
+                KeyEntry { id: 5, hash_sha256: hash_key("portus_sk_old").to_vec(), tenant: "team-a".into(), name: "rotated".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 1_000 },
                 KeyEntry {
                     id: 2,
                     hash_sha256: hash_key("portus_sk_haiku").to_vec(),
@@ -202,8 +247,9 @@ mod tests {
                     name: "bot".into(),
                     allowed_models: vec!["claude-haiku-4-5".into()],
                     allowed_tools: vec![],
+                    expires_unix_secs: 0,
                 },
-                KeyEntry { id: 3, hash_sha256: vec![1, 2, 3], tenant: "bad".into(), name: "short-hash".into(), allowed_models: vec![], allowed_tools: vec![] },
+                KeyEntry { id: 3, hash_sha256: vec![1, 2, 3], tenant: "bad".into(), name: "short-hash".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0 },
                 KeyEntry {
                     id: 4,
                     hash_sha256: hash_key("portus_sk_tools").to_vec(),
@@ -211,6 +257,7 @@ mod tests {
                     name: "agent".into(),
                     allowed_models: vec![],
                     allowed_tools: vec!["echo".into(), "github.*".into()],
+                    expires_unix_secs: 0,
                 },
             ],
         }
@@ -227,7 +274,7 @@ mod tests {
     #[test]
     fn snapshots_load_by_hash_and_skip_malformed_entries() {
         let set = KeySet::from_snapshot(&snapshot());
-        assert_eq!((set.version, set.len()), (3, 3));
+        assert_eq!((set.version, set.len()), (3, 4));
         assert_eq!(set.lookup("portus_sk_any").map(|k| k.id), Some(1));
         assert_eq!(set.lookup("portus_sk_haiku").map(|k| k.tenant.as_ref()), Some("team-b"));
         assert!(set.lookup("portus_sk_nope").is_none());
@@ -243,6 +290,37 @@ mod tests {
         assert_eq!(presented_key(&headers(&[])), None);
         // x-api-key wins when both are present, as it does at Anthropic.
         assert_eq!(presented_key(&headers(&[("x-api-key", "a"), ("authorization", "Bearer b")])), Some("a"));
+    }
+
+    fn authorize<'k>(keys: &'k KeySet, headers: &http::HeaderMap, access: Access<'_>) -> Result<&'k KeyInfo, Refusal> {
+        super::authorize(keys, headers, access, 500)
+    }
+
+    #[test]
+    fn an_expired_key_is_refused_like_an_unknown_one() {
+        let set = KeySet::from_snapshot(&snapshot());
+        let h = headers(&[("x-api-key", "portus_sk_old")]);
+        assert_eq!(super::authorize(&set, &h, Access::Other, 999).map(|k| k.id), Ok(5), "before expiry");
+        assert_eq!(super::authorize(&set, &h, Access::Other, 1_000).map(|k| k.id), Err(Refusal::Unauthenticated), "at expiry");
+        assert_eq!(super::authorize(&set, &h, Access::Other, 5_000).map(|k| k.id), Err(Refusal::Unauthenticated));
+        assert_eq!(super::authorize(&set, &headers(&[("x-api-key", "portus_sk_any")]), Access::Other, u64::MAX).map(|k| k.id), Ok(1), "no expiry: forever");
+    }
+
+    #[test]
+    fn on_behalf_of_is_believed_from_trusted_keys_only_and_the_name_is_bounded() {
+        let set = KeySet::from_snapshot(&snapshot());
+        let hub = set.lookup("portus_sk_any").unwrap();
+        let bot = set.lookup("portus_sk_haiku").unwrap();
+        let policy = OnBehalfOf { header: Arc::from(ON_BEHALF_OF_HEADER), trusted_keys: Arc::from(vec!["team-a/ci".to_string(), "agent".to_string()]) };
+        let h = headers(&[("x-portus-on-behalf-of", " alice@example.com ")]);
+        assert_eq!(policy.user(&h, hub), Some("alice@example.com"), "tenant/name entry");
+        assert_eq!(policy.user(&h, set.lookup("portus_sk_tools").unwrap()), Some("alice@example.com"), "bare name entry");
+        assert_eq!(policy.user(&h, bot), None, "an untrusted key cannot name anyone");
+        assert_eq!(policy.user(&headers(&[]), hub), None, "no header");
+        assert_eq!(policy.user(&headers(&[("x-portus-on-behalf-of", "   ")]), hub), None, "blank");
+        assert_eq!(policy.user(&headers(&[("x-portus-on-behalf-of", &"a".repeat(65))]), hub), None, "too long");
+        let same_name_other_tenant = KeyInfo { tenant: Arc::from("team-z"), ..hub.clone() };
+        assert!(!policy.trusts(&same_name_other_tenant), "team-a/ci does not trust team-z/ci");
     }
 
     #[test]

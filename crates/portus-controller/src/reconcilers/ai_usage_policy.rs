@@ -51,9 +51,10 @@ pub fn normalise(policy: &AIUsagePolicy) -> Result<Normalised, String> {
     };
     let per = match spec.budget.per.as_deref().unwrap_or("Key").to_ascii_lowercase().as_str() {
         "key" => "KEY",
+        "subject" => "SUBJECT",
         "tenant" => "TENANT",
         "route" => "ROUTE",
-        other => return Err(format!("budget.per {other:?} is not Key, Tenant or Route")),
+        other => return Err(format!("budget.per {other:?} is not Key, Subject, Tenant or Route")),
     };
     let fail_open = match spec.on_ledger_unavailable.as_deref().unwrap_or("Open").to_ascii_lowercase().as_str() {
         "open" => true,

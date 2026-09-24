@@ -598,6 +598,10 @@ pub fn build_listener_buckets_from_proto(
                             tools_claim: Arc::from(j.tools_claim.as_str()),
                             scopes: Arc::from(j.scopes.as_str()),
                         }),
+                        on_behalf_of: spec.ai_on_behalf_of.as_ref().map(|o| crate::ai::keys::OnBehalfOf {
+                            header: Arc::from(if o.header.is_empty() { crate::ai::keys::ON_BEHALF_OF_HEADER } else { o.header.as_str() }.to_ascii_lowercase().as_str()),
+                            trusted_keys: Arc::from(o.trusted_keys.clone()),
+                        }),
                         budget: spec.ai_budget.as_ref().and_then(|b| {
                             Some(crate::ai::budget::BudgetPolicy {
                                 id: Arc::from(b.policy.as_str()),
@@ -669,7 +673,7 @@ pub fn build_listener_buckets_from_proto(
             .flatten()
             .chain(prefix_rules.iter())
             .chain(catch_all.iter())
-            .any(|r| crate::router::needs_body_fields(&r.header_matches));
+            .any(crate::router::route_needs_body);
         let oauth = crate::router::oauth_of(exact_map.values().flatten().chain(prefix_rules.iter()).chain(catch_all.iter()));
         let host_routes = HostRoutes {
             exact_map,

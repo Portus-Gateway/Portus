@@ -15,7 +15,8 @@ use super::{ReconcileContext, ReconcileError};
 use crate::ai_types::{AIRoute, AIRouteMatch, AIStringMatch};
 use crate::status;
 use crate::store::{
-    AIJwtState, AIRouteRuleState, AIRouteState, BackendRefState, ConfigStore, HTTPRouteMatchState, NamespacedName, RouteKind,
+    AIJwtState, AIOnBehalfOfState, AIRouteRuleState, AIRouteState, BackendRefState, ConfigStore, HTTPFilterState, HTTPRouteMatchState,
+    NamespacedName, RouteKind,
 };
 
 /// Header-match name the data plane resolves from the body's `model`.
@@ -110,6 +111,36 @@ pub fn jwt_state(spec: &crate::ai_types::AIJwtSpec) -> Result<AIJwtState, String
     })
 }
 
+/// `auth.onBehalfOf` normalised: a lower-case header name (default
+/// `x-portus-on-behalf-of`) and at least one trusted key.
+pub fn on_behalf_of_state(spec: &crate::ai_types::AIOnBehalfOfSpec) -> Result<AIOnBehalfOfState, String> {
+    let header = spec.header.as_deref().map(str::trim).filter(|h| !h.is_empty()).unwrap_or("x-portus-on-behalf-of").to_ascii_lowercase();
+    // RFC 7230 token characters; what the data plane's header map accepts.
+    let token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    if header.is_empty() || !header.chars().all(token) {
+        return Err(format!("header {header:?} is not a valid header name"));
+    }
+    let trusted_keys: Vec<String> = spec.trusted_keys.iter().map(|k| k.trim()).filter(|k| !k.is_empty()).map(str::to_string).collect();
+    if trusted_keys.is_empty() {
+        return Err("trustedKeys must name at least one key (name or tenant/name)".to_string());
+    }
+    Ok(AIOnBehalfOfState { header, trusted_keys })
+}
+
+/// A rule's `urlRewrite` as the HTTPRoute filter state the compiler consumes.
+pub fn rewrite_filter(rw: &crate::ai_types::AIUrlRewrite) -> Result<HTTPFilterState, String> {
+    let Some(pm) = rw.path.as_ref() else { return Err("urlRewrite.path is required".to_string()) };
+    let (path, path_type) = match pm.modifier_type.as_deref().unwrap_or("") {
+        "ReplaceFullPath" => (pm.replace_full_path.clone().ok_or("urlRewrite.path.replaceFullPath is required for ReplaceFullPath")?, "ReplaceFullPath"),
+        "ReplacePrefixMatch" => (pm.replace_prefix_match.clone().ok_or("urlRewrite.path.replacePrefixMatch is required for ReplacePrefixMatch")?, "ReplacePrefixMatch"),
+        other => return Err(format!("urlRewrite.path.type {other:?} is not ReplaceFullPath or ReplacePrefixMatch")),
+    };
+    if !path.starts_with('/') {
+        return Err(format!("urlRewrite path {path:?} must start with /"));
+    }
+    Ok(HTTPFilterState::URLRewrite { hostname: None, path: Some(path), path_type: Some(path_type.to_string()) })
+}
+
 /// Build the route state and its status conditions without touching the API.
 pub fn reconcile_inner(route: &AIRoute, store: &ConfigStore) -> Result<(AIRouteState, Vec<Condition>), ReconcileError> {
     let name = route.metadata.name.as_deref().ok_or_else(|| ReconcileError::MissingField("metadata.name".into()))?;
@@ -159,7 +190,15 @@ pub fn reconcile_inner(route: &AIRoute, store: &ConfigStore) -> Result<(AIRouteS
                 Vec::new()
             }
         };
-        rules.push(AIRouteRuleState { matches, backend_refs, provider });
+        let filters = match rule.url_rewrite.as_ref().map(rewrite_filter) {
+            Some(Ok(f)) => vec![f],
+            Some(Err(e)) => {
+                problems.push(format!("rule {i}: {e}"));
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        rules.push(AIRouteRuleState { matches, backend_refs, provider, filters });
     }
 
     let jwt = match route.spec.auth.as_ref().and_then(|a| a.jwt.as_ref()) {
@@ -167,6 +206,16 @@ pub fn reconcile_inner(route: &AIRoute, store: &ConfigStore) -> Result<(AIRouteS
             Ok(state) => Some(state),
             Err(e) => {
                 problems.push(format!("auth.jwt: {e}"));
+                None
+            }
+        },
+        None => None,
+    };
+    let on_behalf_of = match route.spec.auth.as_ref().and_then(|a| a.on_behalf_of.as_ref()) {
+        Some(o) => match on_behalf_of_state(o) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                problems.push(format!("auth.onBehalfOf: {e}"));
                 None
             }
         },
@@ -181,6 +230,7 @@ pub fn reconcile_inner(route: &AIRoute, store: &ConfigStore) -> Result<(AIRouteS
         rules,
         require_api_key: route.spec.require_api_key,
         jwt,
+        on_behalf_of,
         generation,
     };
 
@@ -325,18 +375,68 @@ mod tests {
         provider(&store, "anthropic");
         let mut r = route(vec![rule(None, None, &["anthropic"])]);
         r.spec.require_api_key = true;
-        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com/".into(), audience: Some("portus".into()), tenant_claim: None, tools_claim: Some("tools".into()), scopes: None }) });
+        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com/".into(), audience: Some("portus".into()), tenant_claim: None, tools_claim: Some("tools".into()), scopes: None }), on_behalf_of: None });
         let (state, conditions) = reconcile_inner(&r, &store).unwrap();
         assert_eq!(conditions[1].status, "True", "{}", conditions[1].message);
         assert_eq!(state.jwt, Some(AIJwtState { issuer: "https://dex.example.com".into(), audience: Some("portus".into()), tenant_claim: "groups".into(), tools_claim: "tools".into(), scopes: "openid profile email groups".into() }));
-        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None, scopes: Some(vec!["openid".into(), "email".into(), "federated:id".into()]) }) });
+        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None, scopes: Some(vec!["openid".into(), "email".into(), "federated:id".into()]) }), on_behalf_of: None });
         let (state, _) = reconcile_inner(&r, &store).unwrap();
         assert_eq!(state.jwt.unwrap().scopes, "openid email federated:id");
-        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None, scopes: None }) });
+        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None, scopes: None }), on_behalf_of: None });
         let (state, conditions) = reconcile_inner(&r, &store).unwrap();
         assert_eq!(conditions[1].status, "False");
         assert!(conditions[1].message.contains("auth.jwt"), "{}", conditions[1].message);
         assert!(state.jwt.is_none());
+    }
+
+    #[test]
+    fn on_behalf_of_needs_trusted_keys_and_lands_lower_cased_on_the_route() {
+        use crate::ai_types::{AIOnBehalfOfSpec, AIRouteAuth};
+        let store = ConfigStore::new();
+        gateway(&store);
+        provider(&store, "anthropic");
+        let mut r = route(vec![rule(None, None, &["anthropic"])]);
+        r.spec.require_api_key = true;
+        r.spec.auth = Some(AIRouteAuth { jwt: None, on_behalf_of: Some(AIOnBehalfOfSpec { header: Some("X-Acting-User".into()), trusted_keys: vec!["team-a/hub".into(), " ".into(), "orchestrator".into()] }) });
+        let (state, conditions) = reconcile_inner(&r, &store).unwrap();
+        assert_eq!(conditions[1].status, "True", "{}", conditions[1].message);
+        assert_eq!(state.on_behalf_of, Some(AIOnBehalfOfState { header: "x-acting-user".into(), trusted_keys: vec!["team-a/hub".into(), "orchestrator".into()] }));
+        r.spec.auth = Some(AIRouteAuth { jwt: None, on_behalf_of: Some(AIOnBehalfOfSpec { header: None, trusted_keys: vec!["hub".into()] }) });
+        let (state, _) = reconcile_inner(&r, &store).unwrap();
+        assert_eq!(state.on_behalf_of.unwrap().header, "x-portus-on-behalf-of", "default header");
+        r.spec.auth = Some(AIRouteAuth { jwt: None, on_behalf_of: Some(AIOnBehalfOfSpec { header: None, trusted_keys: vec![] }) });
+        let (state, conditions) = reconcile_inner(&r, &store).unwrap();
+        assert_eq!(conditions[1].status, "False");
+        assert!(conditions[1].message.contains("trustedKeys"), "{}", conditions[1].message);
+        assert!(state.on_behalf_of.is_none(), "nobody is trusted by default");
+        r.spec.auth = Some(AIRouteAuth { jwt: None, on_behalf_of: Some(AIOnBehalfOfSpec { header: Some("bad header".into()), trusted_keys: vec!["hub".into()] }) });
+        let (_, conditions) = reconcile_inner(&r, &store).unwrap();
+        assert!(conditions[1].message.contains("header"), "{}", conditions[1].message);
+    }
+
+    #[test]
+    fn a_rule_url_rewrite_becomes_the_http_route_filter_and_bad_ones_are_reported() {
+        use crate::ai_types::AIUrlRewrite;
+        use crate::gateway_types::HTTPPathModifierCRD;
+        let store = ConfigStore::new();
+        gateway(&store);
+        provider(&store, "anthropic");
+        let mut good = rule(None, None, &["anthropic"]);
+        good.url_rewrite = Some(AIUrlRewrite { path: Some(HTTPPathModifierCRD { modifier_type: Some("ReplaceFullPath".into()), replace_full_path: Some("/mcp".into()), replace_prefix_match: None }) });
+        let mut prefix = rule(None, None, &["anthropic"]);
+        prefix.url_rewrite = Some(AIUrlRewrite { path: Some(HTTPPathModifierCRD { modifier_type: Some("ReplacePrefixMatch".into()), replace_full_path: None, replace_prefix_match: Some("/".into()) }) });
+        let (state, conditions) = reconcile_inner(&route(vec![good, prefix]), &store).unwrap();
+        assert_eq!(conditions[1].status, "True", "{}", conditions[1].message);
+        assert_eq!(state.rules[0].filters, vec![HTTPFilterState::URLRewrite { hostname: None, path: Some("/mcp".into()), path_type: Some("ReplaceFullPath".into()) }]);
+        assert_eq!(state.rules[1].filters, vec![HTTPFilterState::URLRewrite { hostname: None, path: Some("/".into()), path_type: Some("ReplacePrefixMatch".into()) }]);
+        let mut bad = rule(None, None, &["anthropic"]);
+        bad.url_rewrite = Some(AIUrlRewrite { path: Some(HTTPPathModifierCRD { modifier_type: Some("ReplaceFullPath".into()), replace_full_path: Some("mcp".into()), replace_prefix_match: None }) });
+        let mut missing = rule(None, None, &["anthropic"]);
+        missing.url_rewrite = Some(AIUrlRewrite { path: Some(HTTPPathModifierCRD { modifier_type: Some("ReplacePrefixMatch".into()), replace_full_path: None, replace_prefix_match: None }) });
+        let (state, conditions) = reconcile_inner(&route(vec![bad, missing]), &store).unwrap();
+        assert_eq!(conditions[1].status, "False");
+        assert!(conditions[1].message.contains("must start with /") && conditions[1].message.contains("replacePrefixMatch is required"), "{}", conditions[1].message);
+        assert!(state.rules.iter().all(|r| r.filters.is_empty()));
     }
 
     fn rule(model: Option<AIStringMatch>, stream: Option<bool>, providers: &[&str]) -> AIRouteRule {
@@ -350,6 +450,7 @@ mod tests {
                 headers: Vec::new(),
             }],
             provider_refs: providers.iter().map(|p| AIProviderRef { name: p.to_string(), weight: None }).collect(),
+            url_rewrite: None,
         }
     }
 
@@ -427,6 +528,7 @@ mod tests {
         let r = route(vec![AIRouteRule {
             matches: vec![m(Some(("Exact", "tools/call")), Some(("Exact", "github.search")), None)],
             provider_refs: vec![AIProviderRef { name: "anthropic".into(), weight: None }],
+            url_rewrite: None,
         }]);
         let (state, conditions) = reconcile_inner(&r, &store).unwrap();
         assert_eq!(conditions[1].status, "True", "{}", conditions[1].message);

@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     allowed_tools TEXT NOT NULL DEFAULT '',
     external INTEGER NOT NULL,
     created_unix_micros INTEGER NOT NULL,
-    revoked_unix_micros INTEGER
+    revoked_unix_micros INTEGER,
+    expires_unix_secs INTEGER
 );
 ";
 
@@ -38,6 +39,28 @@ pub struct KeyRow {
     pub external: bool,
     pub created_unix_micros: u64,
     pub revoked_unix_micros: Option<u64>,
+    /// Unix seconds the key stops working at; None: never. An expired key
+    /// is revoked (with `revoked_unix_micros` set) by the ledger's sweep.
+    pub expires_unix_secs: Option<u64>,
+}
+
+/// What a PATCH may change on a live key; every field optional.
+#[derive(Debug, Clone, Default, serde::Deserialize, PartialEq, Eq)]
+pub struct KeyPatch {
+    pub tenant: Option<String>,
+    pub name: Option<String>,
+    pub allowed_models: Option<Vec<String>>,
+    pub allowed_tools: Option<Vec<String>>,
+    /// Seconds from now until the key expires; 0 clears an expiry.
+    pub expires_in_secs: Option<u64>,
+}
+
+fn now_secs() -> u64 {
+    now_micros() / 1_000_000
+}
+
+fn expiry(expires_in_secs: Option<u64>) -> Option<u64> {
+    expires_in_secs.filter(|s| *s > 0).map(|s| now_secs() + s)
 }
 
 pub fn hash_key(key: &str) -> [u8; 32] {
@@ -69,15 +92,17 @@ pub fn issue(
     allowed_models: &[String],
     allowed_tools: &[String],
     plaintext: Option<&str>,
+    expires_in_secs: Option<u64>,
 ) -> rusqlite::Result<(KeyRow, String)> {
     let external = plaintext.is_some();
     let key = plaintext.map(str::to_string).unwrap_or_else(generate_key);
     let id: u64 = rand::random::<u64>() >> 1; // fits SQLite's signed INTEGER
     let created = now_micros();
+    let expires = expiry(expires_in_secs);
     conn.execute(
-        "INSERT INTO api_keys (id, hash, tenant, name, allowed_models, allowed_tools, external, created_unix_micros, revoked_unix_micros)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
-        params![id as i64, hash_key(&key).to_vec(), tenant, name, allowed_models.join(","), allowed_tools.join(","), external, created as i64],
+        "INSERT INTO api_keys (id, hash, tenant, name, allowed_models, allowed_tools, external, created_unix_micros, revoked_unix_micros, expires_unix_secs)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+        params![id as i64, hash_key(&key).to_vec(), tenant, name, allowed_models.join(","), allowed_tools.join(","), external, created as i64, expires.map(|e| e as i64)],
     )?;
     let row = KeyRow {
         id,
@@ -88,8 +113,37 @@ pub fn issue(
         external,
         created_unix_micros: created,
         revoked_unix_micros: None,
+        expires_unix_secs: expires,
     };
     Ok((row, key))
+}
+
+/// Change a live key in place. The plaintext and hash never change, so
+/// clients keep working; the data planes get the new lists in the next
+/// snapshot. `None` when there is no live key with that id.
+pub fn update(conn: &Connection, id: u64, patch: &KeyPatch) -> rusqlite::Result<Option<KeyRow>> {
+    let Some(current) = list(conn)?.into_iter().find(|k| k.id == id && k.revoked_unix_micros.is_none()) else { return Ok(None) };
+    let tenant = patch.tenant.as_deref().map(str::trim).unwrap_or(&current.tenant);
+    let name = patch.name.as_deref().map(str::trim).unwrap_or(&current.name);
+    let models = patch.allowed_models.as_ref().unwrap_or(&current.allowed_models);
+    let tools = patch.allowed_tools.as_ref().unwrap_or(&current.allowed_tools);
+    let expires = match patch.expires_in_secs {
+        Some(secs) => expiry(Some(secs)),
+        None => current.expires_unix_secs,
+    };
+    conn.execute(
+        "UPDATE api_keys SET tenant = ?2, name = ?3, allowed_models = ?4, allowed_tools = ?5, expires_unix_secs = ?6 WHERE id = ?1 AND revoked_unix_micros IS NULL",
+        params![id as i64, tenant, name, models.join(","), tools.join(","), expires.map(|e| e as i64)],
+    )?;
+    Ok(Some(KeyRow { tenant: tenant.to_string(), name: name.to_string(), allowed_models: models.clone(), allowed_tools: tools.clone(), expires_unix_secs: expires, ..current }))
+}
+
+/// Revoke every live key whose expiry has passed. Returns how many.
+pub fn expire(conn: &Connection, now_unix_secs: u64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE api_keys SET revoked_unix_micros = ?1 WHERE revoked_unix_micros IS NULL AND expires_unix_secs IS NOT NULL AND expires_unix_secs <= ?2",
+        params![(now_unix_secs * 1_000_000) as i64, now_unix_secs as i64],
+    )
 }
 
 /// Mark a key revoked. Returns whether a live key was found.
@@ -108,7 +162,7 @@ fn split_models(s: &str) -> Vec<String> {
 /// Every key, revoked ones included, newest first.
 pub fn list(conn: &Connection) -> rusqlite::Result<Vec<KeyRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, tenant, name, allowed_models, external, created_unix_micros, revoked_unix_micros, allowed_tools
+        "SELECT id, tenant, name, allowed_models, external, created_unix_micros, revoked_unix_micros, allowed_tools, expires_unix_secs
          FROM api_keys ORDER BY created_unix_micros DESC, id",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -121,6 +175,7 @@ pub fn list(conn: &Connection) -> rusqlite::Result<Vec<KeyRow>> {
             external: r.get(4)?,
             created_unix_micros: r.get::<_, i64>(5)? as u64,
             revoked_unix_micros: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+            expires_unix_secs: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
         })
     })?;
     rows.collect()
@@ -129,10 +184,11 @@ pub fn list(conn: &Connection) -> rusqlite::Result<Vec<KeyRow>> {
 /// The live keys as the data planes receive them.
 pub fn snapshot(conn: &Connection, version: u64) -> rusqlite::Result<KeySnapshot> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, hash, tenant, name, allowed_models, allowed_tools FROM api_keys WHERE revoked_unix_micros IS NULL ORDER BY id",
+        "SELECT id, hash, tenant, name, allowed_models, allowed_tools, expires_unix_secs FROM api_keys
+         WHERE revoked_unix_micros IS NULL AND (expires_unix_secs IS NULL OR expires_unix_secs > ?1) ORDER BY id",
     )?;
     let keys = stmt
-        .query_map([], |r| {
+        .query_map(params![now_secs() as i64], |r| {
             Ok(KeyEntry {
                 id: r.get::<_, i64>(0)? as u64,
                 hash_sha256: r.get(1)?,
@@ -140,6 +196,7 @@ pub fn snapshot(conn: &Connection, version: u64) -> rusqlite::Result<KeySnapshot
                 name: r.get(3)?,
                 allowed_models: split_models(&r.get::<_, String>(4)?),
                 allowed_tools: split_models(&r.get::<_, String>(5)?),
+                expires_unix_secs: r.get::<_, Option<i64>>(6)?.map(|v| v as u64).unwrap_or(0),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -167,8 +224,8 @@ mod tests {
     #[test]
     fn issued_keys_appear_in_the_snapshot_by_hash_until_revoked() {
         let c = conn();
-        let (row, key) = issue(&c, "team-a", "ci", &["claude-haiku-4-5".to_string()], &["echo".to_string(), "github.*".to_string()], None).unwrap();
-        let (ext_row, ext_key) = issue(&c, "team-b", "legacy", &[], &[], Some("sk-external-123")).unwrap();
+        let (row, key) = issue(&c, "team-a", "ci", &["claude-haiku-4-5".to_string()], &["echo".to_string(), "github.*".to_string()], None, None).unwrap();
+        let (ext_row, ext_key) = issue(&c, "team-b", "legacy", &[], &[], Some("sk-external-123"), None).unwrap();
         assert_eq!(ext_key, "sk-external-123");
         assert!(ext_row.external && !row.external);
 
@@ -197,7 +254,48 @@ mod tests {
     #[test]
     fn the_same_plaintext_cannot_be_stored_twice() {
         let c = conn();
-        issue(&c, "a", "one", &[], &[], Some("dup")).unwrap();
-        assert!(issue(&c, "a", "two", &[], &[], Some("dup")).is_err());
+        issue(&c, "a", "one", &[], &[], Some("dup"), None).unwrap();
+        assert!(issue(&c, "a", "two", &[], &[], Some("dup"), None).is_err());
+    }
+
+    #[test]
+    fn a_key_is_changed_in_place_and_keeps_its_plaintext() {
+        let c = conn();
+        let (row, key) = issue(&c, "team-a", "hub", &["claude-haiku-4-5".to_string()], &[], None, None).unwrap();
+        let patched = update(&c, row.id, &KeyPatch { allowed_models: Some(vec!["claude-opus-5".to_string()]), allowed_tools: Some(vec!["github.*".to_string()]), name: Some("hub-2".into()), ..Default::default() }).unwrap().unwrap();
+        assert_eq!((patched.id, patched.tenant.as_str(), patched.name.as_str()), (row.id, "team-a", "hub-2"));
+        assert_eq!((patched.allowed_models, patched.allowed_tools), (vec!["claude-opus-5".to_string()], vec!["github.*".to_string()]));
+        let snap = snapshot(&c, 2).unwrap();
+        assert_eq!(snap.keys[0].hash_sha256, hash_key(&key).to_vec(), "same key, new lists");
+        assert_eq!(snap.keys[0].allowed_models, vec!["claude-opus-5".to_string()]);
+        assert_eq!(update(&c, 12345, &KeyPatch::default()).unwrap(), None, "unknown id");
+        assert!(revoke(&c, row.id).unwrap());
+        assert_eq!(update(&c, row.id, &KeyPatch::default()).unwrap(), None, "a revoked key cannot be edited");
+    }
+
+    #[test]
+    fn expiring_keys_leave_the_snapshot_and_are_revoked_by_the_sweep() {
+        let c = conn();
+        let (forever, _) = issue(&c, "t", "forever", &[], &[], None, None).unwrap();
+        let (soon, _) = issue(&c, "t", "soon", &[], &[], None, Some(3600)).unwrap();
+        let now = now_secs();
+        let exp = soon.expires_unix_secs.unwrap();
+        assert!(exp >= now + 3599 && exp <= now + 3601, "{exp} vs {now}");
+        assert_eq!(forever.expires_unix_secs, None);
+        let snap = snapshot(&c, 1).unwrap();
+        assert_eq!(snap.keys.len(), 2);
+        assert_eq!(snap.keys.iter().find(|k| k.id == soon.id).unwrap().expires_unix_secs, exp, "the data plane learns the expiry");
+        assert_eq!(snap.keys.iter().find(|k| k.id == forever.id).unwrap().expires_unix_secs, 0);
+        // Rotation grace: an existing key gets an expiry; 0 clears it again.
+        let graced = update(&c, forever.id, &KeyPatch { expires_in_secs: Some(60), ..Default::default() }).unwrap().unwrap();
+        assert!(graced.expires_unix_secs.is_some());
+        let cleared = update(&c, forever.id, &KeyPatch { expires_in_secs: Some(0), ..Default::default() }).unwrap().unwrap();
+        assert_eq!(cleared.expires_unix_secs, None);
+        assert_eq!(expire(&c, now).unwrap(), 0, "nothing has expired yet");
+        assert_eq!(expire(&c, exp).unwrap(), 1);
+        assert_eq!(snapshot(&c, 2).unwrap().keys.iter().map(|k| k.id).collect::<Vec<_>>(), vec![forever.id]);
+        let soon_row = list(&c).unwrap().into_iter().find(|k| k.id == soon.id).unwrap();
+        assert_eq!(soon_row.revoked_unix_micros, Some(exp * 1_000_000), "revoked at its expiry");
+        assert_eq!(expire(&c, exp + 1).unwrap(), 0, "once");
     }
 }

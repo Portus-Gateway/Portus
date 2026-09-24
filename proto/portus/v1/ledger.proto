@@ -43,6 +43,16 @@ message UsageRecord {
   // an OAuth token's claims (the ledger has no key row for those).
   string tenant = 20;
   string subject = 21;
+  // What refused the request: the AIUsagePolicy (namespace/name) for a
+  // spent budget, "key" or "jwt" for an allow list. Empty when forwarded.
+  string rule = 22;
+  // The client's own x-portus-request-id, when it sent one (for correlating
+  // a turn with its rows); the gateway's request_id is always echoed back.
+  string client_request_id = 23;
+  // Time to the first response body byte; 0 when there was none.
+  uint64 first_byte_micros = 24;
+  // The user the trusted caller acted for (auth.onBehalfOf); empty otherwise.
+  string on_behalf_of = 25;
 }
 
 message ReportAck {
@@ -108,4 +118,8 @@ message KeyEntry {
   repeated string allowed_models = 5;
   // MCP: tools a tools/call may name, exact or "prefix.*". Empty: any.
   repeated string allowed_tools = 6;
+  // Unix seconds after which the key stops working; 0: never. The ledger
+  // leaves expired keys out of the snapshot; this lets a data plane refuse
+  // one between snapshots.
+  uint64 expires_unix_secs = 7;
 }

@@ -69,8 +69,8 @@ spec:
                       enum: [Hourly, Daily, Monthly]
                     per:
                       type: string
-                      enum: [Key, Tenant, Route]
-                      description: "Whose counter the request spends from; default Key"
+                      enum: [Key, Subject, Tenant, Route]
+                      description: "Whose counter the request spends from; default Key. Subject: the user behind the call (the auth.onBehalfOf name under its key, else the key or OAuth subject)"
                 onLedgerUnavailable:
                   type: string
                   enum: [Open, Closed]

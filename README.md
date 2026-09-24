@@ -39,7 +39,7 @@ kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
 # Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.7 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.8 \
   --namespace portus --create-namespace
 ```
 
@@ -173,13 +173,19 @@ spec:
   put `model` after the prompt, so this matters.
 - **Keys.** The ledger issues `portus_sk_…` keys or imports external ones and stores only hashes;
   the data plane checks a key with one hash and one lookup against a pushed snapshot. Keys carry
-  `allowed_models` and `allowed_tools`.
+  `allowed_models` and `allowed_tools`, can expire, and are edited in place (`PATCH`) without a
+  new key or a restart.
+- **Who is behind a call.** A hub holding one key for many users names the user in
+  `x-portus-on-behalf-of` (`auth.onBehalfOf`, believed from listed keys only); the ledger records
+  the user, budgets can be per subject, and the header never reaches the provider.
 - **Metering and budgets.** Input, output and cache tokens are read from JSON and SSE responses of
-  both dialects. Budgets are local counters per key, tenant or route, reserved before the request
-  and settled after, synced with the ledger once a second; every response carries
-  `x-portus-tokens-remaining`.
+  both dialects. Budgets are local counters per key, subject, tenant or route, reserved before the
+  request and settled after, synced with the ledger once a second; every response carries
+  `x-portus-tokens-remaining` and `x-portus-request-id`.
+- **Usage data.** `/v1/summary` groups by key, subject, model, tool, tenant or route with refusal
+  reasons and latency; `/v1/series` gives the same per time bucket; `/export.jsonl` is every row.
 - **Refusals in the provider's shape**: 401 `authentication_error`, 403 `permission_error`, 429
-  with `Retry-After`. Every refusal is recorded with its reason.
+  with `Retry-After`. Every refusal is recorded with its reason and the rule behind it.
 - **Ordinary policies apply**: `TimeoutPolicy`, `RateLimitPolicy`, `RetryPolicy` and the rest
   target an AIRoute like an HTTPRoute.
 - **Claude Code** works unchanged: `ANTHROPIC_BASE_URL=https://llm.example.com ANTHROPIC_API_KEY=portus_sk_… claude`.
@@ -351,7 +357,7 @@ budget syncs and usage records on the ledger stream.
 ### Helm Values
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.7 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.8 \
   --namespace portus --create-namespace \
   --set dataplane.replicasPerGateway=3
 ```
@@ -378,7 +384,7 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `aiGateway.enabled` | `false` | Deploy the ledger and enable AI routes (Rama stack). Upgrade with your values in a file (`-f`), not a reuse flag; installs first created before 0.2.6 delete the generated grpc-tls Secret once |
 | `aiGateway.ledger.storage.size` | `1Gi` | PersistentVolumeClaim for the ledger's SQLite file |
 | `aiGateway.ledger.adminTokenSecretName` | `""` | Bring your own admin token Secret (key `token`) for the key API and the usage reads |
-| `aiGateway.ledger.openReads` | `false` | Serve `/export.jsonl` and `/v1/summary` without the token |
+| `aiGateway.ledger.openReads` | `false` | Serve `/export.jsonl`, `/v1/summary` and `/v1/series` without the token |
 | `aiGateway.jwt.issuers` | `[]` | OAuth issuers whose tokens `AIRoute.auth.jwt` may accept; the ledger fetches their JWKS every 5 minutes |
 
 Full reference: [`docs/deployment.md`](docs/deployment.md). Policies: [`docs/policies.md`](docs/policies.md).

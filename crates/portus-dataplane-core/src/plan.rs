@@ -752,9 +752,7 @@ mod tests {
     }
 
     fn snapshot_with(routes: Vec<PathRoute>) -> ProxySnapshot {
-        let needs_body = crate::router::needs_body_fields(
-            &routes.iter().flat_map(|r| r.header_matches.iter().cloned()).collect::<Vec<_>>(),
-        );
+        let needs_body = routes.iter().any(crate::router::route_needs_body);
         let mut exact_map = HashMap::new();
         exact_map.insert(Arc::from("/v1/messages"), routes);
         let host_routes = HostRoutes { exact_map, rules: Vec::new(), catch_all: None, needs_body, oauth: None };
@@ -835,6 +833,7 @@ mod tests {
             budget: None,
             session_affinity: true,
             jwt: Some(crate::ai::jwt::JwtPolicy { issuer: Arc::from("https://dex.example.com"), audience: None, tenant_claim: Arc::from("groups"), tools_claim: Arc::from("scope"), scopes: Arc::from("openid profile email groups") }),
+            on_behalf_of: None,
         });
         let mut snap = snapshot_with(vec![route]);
         // The test builder does not compute the issuer; the receiver does.

@@ -183,6 +183,7 @@ pub fn verify(token: &str, policy: &JwtPolicy, jwks: &Jwks, now_unix_secs: u64) 
         name: Arc::from(name),
         allowed_models: Arc::from(Vec::new()),
         allowed_tools: Arc::from(tools),
+        expires_unix_secs: exp,
     };
     Some((info, exp))
 }

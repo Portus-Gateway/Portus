@@ -564,7 +564,15 @@ pub struct AIRouteState {
     pub require_api_key: bool,
     /// `auth.jwt`, normalised (claims defaulted).
     pub jwt: Option<AIJwtState>,
+    /// `auth.onBehalfOf`: header (lower-case) and the keys believed.
+    pub on_behalf_of: Option<AIOnBehalfOfState>,
     pub generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AIOnBehalfOfState {
+    pub header: String,
+    pub trusted_keys: Vec<String>,
 }
 
 /// An AIRoute's OAuth acceptance as the compiler needs it.
@@ -603,6 +611,8 @@ pub struct AIRouteRuleState {
     pub backend_refs: Vec<BackendRefState>,
     /// The provider named by the rule, resolved or not.
     pub provider: NamespacedName,
+    /// `urlRewrite`, as the HTTPRoute filter the compiler already handles.
+    pub filters: Vec<HTTPFilterState>,
 }
 
 impl RouteState for GRPCRouteState {

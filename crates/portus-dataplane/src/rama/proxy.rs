@@ -62,6 +62,14 @@ static NO_SNAPSHOT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// attempt.
 const RETRY_BUFFER_MAX: u64 = 64 * 1024;
 
+/// Every AI response carries the gateway's request id in this header; a
+/// client may send its own id in it and finds it on the ledger row.
+const REQUEST_ID_HEADER: &str = "x-portus-request-id";
+
+fn request_id_value(id: u64) -> http::HeaderValue {
+    http::HeaderValue::from_str(&format!("{id:016x}")).unwrap_or_else(|_| http::HeaderValue::from_static(""))
+}
+
 /// Read view of Rama's header map for the core.
 struct Headers<'a>(&'a HeaderMap);
 
@@ -80,7 +88,11 @@ impl RequestHeaders for Headers<'_> {
 struct HeadersMut<'a>(&'a mut HeaderMap);
 
 fn rama_name(name: &http::HeaderName) -> Option<HeaderName> {
-    HeaderName::from_bytes(name.as_str().as_bytes()).ok()
+    rama_name_str(name.as_str())
+}
+
+fn rama_name_str(name: &str) -> Option<HeaderName> {
+    HeaderName::from_bytes(name.as_bytes()).ok()
 }
 
 fn rama_value(value: &http::HeaderValue) -> Option<HeaderValue> {
@@ -261,6 +273,17 @@ impl ProxyService {
         let mut key_id = 0;
         let mut tenant: Option<Arc<str>> = None;
         let mut who_name: Option<Arc<str>> = None;
+        // The user a trusted caller acts for (auth.onBehalfOf), and whether
+        // the caller proved itself with a JWT rather than a Portus key.
+        let mut on_behalf_of: Option<String> = None;
+        let mut via_jwt = false;
+        // One id per request: the ledger row carries it and the client gets
+        // it back in x-portus-request-id; the client's own id, if it sent
+        // one in the same header, is recorded next to it.
+        let gateway_request_id: u64 = rand::random();
+        let client_request_id: Option<String> = plan.ai.as_ref().and_then(|_| {
+            req.headers().get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty() && v.len() <= 64).map(str::to_string)
+        });
         let field = |key: &str| body_fields.as_ref().and_then(|f| f.iter().find(|(k, _)| *k == key)).map(|(_, v)| v.as_str());
         let model = field("model");
         // The JSON-RPC id, as JSON text, for MCP refusals to echo.
@@ -287,9 +310,10 @@ impl ProxyService {
                     let bearer = presented_key(&request_headers);
                     match (ai.jwt.as_ref(), bearer) {
                         (Some(policy), Some(token)) if looks_like_jwt(token) => {
+                            via_jwt = true;
                             ledger.tokens.get_or_verify(token, policy, &keys.jwks, unix_now()).ok_or(Refusal::Unauthenticated)
                         }
-                        _ => authorize(&keys, &request_headers, Access::Other).cloned(),
+                        _ => authorize(&keys, &request_headers, Access::Other, unix_now()).cloned(),
                     }
                 }
                 None => Err(Refusal::Unauthenticated),
@@ -308,6 +332,9 @@ impl ProxyService {
                     key_id = info.id;
                     tenant = Some(Arc::clone(&info.tenant));
                     who_name = Some(Arc::clone(&info.name));
+                    if let Some(policy) = ai.on_behalf_of.as_ref() {
+                        on_behalf_of = policy.user(&Headers(req.headers()), &info).map(str::to_string);
+                    }
                 }
                 Err(refusal) => {
                     let mut reply = refusal.reply(ai.dialect, subject, request_id);
@@ -323,11 +350,18 @@ impl ProxyService {
                             reply = reply.with_header(http::header::WWW_AUTHENTICATE, v);
                         }
                     }
+                    let reply = reply.with_header(http::header::HeaderName::from_static(REQUEST_ID_HEADER), request_id_value(gateway_request_id));
                     let status = reply.status;
                     self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                     if let Some(ledger) = self.ledger.as_ref() {
                         // A model or tool refusal knows its subject; an authentication one does not.
+                        // A trusted caller's refusal is the named user's refusal.
                         let key_id = known.as_ref().map(|k| k.id).unwrap_or(0);
+                        let request_headers = Headers(req.headers());
+                        let vouched: Option<&str> = match (ai.on_behalf_of.as_ref(), known.as_ref()) {
+                            (Some(policy), Some(k)) => policy.user(&request_headers, k),
+                            _ => None,
+                        };
                         let side = RequestSide {
                             ai,
                             host,
@@ -336,7 +370,11 @@ impl ProxyService {
                             start,
                             key_id,
                             tenant: known.as_ref().map(|k| k.tenant.as_ref()),
-                            subject: known.as_ref().map(|k| k.name.as_ref()),
+                            subject: vouched.or(known.as_ref().map(|k| k.name.as_ref())),
+                            on_behalf_of: vouched,
+                            request_id: gateway_request_id,
+                            client_request_id: client_request_id.as_deref(),
+                            rule: known.as_ref().map(|_| if via_jwt { "jwt" } else { "key" }),
                             reservation: None,
                         };
                         record_refusal(status, refusal.kind(), side, &ledger.ring);
@@ -349,7 +387,15 @@ impl ProxyService {
             }
             req.headers_mut().remove("x-api-key");
             req.headers_mut().remove("authorization");
+            // The user's name is for the ledger, never for the provider.
+            if let Some(policy) = ai.on_behalf_of.as_ref()
+                && let Some(n) = rama_name_str(&policy.header)
+            {
+                req.headers_mut().remove(n);
+            }
         }
+        // Who the row names: the vouched-for user, else the key or OAuth subject.
+        let acting: Option<Arc<str>> = on_behalf_of.as_deref().map(Arc::from).or_else(|| who_name.clone());
         // Token budget: reserve an estimate against the subject's counter
         // (one atomic), settle to the real count when the response ends. The
         // counter syncs with the ledger in the background.
@@ -361,6 +407,9 @@ impl ProxyService {
                 Scope::Key => Arc::from("anonymous"),
                 Scope::Tenant => tenant.clone().unwrap_or_else(|| Arc::from("anonymous")),
                 Scope::Route => Arc::from("route"),
+                // The user behind the call, under the key that vouched for
+                // it, so two hubs naming the same user do not share a counter.
+                Scope::Subject => Arc::from(format!("{key_id}:{}", acting.as_deref().unwrap_or("anonymous"))),
             };
             let max_tokens = field("max_tokens").and_then(|v| v.parse::<u64>().ok());
             let cost = cost(budget.unit, max_tokens, request_bytes);
@@ -389,11 +438,12 @@ impl ProxyService {
                 Verdict::Unknown => Some((1, 0, cost)),
             };
             if let Some((retry, remaining, needed)) = refuse {
-                let reply = exhausted_reply(ai.dialect, budget.unit, retry, remaining, needed, request_id);
+                let reply = exhausted_reply(ai.dialect, budget.unit, retry, remaining, needed, request_id)
+                    .with_header(http::header::HeaderName::from_static(REQUEST_ID_HEADER), request_id_value(gateway_request_id));
                 let status = reply.status;
                 self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
                 if let Some(ledger) = self.ledger.as_ref() {
-                    let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: who_name.as_deref(), reservation: None };
+                    let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: acting.as_deref(), on_behalf_of: on_behalf_of.as_deref(), request_id: gateway_request_id, client_request_id: client_request_id.as_deref(), rule: Some(budget.id.as_ref()), reservation: None };
                     record_refusal(status, RefusalKind::BudgetExhausted, side, &ledger.ring);
                 }
                 if let Some((method, path)) = &logged {
@@ -410,8 +460,14 @@ impl ProxyService {
         {
             response.headers_mut().insert(n, HeaderValue::from(remaining.max(0)));
         }
+        if plan.ai.is_some()
+            && let Some(n) = rama_name_str(REQUEST_ID_HEADER)
+            && let Ok(v) = HeaderValue::from_str(&format!("{gateway_request_id:016x}"))
+        {
+            response.headers_mut().insert(n, v);
+        }
         if let (Some(ai), Some(ledger)) = (plan.ai.as_ref(), self.ledger.as_ref()) {
-            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: who_name.as_deref(), reservation };
+            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: acting.as_deref(), on_behalf_of: on_behalf_of.as_deref(), request_id: gateway_request_id, client_request_id: client_request_id.as_deref(), rule: None, reservation };
             let body = std::mem::replace(response.body_mut(), Body::empty());
             // A provider that compressed anyway cannot be metered; say so once.
             let readable = response

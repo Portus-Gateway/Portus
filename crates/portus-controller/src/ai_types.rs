@@ -96,6 +96,23 @@ pub struct AIRouteAuth {
     /// plane against the issuer's JWKS, which the ledger fetches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt: Option<AIJwtSpec>,
+    /// A trusted caller (a hub, an orchestrator holding one key for many
+    /// users) names the user it acts for in a header; the gateway records
+    /// that user as the subject and can budget per subject.
+    #[serde(rename = "onBehalfOf", default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<AIOnBehalfOfSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AIOnBehalfOfSpec {
+    /// Header carrying the user's name; default `x-portus-on-behalf-of`.
+    /// Stripped before the request reaches the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// Keys whose header is believed, by `name` or `tenant/name`. From any
+    /// other key the header is ignored.
+    #[serde(rename = "trustedKeys", default)]
+    pub trusted_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -128,6 +145,17 @@ pub struct AIRouteRule {
     /// Providers in this rule's namespace; weights split traffic.
     #[serde(rename = "providerRefs", default)]
     pub provider_refs: Vec<AIProviderRef>,
+    /// Rewrite the path before forwarding, as HTTPRoute's URLRewrite filter:
+    /// `ReplaceFullPath` or `ReplacePrefixMatch` against the rule's path
+    /// match.
+    #[serde(rename = "urlRewrite", default, skip_serializing_if = "Option::is_none")]
+    pub url_rewrite: Option<AIUrlRewrite>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AIUrlRewrite {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<crate::gateway_types::HTTPPathModifierCRD>,
 }
 
 /// One match: every set field must match (AND). A rule with several matches
@@ -203,7 +231,9 @@ pub struct AIBudgetSpec {
     pub calls: Option<u64>,
     /// `Hourly`, `Daily` or `Monthly`, fixed windows in UTC.
     pub window: String,
-    /// Whose counter: `Key` (default), `Tenant` or `Route`.
+    /// Whose counter: `Key` (default), `Subject` (the user behind the call:
+    /// the `auth.onBehalfOf` name under its key, else the key or OAuth
+    /// subject), `Tenant` or `Route`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per: Option<String>,
 }

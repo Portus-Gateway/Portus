@@ -11,7 +11,7 @@ the request path.
 ## Install
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.7 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.8 \
   --namespace portus --create-namespace --set aiGateway.enabled=true
 ```
 
@@ -82,6 +82,36 @@ key (see [OAuth clients](#oauth-clients)).
 | `toolsClaim` | claim name, default `scope` | The MCP tools the subject may call: an array of strings or a space-separated string |
 | `scopes` | list, default `[openid, profile, email, groups]` | What clients are told to request: `scopes_supported` in the metadata document and `scope` in the 401 challenge. Dex behind an upstream connector needs `federated:id` added when the token's `federated_claims` matter |
 
+`auth.onBehalfOf` is for a caller that holds one key for many users (a hub, an
+orchestrator): it names the user it acts for in a header, the gateway records that user as
+the row's `subject` (the key stays on the row as the one that vouched, and `on_behalf_of`
+repeats the name), an `AIUsagePolicy` with `budget.per: Subject` limits each user
+separately, and the header never reaches the provider. Only keys listed in `trustedKeys`
+(`name` or `tenant/name`) are believed; from any other key the header is dropped, so an
+agent cannot claim to be someone else.
+
+```yaml
+auth:
+  onBehalfOf:
+    header: x-portus-on-behalf-of   # default
+    trustedKeys: [team-a/hub]
+```
+
+A rule may carry `urlRewrite` with the shape of HTTPRoute's URLRewrite filter
+(`path.type: ReplaceFullPath | ReplacePrefixMatch`), for a server that lives at `/mcp`
+behind a route matched on `/tools/deepwiki`:
+
+```yaml
+rules:
+  - matches: [{ path: { type: PathPrefix, value: /tools/deepwiki } }]
+    urlRewrite: { path: { type: ReplaceFullPath, replaceFullPath: /mcp } }
+    providerRefs: [{ name: deepwiki }]
+```
+
+Every response on an AI route carries `x-portus-request-id`, the id of the ledger row
+(16 hex characters). A client may send its own id in the same header; it is stored as the
+row's `client_request_id`, so a turn's tokens can be tied to the gateway's bill.
+
 The body is scanned as it streams for `model`, `stream`, `max_tokens`, `method`, `id`
 and `params` (`params` kept up to 64 KiB to read the tool name). Bodies over 8 MiB are
 refused with 413; the bytes read are replayed to the provider unchanged.
@@ -96,7 +126,7 @@ route; the oldest wins a conflict).
 | `budget.tokens` | integer ≥ 1 | Input + output + cache read + cache creation tokens per window (LLM routes) |
 | `budget.calls` | integer ≥ 1 | JSON-RPC requests that reached the server per window (MCP routes) |
 | `budget.window` | `Hourly`, `Daily`, `Monthly` | Fixed windows in UTC |
-| `budget.per` | `Key` (default), `Tenant`, `Route` | Whose counter the request spends from |
+| `budget.per` | `Key` (default), `Subject`, `Tenant`, `Route` | Whose counter the request spends from. `Subject`: the user behind the call, the `auth.onBehalfOf` name under its key, else the key or OAuth subject itself |
 | `onLedgerUnavailable` | `Open` (default), `Closed` | Before the first sync of a window with the ledger unreachable |
 
 Exactly one of `tokens` and `calls` is set. The gateway forwards `Accept-Encoding: identity`
@@ -118,11 +148,13 @@ tenants and subjects. `aiGateway.ledger.openReads: true` serves `/export.jsonl` 
 
 | Call | Body / result |
 |---|---|
-| `POST /v1/keys` | `{"tenant","name","allowed_models":[…],"allowed_tools":[…],"key"}`; `key` imports an external key (≥ 16 characters), omitted generates `portus_sk_` + 40 hex. The plaintext is returned once |
-| `GET /v1/keys` | Every key, revoked ones included, without plaintext or hash |
+| `POST /v1/keys` | `{"tenant","name","allowed_models":[…],"allowed_tools":[…],"key","expires_in_secs"}`; `key` imports an external key (≥ 16 characters), omitted generates `portus_sk_` + 40 hex; `expires_in_secs` sets an expiry (omitted: never). The plaintext is returned once |
+| `PATCH /v1/keys/{id}` | Change `tenant`, `name`, `allowed_models`, `allowed_tools` or `expires_in_secs` (0 clears) in place; the plaintext keeps working and the data planes get the change within a second, so a policy change needs no new key and no restart. Rotation grace: issue the new key, give the old one `expires_in_secs` |
+| `GET /v1/keys` | Every key, revoked ones included, without plaintext or hash; `expires_unix_secs` when set. Expired keys are revoked by the ledger within a minute and refused by the data planes at the second |
 | `DELETE /v1/keys/{id}` | Revoke; data planes drop the key within a second |
-| `GET /v1/summary?hours=N` | Requests, refusals and tokens per subject: a key's tenant and name, or an OAuth token's tenant claim and `sub` |
-| `GET /export.jsonl?since_us=&limit=` | One JSON row per request: status, dialect, provider, model or method, tool, tokens, bytes, key id, tenant, subject, refusal |
+| `GET /v1/summary?hours=N&by=` | Totals per group: `by=key` (default: a key's tenant and name, or an OAuth token's tenant claim and `sub`), `subject` (the user behind each key), `model` (per key and model; MCP: method), `tool` (per key, method and tool), `tenant`, `route` (host and provider). Each row: requests, refusals broken down by reason (`refused_unauthenticated`, `refused_model_not_allowed`, `refused_tool_not_allowed`, `refused_budget_exhausted`), `upstream_errors` (5xx from the provider), tokens, `duration_micros_total` and `first_byte_micros_total`/`first_byte_samples` for averages, `last_seen_unix_micros` |
+| `GET /v1/series?hours=N&bucket_secs=S&by=` | The same rows per time bucket (`bucket_start_unix_micros`; default 3600 s, 60 s to 7 d, epoch-aligned) for charts and spike detection |
+| `GET /export.jsonl?since_us=&limit=` | One JSON row per request: status, dialect, provider, model or method, tool, tokens, bytes, key id, tenant, subject, `on_behalf_of`, refusal and `rule` (the AIUsagePolicy that refused, or `key`/`jwt` for an allow list), `request_id`, `client_request_id`, `duration_micros`, `first_byte_micros` |
 | `GET /metrics` | Prometheus; no token |
 
 `allowed_models` applies to LLM requests (empty: any model). `allowed_tools` applies to
@@ -176,7 +208,10 @@ cases.
 
 MCP policy refusals are 200s on purpose: a non-2xx inside a session makes clients tear
 the session down. Every refusal is recorded in the ledger with its reason
-(`unauthenticated`, `model_not_allowed`, `tool_not_allowed`, `budget_exhausted`).
+(`unauthenticated`, `model_not_allowed`, `tool_not_allowed`, `budget_exhausted`) and the
+rule behind it (`rule`: the AIUsagePolicy's `namespace/name`, or `key`/`jwt` for an
+allow list); `/v1/summary` counts them per reason. Refusals carry `x-portus-request-id`
+too.
 
 ## MCP
 

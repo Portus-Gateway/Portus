@@ -108,6 +108,10 @@ pub fn to_wire(r: &UsageRecord) -> WireRecord {
         subject: r.subject.to_string(),
         request_id: r.request_id,
         refusal: r.refusal.map_or("", |k| k.as_str()).to_string(),
+        rule: r.rule.to_string(),
+        client_request_id: r.client_request_id.to_string(),
+        first_byte_micros: r.first_byte_micros,
+        on_behalf_of: r.on_behalf_of.to_string(),
     }
 }
 
@@ -254,6 +258,10 @@ mod tests {
             subject: UsageRecord::name("alice@example.com"),
             request_id: 42,
             refusal: None,
+            rule: ArrayString::new(),
+            client_request_id: UsageRecord::name("turn-7"),
+            first_byte_micros: 1,
+            on_behalf_of: UsageRecord::name("bob@example.com"),
         };
         let w = to_wire(&r);
         assert_eq!(w.refusal, "");
@@ -262,11 +270,13 @@ mod tests {
         assert_eq!((w.input_tokens, w.output_tokens, w.cache_read_tokens), (9, 12, 3));
         assert_eq!((w.provider.as_str(), w.route_host.as_str(), w.requested_model.as_str(), w.served_model.as_str()), ("echo", "llm.bench", "gpt-5", ""));
         assert_eq!((w.request_bytes, w.response_bytes, w.key_id, w.request_id), (100, 200, 7, 42));
+        assert_eq!((w.rule.as_str(), w.client_request_id.as_str(), w.first_byte_micros, w.on_behalf_of.as_str()), ("", "turn-7", 1, "bob@example.com"));
         r.tokens = None;
         r.refusal = Some(crate::ai::usage::RefusalKind::BudgetExhausted);
+        r.rule = UsageRecord::name("llm/daily");
         let w = to_wire(&r);
         assert!(!w.has_usage);
-        assert_eq!(w.refusal, "budget_exhausted");
+        assert_eq!((w.refusal.as_str(), w.rule.as_str()), ("budget_exhausted", "llm/daily"));
         assert_eq!((w.input_tokens, w.output_tokens), (0, 0));
     }
 }
