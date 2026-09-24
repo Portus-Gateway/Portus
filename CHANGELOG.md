@@ -4,6 +4,13 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.10] - 2026-09-24
+
+### Added
+
+- **MCP federation.** `AIProvider kind: mcp-federation` with `members: [{name, provider, path}]` puts several MCP servers behind one route with namespaced tool names. The gateway answers `initialize` (tools capability, merged instructions) and `tools/list` (every member's tools as `<member>.<tool>`) itself, routes `tools/call` by the prefix and strips it for the member, fans `notifications/*` and `DELETE` out, answers `ping` and the prompt/resource list methods locally, and refuses `GET` streams with 405. Every member's session travels inside the client's `Mcp-Session-Id` (`fed.<member>=<tag>.<id>;…`), pinned to the member endpoint that created it, so any gateway pod serves any request and no state is kept. Allow lists, budgets and usage rows use the namespaced name. A member that fails `initialize` fails the session start with JSON-RPC `-32004`; one that fails `tools/list` is left out and logged.
+- Crate versions follow the chart (0.2.10).
+
 ## [0.2.9] - 2026-09-24
 
 The rest of the first fleet's list: one budget per key, the effective limits without

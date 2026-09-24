@@ -60,6 +60,10 @@ message CompiledConfig {
   // data plane picks the certificate for an upstream connection.
   repeated GatewayBackendTls gateway_backend_tls = 11;
 
+  // MCP federations: one gateway endpoint in front of several MCP servers
+  // with namespaced tool names. Routes reference one by RouteConfig.ai_federation.
+  repeated McpFederation mcp_federations = 13;
+
   // Phase 9: populated when Policy CRDs are implemented
   // (policies are resolved by controller and inlined into RouteConfig)
 }
@@ -174,6 +178,9 @@ message RouteConfig {
   optional AiJwt ai_jwt = 41;
   // A trusted caller may name the user it acts for.
   optional AiOnBehalfOf ai_on_behalf_of = 42;
+  // The McpFederation (namespace/name) this route fans out to, when the
+  // provider is a federation rather than one server.
+  string ai_federation = 43;
 
   // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
   // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.
@@ -257,6 +264,24 @@ message BackendEndpoint {
 // user it acts for in `header`; the gateway records that user as the
 // subject and can budget per subject. Only keys named in trusted_keys are
 // believed; from anyone else the header is dropped.
+// An MCP federation: the gateway answers initialize and tools/list itself,
+// prefixes every member's tool names with `<member name>.`, routes tools/call
+// by that prefix and carries every member's session inside the client's
+// Mcp-Session-Id, so no gateway pod holds state.
+message McpFederation {
+  string name = 1;                // namespace/name of the AIProvider (kind mcp-federation)
+  repeated McpMember members = 2;
+}
+message McpMember {
+  string name = 1;                // tool-name prefix
+  string service_name = 2;        // the member provider's synthetic Service (pool key)
+  uint32 port = 3;
+  bool tls = 4;
+  string sni = 5;
+  string host = 6;                // Host header the member expects
+  map<string, string> headers = 7; // credential and other fixed headers
+  string path = 8;                // where the member serves MCP (default /mcp)
+}
 message AiOnBehalfOf {
   string header = 1;
   repeated string trusted_keys = 2;

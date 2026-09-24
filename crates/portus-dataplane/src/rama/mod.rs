@@ -6,6 +6,7 @@
 
 mod body;
 mod client;
+mod federation;
 mod usage;
 mod health;
 mod proxy;

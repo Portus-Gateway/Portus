@@ -5,7 +5,7 @@ Portus API keys, enforces token budgets and records usage in the ledger.
 Clients keep speaking the provider's native API.
 
 1. Install with the ledger:
-   `helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.9 -n portus --create-namespace --set aiGateway.enabled=true`.
+   `helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.10 -n portus --create-namespace --set aiGateway.enabled=true`.
    A fresh install carries the AI CRDs. An existing install: apply
    `deploy/helm/crds/aiprovider.yaml`, `airoute.yaml` and `aiusagepolicy.yaml`
    by hand (Helm does not upgrade CRDs) and pass your values with `-f`, not
@@ -34,6 +34,10 @@ Clients keep speaking the provider's native API.
    `claude mcp add --transport http github https://mcp.example.com/mcp --header "Authorization: Bearer portus_sk_…"`.
    A `calls` budget counts JSON-RPC requests; a disallowed tool or a spent
    budget comes back as a JSON-RPC error on 200 so the session survives.
+
+7. Federation: `mcp-federation.yaml` puts three MCP servers behind one
+   endpoint as `github.*`, `wiki.*` and `aws.*`; one `claude mcp add` gives
+   Claude all of them, and allow lists use the prefixed names.
 
 Refusals come back in the provider's error shape: 401 for a missing or
 unknown key, 403 for a model outside the key's list, 429 with `Retry-After`

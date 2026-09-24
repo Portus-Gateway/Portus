@@ -23,13 +23,19 @@ use crate::policy_types::{PolicyStatus, PolicyTargetRef};
 )]
 pub struct AIProviderSpec {
     /// API dialect the provider speaks: `anthropic`, `openai`,
-    /// `openai-compatible` or `mcp` (Model Context Protocol over Streamable
-    /// HTTP). Decides the default credential header and how usage is read
-    /// from responses.
+    /// `openai-compatible`, `mcp` (Model Context Protocol over Streamable
+    /// HTTP) or `mcp-federation` (several MCP providers behind one endpoint
+    /// with namespaced tool names). Decides the default credential header
+    /// and how usage is read from responses.
     pub kind: String,
     /// Base URL: scheme and host, optional port, no path
-    /// (`https://api.anthropic.com`).
+    /// (`https://api.anthropic.com`). Not used by `mcp-federation`.
+    #[serde(default)]
     pub url: String,
+    /// `mcp-federation`: the member servers. Each member's tools appear as
+    /// `<name>.<tool>`; `tools/call` on such a name goes to that member.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<AIFederationMemberSpec>,
     /// Where the provider's API key comes from and how it is sent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<AICredentialSpec>,
@@ -38,6 +44,18 @@ pub struct AIProviderSpec {
     /// `header` for `mcp`, `none` otherwise.
     #[serde(rename = "sessionAffinity", default, skip_serializing_if = "Option::is_none")]
     pub session_affinity: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AIFederationMemberSpec {
+    /// Tool-name prefix (letters, digits, `-`, `_`); unique in the federation.
+    pub name: String,
+    /// The member AIProvider (kind `mcp`, same namespace); default: `name`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Where the member serves MCP; default `/mcp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

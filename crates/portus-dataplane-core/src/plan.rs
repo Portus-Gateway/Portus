@@ -834,6 +834,7 @@ mod tests {
             session_affinity: true,
             jwt: Some(crate::ai::jwt::JwtPolicy { issuer: Arc::from("https://dex.example.com"), audience: None, tenant_claim: Arc::from("groups"), tools_claim: Arc::from("scope"), scopes: Arc::from("openid profile email groups"), groups_claim: Arc::from("groups"), tools_by_group: Arc::from(Vec::new()) }),
             on_behalf_of: None,
+            federation: None,
         });
         let mut snap = snapshot_with(vec![route]);
         // The test builder does not compute the issuer; the receiver does.

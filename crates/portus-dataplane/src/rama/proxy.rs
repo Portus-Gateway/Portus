@@ -122,7 +122,7 @@ pub struct ProxyService {
     snapshot: SnapshotSlot,
     metrics: Arc<ProxyMetrics>,
     outliers: Arc<Outliers>,
-    client: Upstream,
+    pub(super) client: Upstream,
     /// Set when a ledger is configured: AI route responses are recorded.
     ledger: Option<Arc<LedgerReporter>>,
 }
@@ -157,7 +157,7 @@ struct Incoming {
 }
 
 #[derive(Debug, PartialEq)]
-enum AttemptError {
+pub(super) enum AttemptError {
     /// Nothing reached the backend (dial, TLS handshake).
     Connect(String),
     /// Our own deadline fired.
@@ -457,7 +457,15 @@ impl ProxyService {
                 return reply_response(reply);
             }
         }
-        let mut response = self.forward(req, &plan, peer_ip, authority).await;
+        // A federated MCP route fans out to its members instead of forwarding.
+        let federation = plan.ai.as_ref().and_then(|ai| ai.federation.as_ref()).and_then(|id| {
+            let snap = self.snapshot.load();
+            snap.federations.get(id).cloned().map(|f| (f, Arc::new(snap.lbs.clone())))
+        });
+        let mut response = match federation {
+            Some((fed, lbs)) => self.federate(req, &plan, &fed, &lbs, body_fields.as_ref(), request_id).await,
+            None => self.forward(req, &plan, peer_ip, authority).await,
+        };
 
         let status = response.status().as_u16();
         if let (Some(remaining), Some(budget)) = (remaining_after, plan.ai.as_ref().and_then(|ai| ai.budget.as_ref()))
@@ -732,7 +740,7 @@ impl ProxyService {
         response
     }
 
-    async fn attempt(&self, req: Request, deadline: Option<Duration>) -> Result<Response, AttemptError> {
+    pub(super) async fn attempt(&self, req: Request, deadline: Option<Duration>) -> Result<Response, AttemptError> {
         let fut = self.client.serve(req);
         let result = match deadline {
             Some(d) => match tokio::time::timeout(d, fut).await {
@@ -869,7 +877,7 @@ fn classify(err: &BoxError) -> AttemptError {
     AttemptError::Exchange(err.to_string())
 }
 
-fn reply_response(reply: Reply) -> Response {
+pub(super) fn reply_response(reply: Reply) -> Response {
     let mut resp = Response::new(Body::new(Full::new(reply.body)));
     *resp.status_mut() = StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     for (name, value) in &reply.headers {
@@ -883,7 +891,7 @@ fn reply_response(reply: Reply) -> Response {
     resp
 }
 
-fn status_response(status: StatusCode) -> Response {
+pub(super) fn status_response(status: StatusCode) -> Response {
     let mut resp = Response::new(Body::empty());
     *resp.status_mut() = status;
     resp.headers_mut().insert("content-length", HeaderValue::from_static("0"));

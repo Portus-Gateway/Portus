@@ -1,6 +1,6 @@
 [package]
 name = "portus-ledger"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2024"
 rust-version.workspace = true
 description = "Portus AI gateway ledger: receives usage records from data planes, stores them, exports them"

@@ -354,6 +354,7 @@ mod tests {
                 port: 443,
                 credential: None,
                 session_affinity: false,
+                members: Vec::new(),
                 generation: 1,
             },
         );

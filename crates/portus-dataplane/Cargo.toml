@@ -1,6 +1,6 @@
 [package]
 name = "portus-dataplane"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2024"
 rust-version.workspace = true
 description = "Portus data plane: the network-stack adapters (Pingora) over portus-dataplane-core"
@@ -40,6 +40,7 @@ tracing-subscriber = { workspace = true }
 tracing-log = { workspace = true }
 mimalloc = { workspace = true }
 bytes = { workspace = true }
+serde_json = { workspace = true }
 http = { workspace = true }
 rustls = { workspace = true }
 hashbrown = { workspace = true }

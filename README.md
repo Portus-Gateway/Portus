@@ -39,7 +39,7 @@ kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
 # Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.9 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.10 \
   --namespace portus --create-namespace
 ```
 
@@ -183,7 +183,11 @@ spec:
   request and settled after, synced with the ledger once a second; every response carries
   `x-portus-tokens-remaining` and `x-portus-request-id`.
 - **Usage data.** `/v1/summary` groups by key, subject, model, tool, tenant or route with refusal
-  reasons and latency; `/v1/series` gives the same per time bucket; `/export.jsonl` is every row.
+  reasons and latency; `/v1/series` gives the same per time bucket; `/export.jsonl` is every row;
+  `/v1/limits` is every budget with what is left.
+- **MCP federation.** Several MCP servers behind one endpoint as `<server>.<tool>`: the gateway
+  merges `tools/list`, routes `tools/call` by prefix and keeps every member session inside the
+  client's session id, so no gateway pod holds state.
 - **Refusals in the provider's shape**: 401 `authentication_error`, 403 `permission_error`, 429
   with `Retry-After`. Every refusal is recorded with its reason and the rule behind it.
 - **Ordinary policies apply**: `TimeoutPolicy`, `RateLimitPolicy`, `RetryPolicy` and the rest
@@ -357,7 +361,7 @@ budget syncs and usage records on the ledger stream.
 ### Helm Values
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.9 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.10 \
   --namespace portus --create-namespace \
   --set dataplane.replicasPerGateway=3
 ```

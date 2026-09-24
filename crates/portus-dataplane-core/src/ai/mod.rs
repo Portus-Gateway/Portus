@@ -4,6 +4,7 @@
 //! and act on what comes out.
 
 pub mod budget;
+pub mod federation;
 pub mod jwt;
 pub mod keys;
 pub mod ledger;

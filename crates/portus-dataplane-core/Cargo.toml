@@ -1,6 +1,6 @@
 [package]
 name = "portus-dataplane-core"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2024"
 rust-version.workspace = true
 description = "Network-stack-independent core of the Portus data plane: config stream, route matching, policies, TLS material, L4/UDP proxies"

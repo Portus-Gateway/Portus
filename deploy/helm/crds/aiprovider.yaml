@@ -26,14 +26,30 @@ spec:
           properties:
             spec:
               type: object
-              required: [kind, url]
+              required: [kind]
               properties:
                 kind:
                   type: string
-                  enum: [anthropic, openai, openai-compatible, mcp]
+                  enum: [anthropic, openai, openai-compatible, mcp, mcp-federation]
                 url:
                   type: string
-                  description: "Base URL, scheme and host only: https://api.anthropic.com"
+                  description: "Base URL, scheme and host only: https://api.anthropic.com. Required except for mcp-federation"
+                members:
+                  type: array
+                  description: "mcp-federation: the MCP providers behind this one endpoint. Each member's tools appear as <name>.<tool>; tools/call on such a name goes to that member; initialize and tools/list are answered by the gateway; every member session travels inside the client's Mcp-Session-Id"
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                        description: "Tool-name prefix (letters, digits, - or _), unique in the federation"
+                      provider:
+                        type: string
+                        description: "The member AIProvider (kind mcp, same namespace); default: name"
+                      path:
+                        type: string
+                        description: "Where the member serves MCP; default /mcp"
                 sessionAffinity:
                   type: string
                   enum: [header, none]

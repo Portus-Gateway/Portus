@@ -17,13 +17,46 @@ use serde_json::json;
 use super::{ReconcileContext, ReconcileError};
 use crate::ai_types::{AIProvider, AIProviderSpec};
 use crate::status;
-use crate::store::{AICredentialState, AIProviderState, ConfigStore, NamespacedName, ServiceKey};
+use crate::store::{AICredentialState, AIFederationMember, AIProviderState, ConfigStore, NamespacedName, ServiceKey};
 use portus_types::BackendEndpoint;
 
 /// How often provider hostnames are re-resolved.
 pub const RESOLVE_INTERVAL: Duration = Duration::from_secs(30);
 
-const KINDS: &[&str] = &["anthropic", "openai", "openai-compatible", "mcp"];
+const KINDS: &[&str] = &["anthropic", "openai", "openai-compatible", "mcp", "mcp-federation"];
+const FEDERATION: &str = "mcp-federation";
+
+/// `spec.members` of a federation, validated: at least one, unique prefixes
+/// of `[A-Za-z0-9_-]`, paths starting with `/` (default `/mcp`), and every
+/// member provider an accepted `mcp` provider in the same namespace.
+fn federation_members(spec: &AIProviderSpec, namespace: &str, store: &ConfigStore) -> Result<Vec<AIFederationMember>, String> {
+    if spec.members.is_empty() {
+        return Err("mcp-federation needs at least one member".to_string());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(spec.members.len());
+    for m in &spec.members {
+        let name = m.name.trim();
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Err(format!("member name {:?} must be letters, digits, - or _", m.name));
+        }
+        if !seen.insert(name.to_string()) {
+            return Err(format!("member name {name:?} is used twice"));
+        }
+        let provider = m.provider.as_deref().map(str::trim).filter(|p| !p.is_empty()).unwrap_or(name).to_string();
+        match store.ai_providers.get(&NamespacedName { namespace: namespace.to_string(), name: provider.clone() }) {
+            Some(p) if p.kind == "mcp" => {}
+            Some(p) => return Err(format!("member {name}: AIProvider {provider} is kind {}, not mcp", p.kind)),
+            None => return Err(format!("member {name}: AIProvider {namespace}/{provider} not found or not accepted")),
+        }
+        let path = m.path.as_deref().map(str::trim).filter(|p| !p.is_empty()).unwrap_or("/mcp");
+        if !path.starts_with('/') {
+            return Err(format!("member {name}: path {path:?} must start with /"));
+        }
+        out.push(AIFederationMember { name: name.to_string(), provider, path: path.to_string() });
+    }
+    Ok(out)
+}
 
 /// Parse `spec.url` into (tls, host, port). Only scheme and authority are
 /// allowed: a path prefix would have to be prepended to every request.
@@ -106,10 +139,26 @@ pub fn reconcile_inner(provider: &AIProvider, store: &ConfigStore) -> Result<Vec
     {
         problems.push(format!("sessionAffinity must be header or none, not {a:?}"));
     }
-    let parsed = parse_provider_url(&spec.url);
+    let is_federation = spec.kind == FEDERATION;
+    // A federation has no address of its own; its members do.
+    let parsed = if is_federation { Ok((false, String::new(), 0)) } else { parse_provider_url(&spec.url) };
     if let Err(e) = &parsed {
         problems.push(e.clone());
     }
+    let members = if is_federation {
+        match federation_members(spec, namespace, store) {
+            Ok(m) => m,
+            Err(e) => {
+                problems.push(e);
+                Vec::new()
+            }
+        }
+    } else {
+        if !spec.members.is_empty() {
+            problems.push("members is only for kind mcp-federation".to_string());
+        }
+        Vec::new()
+    };
     let credential = spec.credential.as_ref().map(|c| {
         let (header, prefix) = default_credential_header(&spec.kind);
         AICredentialState {
@@ -137,6 +186,7 @@ pub fn reconcile_inner(provider: &AIProvider, store: &ConfigStore) -> Result<Vec
             port,
             credential,
             session_affinity: session_affinity(spec),
+            members,
             generation,
         };
         store.insert_and_notify(&store.ai_providers, key, state);
@@ -269,7 +319,8 @@ pub fn refresh_for_service(store: &ConfigStore, namespace: &str, service: &str) 
 pub async fn resolve_all(store: &ConfigStore) {
     let providers: Vec<AIProviderState> = store.ai_providers.iter().map(|e| e.value().clone()).collect();
     for provider in providers {
-        if sync_cluster_local(store, &provider) {
+        // A federation has no address; its members resolve on their own.
+        if provider.kind == FEDERATION || sync_cluster_local(store, &provider) {
             continue;
         }
         let key = provider.service_key();
@@ -321,7 +372,7 @@ mod tests {
                 generation: Some(1),
                 ..Default::default()
             },
-            spec: AIProviderSpec { kind: kind.into(), url: url.into(), credential, session_affinity: None },
+            spec: AIProviderSpec { kind: kind.into(), url: url.into(), credential, session_affinity: None, members: Vec::new() },
             status: None,
         }
     }
@@ -395,6 +446,50 @@ mod tests {
         let conditions = reconcile_inner(&bad, &store).unwrap();
         assert_eq!(conditions[0].status, "False");
         assert!(conditions[0].message.contains("sessionAffinity"), "{}", conditions[0].message);
+    }
+
+    #[test]
+    fn a_federation_needs_valid_unique_members_that_are_mcp_providers() {
+        use crate::ai_types::AIFederationMemberSpec;
+        let store = ConfigStore::new();
+        reconcile_inner(&provider("mcp", "http://github-mcp.tools:8080", None), &store).unwrap(); // named "anthropic" by the helper
+        let fed = |members: Vec<AIFederationMemberSpec>| {
+            let mut p = provider("mcp-federation", "", None);
+            p.metadata.name = Some("fed".into());
+            p.spec.members = members;
+            p
+        };
+        let m = |name: &str, provider: Option<&str>, path: Option<&str>| AIFederationMemberSpec { name: name.into(), provider: provider.map(str::to_string), path: path.map(str::to_string) };
+        let key = NamespacedName { namespace: "llm".into(), name: "fed".into() };
+
+        let ok = reconcile_inner(&fed(vec![m("gh", Some("anthropic"), None), m("wiki", Some("anthropic"), Some("/"))]), &store).unwrap();
+        assert_eq!(ok[0].status, "True", "{}", ok[0].message);
+        let state = store.ai_providers.get(&key).unwrap().clone();
+        assert_eq!((state.kind.as_str(), state.host.as_str(), state.port), ("mcp-federation", "", 0));
+        assert_eq!(state.members, vec![AIFederationMember { name: "gh".into(), provider: "anthropic".into(), path: "/mcp".into() }, AIFederationMember { name: "wiki".into(), provider: "anthropic".into(), path: "/".into() }]);
+
+        for (members, expect) in [
+            (vec![], "at least one member"),
+            (vec![m("gh", Some("anthropic"), None), m("gh", Some("anthropic"), None)], "used twice"),
+            (vec![m("bad name", Some("anthropic"), None)], "letters, digits"),
+            (vec![m("gh", Some("nope"), None)], "not found"),
+            (vec![m("gh", Some("anthropic"), Some("mcp"))], "must start with /"),
+        ] {
+            let conditions = reconcile_inner(&fed(members), &store).unwrap();
+            assert_eq!(conditions[0].status, "False", "{expect}");
+            assert!(conditions[0].message.contains(expect), "{} should mention {expect}", conditions[0].message);
+        }
+        assert!(store.ai_providers.get(&key).is_none(), "a rejected federation leaves the store");
+        // A member that is an LLM provider is refused; members on a non-federation are refused.
+        let mut llm = provider("anthropic", "https://api.anthropic.com", None);
+        llm.metadata.name = Some("claude".into());
+        reconcile_inner(&llm, &store).unwrap();
+        let c = reconcile_inner(&fed(vec![m("c", Some("claude"), None)]), &store).unwrap();
+        assert!(c[0].message.contains("not mcp"), "{}", c[0].message);
+        let mut plain = provider("mcp", "http://x:1", None);
+        plain.spec.members = vec![m("a", None, None)];
+        let c = reconcile_inner(&plain, &store).unwrap();
+        assert!(c[0].message.contains("only for kind mcp-federation"), "{}", c[0].message);
     }
 
     #[test]

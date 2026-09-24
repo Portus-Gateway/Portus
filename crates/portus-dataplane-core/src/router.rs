@@ -273,6 +273,9 @@ pub struct AiBackend {
     pub jwt: Option<crate::ai::jwt::JwtPolicy>,
     /// A trusted caller may name the user it acts for.
     pub on_behalf_of: Option<crate::ai::keys::OnBehalfOf>,
+    /// MCP: the federation (`ProxySnapshot::federations` key) this route
+    /// fans out to instead of forwarding to one server.
+    pub federation: Option<Arc<str>>,
 }
 
 impl PathRoute {
@@ -838,6 +841,9 @@ pub struct ProxySnapshot {
     /// was built from. `apply_config` reuses the existing `LoadBalancer` (and its
     /// health state) when the signature is unchanged.
     pub lb_signatures: HashMap<(Arc<str>, u16), u64>,
+    /// MCP federations by namespace/name; routes point at them by
+    /// `AiBackend::federation`.
+    pub federations: HashMap<Arc<str>, Arc<crate::ai::federation::Federation>>,
 }
 
 impl Default for ProxySnapshot {
@@ -846,6 +852,7 @@ impl Default for ProxySnapshot {
             listeners_by_port: HashMap::new(),
             any_port_listeners: Vec::new(),
             lbs: HashMap::new(),
+            federations: HashMap::new(),
             circuit_breakers: HashMap::new(),
             connection_limiters: HashMap::new(),
             per_ip_limiters: Vec::new(),
@@ -1482,6 +1489,7 @@ mod tests {
             session_affinity: true,
             jwt: None,
             on_behalf_of: None,
+            federation: None,
         });
         assert!(route_needs_body(&mcp));
         assert!(make_host_routes(vec![mcp], None).needs_body);

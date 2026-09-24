@@ -11,7 +11,7 @@ the request path.
 ## Install
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.9 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.10 \
   --namespace portus --create-namespace --set aiGateway.enabled=true
 ```
 
@@ -242,6 +242,46 @@ opens the server-to-client event stream, `DELETE` ends the session. The gateway:
 
 The older HTTP+SSE transport (2024-11-05) flows through an ordinary path rule: its
 `POST`s route and are recorded like any other, but sessions are not pinned.
+
+### Federation
+
+Several MCP servers behind one endpoint, with namespaced tool names, is an `AIProvider`
+of kind `mcp-federation` whose members are other `mcp` providers in the same namespace:
+
+```yaml
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIProvider
+metadata: {name: tools, namespace: agents}
+spec:
+  kind: mcp-federation
+  members:
+  - {name: github, provider: github-mcp}          # path defaults to /mcp
+  - {name: wiki, provider: deepwiki, path: /mcp}
+  - {name: aws, provider: aws-knowledge, path: /}
+```
+
+An `AIRoute` rule points at it like any provider. The gateway then:
+
+- answers `initialize` itself after initialising every member (the first member's
+  protocol version, a `tools` capability only, every member's `instructions` under its
+  name); a member that fails to initialise fails the whole `initialize` with JSON-RPC
+  `-32004`, so a session never starts half-formed;
+- answers `tools/list` by asking every member and prefixing each tool with `<member>.`
+  (`github.search`, `wiki.read_wiki_structure`); a member that fails is left out and
+  logged;
+- routes `tools/call` by the prefix, strips it from `params.name` and streams the member's
+  reply back; an unknown prefix is `-32602`;
+- fans `notifications/*` and `DELETE` out to every member; answers `ping`, `prompts/list`,
+  `resources/list` and `resources/templates/list` itself (empty); other methods are
+  `-32601`; `GET` streams are `405`;
+- keeps every member's session inside the client's `Mcp-Session-Id`
+  (`fed.github=<tag>.<id>;wiki=<tag>.<id>`), each pinned to the member endpoint that
+  created it, so any gateway pod serves any request and nothing is stored anywhere.
+
+Allow lists, budgets and usage rows see the namespaced name: a key with
+`allowed_tools: ["github.*", "wiki.read_wiki_structure"]` may call exactly those, and
+rows carry `github.search` in the tool column. Members keep their own credentials, TLS and
+Host. Two members that both offer `echo` no longer clash.
 
 A server-to-client stream is a request in flight: on a pod drain it is cut after
 `PORTUS_DRAIN_SECONDS` (25) and the client resumes with `Last-Event-ID` on the new pod,

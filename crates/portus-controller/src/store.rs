@@ -522,7 +522,18 @@ pub struct AIProviderState {
     pub credential: Option<AICredentialState>,
     /// MCP: pin sessions to the endpoint that created them.
     pub session_affinity: bool,
+    /// `mcp-federation`: the servers behind this one endpoint.
+    pub members: Vec<AIFederationMember>,
     pub generation: i64,
+}
+
+/// One server in an MCP federation: its tool-name prefix, the AIProvider it
+/// is (same namespace) and where that provider serves MCP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AIFederationMember {
+    pub name: String,
+    pub provider: String,
+    pub path: String,
 }
 
 impl AIProviderState {

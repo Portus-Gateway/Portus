@@ -128,6 +128,9 @@ pub fn scope_config(config: &CompiledConfig, namespace: &str, name: &str) -> Com
         .cloned()
         .collect();
 
+    // Federations the slice's routes fan out to.
+    let wanted: std::collections::HashSet<&str> = routes.iter().map(|r| r.ai_federation.as_str()).filter(|f| !f.is_empty()).collect();
+    let mcp_federations: Vec<portus_types::McpFederation> = config.mcp_federations.iter().filter(|f| wanted.contains(f.name.as_str())).cloned().collect();
     let mut scoped = CompiledConfig {
         schema_version: config.schema_version.clone(),
         version: config.version,
@@ -140,6 +143,7 @@ pub fn scope_config(config: &CompiledConfig, namespace: &str, name: &str) -> Com
         udp_proxy_routes,
         tls_passthrough_listener_hostnames,
         gateway_backend_tls,
+        mcp_federations,
     };
     scoped.fingerprint = config_fingerprint(&scoped);
     scoped
@@ -945,11 +949,14 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         if let Some(provider) = store.ai_providers.get(&NamespacedName { namespace: ns.to_string(), name: name.to_string() }) {
             route.ai_dialect = match provider.kind.as_str() {
                 "anthropic" => "anthropic".to_string(),
-                "mcp" => "mcp".to_string(),
+                "mcp" | "mcp-federation" => "mcp".to_string(),
                 _ => "openai".to_string(),
             };
             route.ai_provider = provider.name.clone();
             route.ai_session_affinity = provider.session_affinity;
+            if provider.kind == "mcp-federation" {
+                route.ai_federation = format!("{}/{}", provider.namespace, provider.name);
+            }
             if provider.tls {
                 route.upstream_tls = Some(UpstreamTlsConfig { enabled: true, verify_cert: true, sni: provider.host.clone() });
             }
@@ -1070,6 +1077,10 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
 
     let tcp_proxy_routes = compile_l4_routes("TCP", &tcp_routes, &gw_map, &mut backend_keys);
     let udp_proxy_routes = compile_l4_routes("UDP", &udp_routes, &gw_map, &mut backend_keys);
+
+    // MCP federations: every member's Service needs a pool even when no rule
+    // names the member directly.
+    let mcp_federations = compile_mcp_federations(store, &mut backend_keys);
 
     // Compile BackendGroups from endpoints.
     // Service ports (from HTTPRoute backendRefs) may differ from target ports
@@ -1198,6 +1209,7 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         udp_proxy_routes,
         tls_passthrough_listener_hostnames,
         gateway_backend_tls: compile_gateway_backend_tls(store),
+        mcp_federations,
         ..Default::default()
     }
 }
@@ -1703,6 +1715,59 @@ fn apply_policies(
 /// prefix contains a slash so no real HTTPRoute name can collide with it.
 const AI_ROUTE_KEY_PREFIX: &str = "airoute/";
 
+/// The fixed headers a request to `provider` carries: its Host and, when it
+/// has a credential, the credential header from the Secret.
+fn provider_request_headers(store: &ConfigStore, provider: &crate::store::AIProviderState) -> Vec<(String, String)> {
+    let mut set: Vec<(String, String)> = vec![("host".to_string(), provider.host.clone())];
+    if let Some(cred) = &provider.credential {
+        let secret_key = NamespacedName { namespace: provider.namespace.clone(), name: cred.secret_name.clone() };
+        match store.secrets.get(&secret_key).and_then(|s| s.data.get(&cred.secret_key).cloned()) {
+            Some(value) => set.push((cred.header.clone(), format!("{}{}", cred.prefix, value.trim()))),
+            None => log::warn!(
+                "AIProvider {}/{}: Secret {} has no key {:?}; requests go out without a credential",
+                provider.namespace, provider.name, cred.secret_name, cred.secret_key
+            ),
+        }
+    }
+    set
+}
+
+/// Every `mcp-federation` provider with its members resolved to the pool
+/// key, TLS parameters and fixed headers the data plane needs to call them.
+/// Members whose provider is missing are left out (the route reconciler
+/// reports them); the member Services join `backend_keys` so they get pools.
+fn compile_mcp_federations(store: &ConfigStore, backend_keys: &mut std::collections::HashSet<ServiceKey>) -> Vec<portus_types::McpFederation> {
+    let mut out: Vec<portus_types::McpFederation> = store
+        .ai_providers
+        .iter()
+        .filter(|e| e.value().kind == "mcp-federation")
+        .map(|e| {
+            let fed = e.value();
+            let members = fed
+                .members
+                .iter()
+                .filter_map(|m| {
+                    let p = store.ai_providers.get(&NamespacedName { namespace: fed.namespace.clone(), name: m.provider.clone() })?;
+                    backend_keys.insert(ServiceKey { namespace: p.namespace.clone(), name: p.service_name(), port: p.port });
+                    Some(portus_types::McpMember {
+                        name: m.name.clone(),
+                        service_name: p.service_name(),
+                        port: u32::from(p.port),
+                        tls: p.tls,
+                        sni: p.host.clone(),
+                        host: p.host.clone(),
+                        headers: provider_request_headers(store, &p).into_iter().collect(),
+                        path: m.path.clone(),
+                    })
+                })
+                .collect();
+            portus_types::McpFederation { name: format!("{}/{}", fed.namespace, fed.name), members }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 fn ai_routes_as_http_routes(store: &ConfigStore) -> Vec<(NamespacedName, HTTPRouteState)> {
     let ai_routes: Vec<(NamespacedName, crate::store::AIRouteState)> =
         store.ai_routes.iter().map(|e| (e.key().clone(), e.value().clone())).collect();
@@ -1713,20 +1778,12 @@ fn ai_routes_as_http_routes(store: &ConfigStore) -> Vec<(NamespacedName, HTTPRou
                 .rules
                 .iter()
                 .map(|rule| {
-                    let mut set: Vec<(String, String)> = Vec::new();
-                    if let Some(provider) = store.ai_providers.get(&rule.provider) {
-                        set.push(("host".to_string(), provider.host.clone()));
-                        if let Some(cred) = &provider.credential {
-                            let secret_key = NamespacedName { namespace: provider.namespace.clone(), name: cred.secret_name.clone() };
-                            match store.secrets.get(&secret_key).and_then(|s| s.data.get(&cred.secret_key).cloned()) {
-                                Some(value) => set.push((cred.header.clone(), format!("{}{}", cred.prefix, value.trim()))),
-                                None => log::warn!(
-                                    "AIProvider {}/{}: Secret {} has no key {:?}; requests go out without a credential",
-                                    provider.namespace, provider.name, cred.secret_name, cred.secret_key
-                                ),
-                            }
-                        }
-                    }
+                    // A federation has no host of its own: the gateway sets
+                    // each member's headers when it fans out.
+                    let set: Vec<(String, String)> = match store.ai_providers.get(&rule.provider) {
+                        Some(provider) if provider.kind != "mcp-federation" => provider_request_headers(store, &provider),
+                        _ => Vec::new(),
+                    };
                     // The provider is resolved here, at compile time, so a
                     // provider that appeared after the route reconciled still
                     // gets traffic; the reconcile-time refs only drive status.
@@ -2112,6 +2169,7 @@ pub(crate) fn config_fingerprint(config: &CompiledConfig) -> u64 {
         fp = fp.wrapping_add(hash_bytes(h.as_bytes()));
     }
     for g in &config.gateway_backend_tls { fp = fp.wrapping_add(hash_msg(g)); }
+    for f in &config.mcp_federations { fp = fp.wrapping_add(hash_msg(f)); }
     fp
 }
 
@@ -2379,6 +2437,7 @@ mod tests {
                 prefix: String::new(),
             }),
             session_affinity: false,
+            members: Vec::new(),
             generation: 1,
         };
         store.endpoints.insert(
@@ -2391,7 +2450,7 @@ mod tests {
             AIRouteState {
                 namespace: "default".into(),
                 hostnames: vec!["llm.example.com".into()],
-                parent_refs: vec![parent],
+                parent_refs: vec![parent.clone()],
                 rules: vec![AIRouteRuleState {
                     matches: vec![HTTPRouteMatchState {
                         path: Some(("/v1/messages".into(), "PathPrefix".into())),
@@ -2424,6 +2483,57 @@ mod tests {
                 generation: 1,
                 creation_timestamp: None,
                 accepted: true,
+            },
+        );
+
+        // A federation of two MCP servers behind one route.
+        let member = |name: &str, host: &str| AIProviderState {
+            namespace: "default".into(),
+            name: name.into(),
+            kind: "mcp".into(),
+            tls: false,
+            host: host.into(),
+            port: 3001,
+            credential: None,
+            session_affinity: true,
+            members: Vec::new(),
+            generation: 1,
+        };
+        for (name, host) in [("github", "github-mcp.tools"), ("wiki", "wiki.tools")] {
+            let p = member(name, host);
+            store.endpoints.insert(p.service_key(), vec![BackendEndpoint { address: "10.0.0.7".into(), port: 3001 }]);
+            store.ai_providers.insert(NamespacedName { namespace: "default".into(), name: name.into() }, p);
+        }
+        store.ai_providers.insert(
+            NamespacedName { namespace: "default".into(), name: "fed".into() },
+            AIProviderState {
+                kind: "mcp-federation".into(),
+                host: String::new(),
+                port: 0,
+                members: vec![
+                    crate::store::AIFederationMember { name: "gh".into(), provider: "github".into(), path: "/mcp".into() },
+                    crate::store::AIFederationMember { name: "wiki".into(), provider: "wiki".into(), path: "/".into() },
+                    crate::store::AIFederationMember { name: "gone".into(), provider: "missing".into(), path: "/mcp".into() },
+                ],
+                ..member("fed", "")
+            },
+        );
+        store.ai_routes.insert(
+            NamespacedName { namespace: "default".into(), name: "tools".into() },
+            AIRouteState {
+                namespace: "default".into(),
+                hostnames: vec!["mcp.example.com".into()],
+                parent_refs: vec![parent.clone()],
+                rules: vec![AIRouteRuleState {
+                    matches: vec![HTTPRouteMatchState { path: Some(("/".into(), "PathPrefix".into())), headers: vec![], method: None, query_params: vec![] }],
+                    backend_refs: vec![],
+                    provider: NamespacedName { namespace: "default".into(), name: "fed".into() },
+                    filters: vec![],
+                }],
+                require_api_key: true,
+                jwt: None,
+                on_behalf_of: None,
+                generation: 1,
             },
         );
 
@@ -2465,8 +2575,8 @@ mod tests {
         );
 
         let config = compile_config(&store);
-        assert_eq!(config.routes.len(), 1);
-        let route = &config.routes[0];
+        assert_eq!(config.routes.len(), 2, "the LLM route and the federation route");
+        let route = config.routes.iter().find(|r| r.host == "llm.example.com").expect("llm route");
         assert!(route.ai_key_required);
         assert_eq!(route.ai_jwt.as_ref().map(|j| (j.issuer.as_str(), j.audience.as_str(), j.tenant_claim.as_str(), j.tools_claim.as_str())), Some(("https://dex.example.com", "", "groups", "scope")));
         assert_eq!(route.ai_jwt.as_ref().map(|j| (j.groups_claim.as_str(), j.tools_by_group.iter().map(|g| (g.group.as_str(), g.tools.clone())).collect::<Vec<_>>())), Some(("groups", vec![("eng", vec!["github.*".to_string()])])));
@@ -2487,6 +2597,21 @@ mod tests {
         assert_eq!(tls.sni, "api.anthropic.com");
         assert_eq!((route.ai_dialect.as_str(), route.ai_provider.as_str()), ("anthropic", "anthropic"));
         assert_eq!(route.ai_on_behalf_of.as_ref().map(|o| (o.header.as_str(), o.trusted_keys.clone())), Some(("x-portus-on-behalf-of", vec!["default/hub".to_string()])));
+        assert_eq!(route.ai_federation, "", "a plain provider is no federation");
+
+        // The federation: one entry, the resolved members only, member Services pooled.
+        assert_eq!(config.mcp_federations.len(), 1);
+        let fed = &config.mcp_federations[0];
+        assert_eq!(fed.name, "default/fed");
+        assert_eq!(fed.members.iter().map(|m| (m.name.as_str(), m.service_name.as_str(), m.port, m.tls, m.host.as_str(), m.path.as_str())).collect::<Vec<_>>(), vec![
+            ("gh", "aiprovider/default/github", 3001, false, "github-mcp.tools", "/mcp"),
+            ("wiki", "aiprovider/default/wiki", 3001, false, "wiki.tools", "/"),
+        ]);
+        assert_eq!(fed.members[0].headers.get("host").map(String::as_str), Some("github-mcp.tools"));
+        assert!(config.backends.iter().any(|b| b.service_name == "aiprovider/default/github" && b.port == 3001 && !b.endpoints.is_empty()), "member Services get pools");
+        let fed_route = config.routes.iter().find(|r| r.host == "mcp.example.com").expect("federation route");
+        assert_eq!((fed_route.ai_dialect.as_str(), fed_route.ai_provider.as_str(), fed_route.ai_federation.as_str()), ("mcp", "fed", "default/fed"));
+        assert!(fed_route.request_headers.as_ref().is_none_or(|h| !h.set.contains_key("host")), "a federation sets no Host of its own");
         assert_eq!(route.url_rewrite.as_ref().map(|r| (r.path.as_str(), r.path_type.as_str())), Some(("/mcp", "ReplaceFullPath")), "the rule's urlRewrite reaches the RouteConfig");
         let group = config.backends.iter().find(|b| b.service_name == "aiprovider/default/anthropic").expect("provider backend group");
         assert_eq!(group.port, 443);

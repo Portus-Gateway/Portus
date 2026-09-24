@@ -600,6 +600,7 @@ pub fn build_listener_buckets_from_proto(
                             groups_claim: Arc::from(if j.groups_claim.is_empty() { "groups" } else { j.groups_claim.as_str() }),
                             tools_by_group: Arc::from(j.tools_by_group.iter().map(|g| (g.group.clone(), g.tools.clone())).collect::<Vec<_>>()),
                         }),
+                        federation: Some(spec.ai_federation.as_str()).filter(|f| !f.is_empty()).map(Arc::from),
                         on_behalf_of: spec.ai_on_behalf_of.as_ref().map(|o| crate::ai::keys::OnBehalfOf {
                             header: Arc::from(if o.header.is_empty() { crate::ai::keys::ON_BEHALF_OF_HEADER } else { o.header.as_str() }.to_ascii_lowercase().as_str()),
                             trusted_keys: Arc::from(o.trusted_keys.clone()),
@@ -766,6 +767,38 @@ pub fn lb_signature(group: &portus_types::BackendGroup) -> u64 {
 /// since the previous snapshot is reused rather than rebuilt, so round-robin
 /// position and — more importantly — health-check state survive unrelated
 /// config changes. Returns the new map and its signatures.
+/// MCP federations as the stack fans out to them; members keep the pool key
+/// and the fixed headers, the pool itself comes from the snapshot's `lbs`.
+pub fn build_federations_from_proto(federations: &[portus_types::McpFederation]) -> HashMap<Arc<str>, Arc<crate::ai::federation::Federation>> {
+    federations
+        .iter()
+        .map(|f| {
+            let members = f
+                .members
+                .iter()
+                .map(|m| {
+                    let mut headers: Vec<(HeaderName, HeaderValue)> = m
+                        .headers
+                        .iter()
+                        .filter_map(|(k, v)| Some((HeaderName::from_bytes(k.as_bytes()).ok()?, HeaderValue::from_str(v).ok()?)))
+                        .collect();
+                    headers.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+                    crate::ai::federation::Member {
+                        name: Arc::from(m.name.as_str()),
+                        service_name: Arc::from(m.service_name.as_str()),
+                        port: u16::try_from(m.port).unwrap_or(0),
+                        tls: m.tls,
+                        sni: Arc::from(m.sni.as_str()),
+                        headers,
+                        path: Arc::from(if m.path.is_empty() { "/mcp" } else { m.path.as_str() }),
+                    }
+                })
+                .collect();
+            (Arc::from(f.name.as_str()), Arc::new(crate::ai::federation::Federation { id: Arc::from(f.name.as_str()), members }))
+        })
+        .collect()
+}
+
 pub fn build_lb_map_from_proto(
     backends: &[portus_types::BackendGroup],
     existing: &LbMap,
@@ -1470,6 +1503,7 @@ pub fn apply_config(mut config: portus_types::CompiledConfig, state: &ProxyState
         backend_tls: new_backend_tls,
         backend_client_cert: new_backend_client_cert,
         lb_signatures: new_lb_signatures,
+        federations: build_federations_from_proto(&config.mcp_federations),
     }));
     state.l4_config.store(Arc::new(new_l4));
 
