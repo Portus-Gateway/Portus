@@ -96,8 +96,8 @@ ifeq ($(PLATFORM),k3d)
 endif
 	@$(DOCKER) image prune -f >/dev/null 2>&1 || true
 ifeq ($(PLATFORM),machine)
-	@# nerdctl has no `builder prune --filter`; buildctl keeps the cache mounts and drops records unused for 3 days.
-	@container machine run -n $(MACHINE) --user root -- buildctl prune --keep-duration 72h >/dev/null 2>&1 || true
+	@# nerdctl has no `builder prune --filter`; buildctl trims the cache to the 20 GB cap buildkitd's GC enforces (deploy/machine/buildkitd.toml), newest records kept.
+	@container machine run -n $(MACHINE) --user root -- buildctl prune --keep-storage 20000 >/dev/null 2>&1 || true
 	@# Return the freed blocks to the host: the machine disk is a sparse file that only shrinks on trim.
 	@container machine run -n $(MACHINE) --user root -- fstrim / >/dev/null 2>&1 || true
 else
