@@ -75,6 +75,15 @@ message SyncRequest {
   string window = 4;          // HOURLY | DAILY | MONTHLY
   // Tokens this pod has spent in the window since its last sync.
   uint64 spent_delta = 5;
+  // The policy as this pod applies it, so the ledger can describe the
+  // effective limits (/v1/limits) without reading Kubernetes.
+  uint64 limit = 6;           // the route policy's limit per window
+  string unit = 7;            // TOKENS | CALLS
+  string per = 8;             // KEY | SUBJECT | TENANT | ROUTE
+  bool fail_open = 9;
+  // The limit this subject is actually held to: the policy's, or the key's
+  // budget_limit when it has one.
+  uint64 subject_limit = 10;
 }
 
 message SyncResponse {
@@ -122,4 +131,7 @@ message KeyEntry {
   // leaves expired keys out of the snapshot; this lets a data plane refuse
   // one between snapshots.
   uint64 expires_unix_secs = 7;
+  // Per-key budget: replaces the route policy's limit for this key (and for
+  // subjects under it with per: Subject), in the policy's unit. 0: none.
+  uint64 budget_limit = 8;
 }

@@ -277,6 +277,8 @@ impl ProxyService {
         // the caller proved itself with a JWT rather than a Portus key.
         let mut on_behalf_of: Option<String> = None;
         let mut via_jwt = false;
+        // A key's own budget replaces the route policy's limit for its counters.
+        let mut key_budget_limit = 0u64;
         // One id per request: the ledger row carries it and the client gets
         // it back in x-portus-request-id; the client's own id, if it sent
         // one in the same header, is recorded next to it.
@@ -332,6 +334,7 @@ impl ProxyService {
                     key_id = info.id;
                     tenant = Some(Arc::clone(&info.tenant));
                     who_name = Some(Arc::clone(&info.name));
+                    key_budget_limit = info.budget_limit;
                     if let Some(policy) = ai.on_behalf_of.as_ref() {
                         on_behalf_of = policy.user(&Headers(req.headers()), &info).map(str::to_string);
                     }
@@ -401,7 +404,9 @@ impl ProxyService {
         // counter syncs with the ledger in the background.
         let mut reservation = None;
         let mut remaining_after: Option<i64> = None;
-        if let (Some(ai), Some(budget)) = (plan.ai.as_ref(), plan.ai.as_ref().and_then(|ai| ai.budget.as_ref())) {
+        if let (Some(ai), Some(route_budget)) = (plan.ai.as_ref(), plan.ai.as_ref().and_then(|ai| ai.budget.as_ref())) {
+            let key_budget = route_budget.for_key(key_budget_limit);
+            let budget = key_budget.as_ref().unwrap_or(route_budget);
             let subject: Arc<str> = match budget.per {
                 Scope::Key if key_id != 0 => Arc::from(key_id.to_string()),
                 Scope::Key => Arc::from("anonymous"),

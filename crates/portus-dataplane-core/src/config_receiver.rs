@@ -597,6 +597,8 @@ pub fn build_listener_buckets_from_proto(
                             tenant_claim: Arc::from(j.tenant_claim.as_str()),
                             tools_claim: Arc::from(j.tools_claim.as_str()),
                             scopes: Arc::from(j.scopes.as_str()),
+                            groups_claim: Arc::from(if j.groups_claim.is_empty() { "groups" } else { j.groups_claim.as_str() }),
+                            tools_by_group: Arc::from(j.tools_by_group.iter().map(|g| (g.group.clone(), g.tools.clone())).collect::<Vec<_>>()),
                         }),
                         on_behalf_of: spec.ai_on_behalf_of.as_ref().map(|o| crate::ai::keys::OnBehalfOf {
                             header: Arc::from(if o.header.is_empty() { crate::ai::keys::ON_BEHALF_OF_HEADER } else { o.header.as_str() }.to_ascii_lowercase().as_str()),
@@ -606,6 +608,7 @@ pub fn build_listener_buckets_from_proto(
                             Some(crate::ai::budget::BudgetPolicy {
                                 id: Arc::from(b.policy.as_str()),
                                 limit: b.limit,
+                                route_limit: b.limit,
                                 unit: crate::ai::budget::Unit::parse(&b.unit)?,
                                 window: crate::ai::budget::Window::parse(&b.window)?,
                                 per: crate::ai::budget::Scope::parse(&b.per)?,

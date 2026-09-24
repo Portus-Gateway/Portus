@@ -102,12 +102,23 @@ pub fn jwt_state(spec: &crate::ai_types::AIJwtSpec) -> Result<AIJwtState, String
     if scopes.iter().any(|s| s.contains(|ch: char| ch.is_whitespace() || ch == '"')) {
         return Err("scopes must not contain whitespace or quotes".to_string());
     }
+    let tools_by_group: Vec<(String, Vec<String>)> = spec
+        .tools_by_group
+        .iter()
+        .flatten()
+        .map(|(g, tools)| (g.trim().to_string(), tools.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).map(str::to_string).collect::<Vec<_>>()))
+        .collect();
+    if tools_by_group.iter().any(|(g, _)| g.is_empty()) {
+        return Err("toolsByGroup has an empty group name".to_string());
+    }
     Ok(AIJwtState {
         issuer: issuer.to_string(),
         audience: spec.audience.as_deref().map(str::trim).filter(|a| !a.is_empty()).map(str::to_string),
         tenant_claim: claim(&spec.tenant_claim, "groups")?,
         tools_claim: claim(&spec.tools_claim, "scope")?,
         scopes: scopes.join(" "),
+        groups_claim: claim(&spec.groups_claim, "groups")?,
+        tools_by_group,
     })
 }
 
@@ -375,14 +386,24 @@ mod tests {
         provider(&store, "anthropic");
         let mut r = route(vec![rule(None, None, &["anthropic"])]);
         r.spec.require_api_key = true;
-        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com/".into(), audience: Some("portus".into()), tenant_claim: None, tools_claim: Some("tools".into()), scopes: None }), on_behalf_of: None });
+        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com/".into(), audience: Some("portus".into()), tenant_claim: None, tools_claim: Some("tools".into()), scopes: None, groups_claim: None, tools_by_group: None }), on_behalf_of: None });
         let (state, conditions) = reconcile_inner(&r, &store).unwrap();
         assert_eq!(conditions[1].status, "True", "{}", conditions[1].message);
-        assert_eq!(state.jwt, Some(AIJwtState { issuer: "https://dex.example.com".into(), audience: Some("portus".into()), tenant_claim: "groups".into(), tools_claim: "tools".into(), scopes: "openid profile email groups".into() }));
-        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None, scopes: Some(vec!["openid".into(), "email".into(), "federated:id".into()]) }), on_behalf_of: None });
+        assert_eq!(state.jwt, Some(AIJwtState { issuer: "https://dex.example.com".into(), audience: Some("portus".into()), tenant_claim: "groups".into(), tools_claim: "tools".into(), scopes: "openid profile email groups".into(), groups_claim: "groups".into(), tools_by_group: Vec::new() }));
+        // Group map: trimmed, sorted by group, empty tool names dropped.
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("ops".to_string(), vec!["fleet_report".to_string(), " ".to_string()]);
+        map.insert("eng".to_string(), vec!["github.*".to_string()]);
+        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None, scopes: None, groups_claim: Some("roles".into()), tools_by_group: Some(map) }), on_behalf_of: None });
+        let (state, conditions) = reconcile_inner(&r, &store).unwrap();
+        assert_eq!(conditions[1].status, "True", "{}", conditions[1].message);
+        let j = state.jwt.unwrap();
+        assert_eq!(j.groups_claim, "roles");
+        assert_eq!(j.tools_by_group, vec![("eng".to_string(), vec!["github.*".to_string()]), ("ops".to_string(), vec!["fleet_report".to_string()])]);
+        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None, scopes: Some(vec!["openid".into(), "email".into(), "federated:id".into()]), groups_claim: None, tools_by_group: None }), on_behalf_of: None });
         let (state, _) = reconcile_inner(&r, &store).unwrap();
         assert_eq!(state.jwt.unwrap().scopes, "openid email federated:id");
-        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None, scopes: None }), on_behalf_of: None });
+        r.spec.auth = Some(AIRouteAuth { jwt: Some(AIJwtSpec { issuer: "dex.example.com".into(), audience: None, tenant_claim: None, tools_claim: None, scopes: None, groups_claim: None, tools_by_group: None }), on_behalf_of: None });
         let (state, conditions) = reconcile_inner(&r, &store).unwrap();
         assert_eq!(conditions[1].status, "False");
         assert!(conditions[1].message.contains("auth.jwt"), "{}", conditions[1].message);

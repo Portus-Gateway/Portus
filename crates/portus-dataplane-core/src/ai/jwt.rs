@@ -30,7 +30,18 @@ pub struct JwtPolicy {
     /// advertised as `scopes_supported` in the protected-resource metadata
     /// and in the 401 challenge.
     pub scopes: Arc<str>,
+    /// Claim listing the subject's groups (array of strings, or one string).
+    pub groups_claim: Arc<str>,
+    /// MCP tools granted per group. A subject may call the union of the
+    /// tools mapped from its groups and the tools its tools claim lists.
+    /// When the map is non-empty, a subject that ends up with no tools is
+    /// refused every `tools/call`.
+    pub tools_by_group: Arc<[(String, Vec<String>)]>,
 }
+
+/// The allow-list entry that matches no tool: what a subject gets when the
+/// group map is in force and grants it nothing.
+pub const NO_TOOLS: &str = "(none)";
 
 /// The `WWW-Authenticate` value a 401 carries on a route that accepts
 /// OAuth tokens (RFC 9728 §5.1 / MCP authorization): where the metadata
@@ -166,11 +177,30 @@ pub fn verify(token: &str, policy: &JwtPolicy, jwks: &Jwks, now_unix_secs: u64) 
         Some(serde_json::Value::Array(a)) => a.first().and_then(|v| v.as_str()).unwrap_or(""),
         _ => "",
     };
-    let tools: Vec<String> = match claims.get(policy.tools_claim.as_ref()) {
+    let mut tools: Vec<String> = match claims.get(policy.tools_claim.as_ref()) {
         Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).map(str::to_string).collect(),
         Some(serde_json::Value::String(s)) => s.split_whitespace().map(str::to_string).collect(),
         _ => Vec::new(),
     };
+    if !policy.tools_by_group.is_empty() {
+        let groups: Vec<&str> = match claims.get(policy.groups_claim.as_ref()) {
+            Some(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str()).collect(),
+            Some(serde_json::Value::String(s)) => vec![s.as_str()],
+            _ => Vec::new(),
+        };
+        for (group, granted) in policy.tools_by_group.iter() {
+            if groups.contains(&group.as_str()) {
+                for t in granted {
+                    if !tools.contains(t) {
+                        tools.push(t.clone());
+                    }
+                }
+            }
+        }
+        if tools.is_empty() {
+            tools.push(NO_TOOLS.to_string());
+        }
+    }
     // The name people read in the ledger: an address or username when the
     // token has one, else the opaque subject (dex's `sub` is a protobuf).
     let name = ["email", "preferred_username", "name"]
@@ -184,6 +214,7 @@ pub fn verify(token: &str, policy: &JwtPolicy, jwks: &Jwks, now_unix_secs: u64) 
         allowed_models: Arc::from(Vec::new()),
         allowed_tools: Arc::from(tools),
         expires_unix_secs: exp,
+        budget_limit: 0,
     };
     Some((info, exp))
 }
@@ -287,7 +318,38 @@ mod tests {
             tenant_claim: Arc::from("groups"),
             tools_claim: Arc::from("scope"),
             scopes: Arc::from("openid profile email groups"),
+            groups_claim: Arc::from("groups"),
+            tools_by_group: Arc::from(Vec::new()),
         }
+    }
+
+    #[test]
+    fn groups_grant_tools_and_an_unmapped_subject_gets_none() {
+        let (key, jwks) = issuer_keys("k1");
+        let set = Jwks::from_entries([("https://dex.example.com", jwks.as_str())]);
+        let p = JwtPolicy {
+            tools_by_group: Arc::from(vec![("eng".to_string(), vec!["github.*".to_string(), "echo".to_string()]), ("ops".to_string(), vec!["fleet_report".to_string(), "echo".to_string()])]),
+            ..policy(None)
+        };
+        let mint = |groups: serde_json::Value, scope: Option<&str>| {
+            let mut c = serde_json::json!({"iss":"https://dex.example.com","sub":"u","exp":now()+600,"groups":groups});
+            if let Some(s) = scope {
+                c["scope"] = serde_json::Value::String(s.to_string());
+            }
+            token(&key, "k1", c)
+        };
+        let tools = |t: &str| verify(t, &p, &set, now()).expect("valid").0.allowed_tools.to_vec();
+        assert_eq!(tools(&mint(serde_json::json!(["eng"]), None)), vec!["github.*", "echo"]);
+        assert_eq!(tools(&mint(serde_json::json!(["eng", "ops"]), None)), vec!["github.*", "echo", "fleet_report"], "union, no duplicates");
+        assert_eq!(tools(&mint(serde_json::json!("ops"), None)), vec!["fleet_report", "echo"], "a string groups claim");
+        assert_eq!(tools(&mint(serde_json::json!(["eng"]), Some("deploy"))), vec!["deploy", "github.*", "echo"], "the tools claim still counts");
+        assert_eq!(tools(&mint(serde_json::json!(["sales"]), None)), vec![NO_TOOLS], "unmapped: nothing, not everything");
+        assert_eq!(tools(&mint(serde_json::json!([]), None)), vec![NO_TOOLS]);
+        let info = verify(&mint(serde_json::json!(["sales"]), None), &p, &set, now()).unwrap().0;
+        assert_eq!(super::super::keys::check_access(&info, super::super::keys::Access::ToolCall(Some("echo"))), Err(super::super::keys::Refusal::ToolNotAllowed));
+        assert_eq!(super::super::keys::check_access(&info, super::super::keys::Access::Other), Ok(()), "tools/list and initialize still work");
+        // Without a map the claim alone decides, and no claim means any tool.
+        assert!(verify(&mint(serde_json::json!(["sales"]), None), &policy(None), &set, now()).unwrap().0.allowed_tools.is_empty());
     }
 
     #[test]

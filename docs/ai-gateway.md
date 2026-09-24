@@ -11,7 +11,7 @@ the request path.
 ## Install
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.8 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.9 \
   --namespace portus --create-namespace --set aiGateway.enabled=true
 ```
 
@@ -81,6 +81,8 @@ key (see [OAuth clients](#oauth-clients)).
 | `tenantClaim` | claim name, default `groups` | A string claim, or the first entry of an array claim |
 | `toolsClaim` | claim name, default `scope` | The MCP tools the subject may call: an array of strings or a space-separated string |
 | `scopes` | list, default `[openid, profile, email, groups]` | What clients are told to request: `scopes_supported` in the metadata document and `scope` in the 401 challenge. Dex behind an upstream connector needs `federated:id` added when the token's `federated_claims` matter |
+| `groupsClaim` | claim name, default `groups` | The subject's groups, for `toolsByGroup` |
+| `toolsByGroup` | `{group: [tools]}` | MCP tools per group, exact or `prefix.*`. A subject may call the union of what its groups grant and what `toolsClaim` lists. With a map in force, a subject granted nothing may call no tool (`tools/list` and `initialize` still work), so dex users are restricted per tool without a key |
 
 `auth.onBehalfOf` is for a caller that holds one key for many users (a hub, an
 orchestrator): it names the user it acts for in a header, the gateway records that user as
@@ -127,6 +129,11 @@ route; the oldest wins a conflict).
 | `budget.calls` | integer ≥ 1 | JSON-RPC requests that reached the server per window (MCP routes) |
 | `budget.window` | `Hourly`, `Daily`, `Monthly` | Fixed windows in UTC |
 | `budget.per` | `Key` (default), `Subject`, `Tenant`, `Route` | Whose counter the request spends from. `Subject`: the user behind the call, the `auth.onBehalfOf` name under its key, else the key or OAuth subject itself |
+
+A key with its own `budget_limit` (see [Keys](#keys)) is held to that instead of
+`budget.tokens`/`budget.calls` on `per: Key` and `per: Subject` counters (each user under
+the key gets the key's limit); tenant and route counters are shared and a key cannot resize
+them. `GET /v1/limits` on the ledger shows the effective figures.
 | `onLedgerUnavailable` | `Open` (default), `Closed` | Before the first sync of a window with the ledger unreachable |
 
 Exactly one of `tokens` and `calls` is set. The gateway forwards `Accept-Encoding: identity`
@@ -148,12 +155,13 @@ tenants and subjects. `aiGateway.ledger.openReads: true` serves `/export.jsonl` 
 
 | Call | Body / result |
 |---|---|
-| `POST /v1/keys` | `{"tenant","name","allowed_models":[…],"allowed_tools":[…],"key","expires_in_secs"}`; `key` imports an external key (≥ 16 characters), omitted generates `portus_sk_` + 40 hex; `expires_in_secs` sets an expiry (omitted: never). The plaintext is returned once |
-| `PATCH /v1/keys/{id}` | Change `tenant`, `name`, `allowed_models`, `allowed_tools` or `expires_in_secs` (0 clears) in place; the plaintext keeps working and the data planes get the change within a second, so a policy change needs no new key and no restart. Rotation grace: issue the new key, give the old one `expires_in_secs` |
+| `POST /v1/keys` | `{"tenant","name","allowed_models":[…],"allowed_tools":[…],"key","expires_in_secs","budget_limit"}`; `key` imports an external key (≥ 16 characters), omitted generates `portus_sk_` + 40 hex; `expires_in_secs` sets an expiry (omitted: never); `budget_limit` gives the key its own budget per window in the route policy's unit, replacing the policy's limit for this key (omitted or 0: the policy's). The plaintext is returned once |
+| `PATCH /v1/keys/{id}` | Change `tenant`, `name`, `allowed_models`, `allowed_tools`, `expires_in_secs` (0 clears) or `budget_limit` (0 clears) in place; the plaintext keeps working and the data planes get the change within a second, so a policy change needs no new key and no restart. Rotation grace: issue the new key, give the old one `expires_in_secs` |
 | `GET /v1/keys` | Every key, revoked ones included, without plaintext or hash; `expires_unix_secs` when set. Expired keys are revoked by the ledger within a minute and refused by the data planes at the second |
 | `DELETE /v1/keys/{id}` | Revoke; data planes drop the key within a second |
 | `GET /v1/summary?hours=N&by=` | Totals per group: `by=key` (default: a key's tenant and name, or an OAuth token's tenant claim and `sub`), `subject` (the user behind each key), `model` (per key and model; MCP: method), `tool` (per key, method and tool), `tenant`, `route` (host and provider). Each row: requests, refusals broken down by reason (`refused_unauthenticated`, `refused_model_not_allowed`, `refused_tool_not_allowed`, `refused_budget_exhausted`), `upstream_errors` (5xx from the provider), tokens, `duration_micros_total` and `first_byte_micros_total`/`first_byte_samples` for averages, `last_seen_unix_micros` |
 | `GET /v1/series?hours=N&bucket_secs=S&by=` | The same rows per time bucket (`bucket_start_unix_micros`; default 3600 s, 60 s to 7 d, epoch-aligned) for charts and spike detection |
+| `GET /v1/limits` | The effective limits: every AIUsagePolicy the data planes have synced (`limit`, `unit`, `window`, `per`, `fail_open`, `window_end_unix_micros`) with the current window's `spent`, `limit` and `remaining` per subject (a key override shows as that subject's limit), plus `key_budgets`, the live keys with a `budget_limit`. A policy appears after its first budgeted request; a subject after its first sync in the window. Reads the ledger, not Kubernetes |
 | `GET /export.jsonl?since_us=&limit=` | One JSON row per request: status, dialect, provider, model or method, tool, tokens, bytes, key id, tenant, subject, `on_behalf_of`, refusal and `rule` (the AIUsagePolicy that refused, or `key`/`jwt` for an allow list), `request_id`, `client_request_id`, `duration_micros`, `first_byte_micros` |
 | `GET /metrics` | Prometheus; no token |
 

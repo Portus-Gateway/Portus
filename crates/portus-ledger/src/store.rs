@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use portus_types::proto::portus::ledger::v1::{KeySnapshot, UsageRecord};
 
-use crate::budget::{self, Synced};
+use crate::budget::{self, PolicyLimits, Shape, Synced};
 use crate::keys::{self, KeyRow};
 
 pub struct Store {
@@ -232,14 +232,32 @@ impl Store {
         if !has_expiry {
             conn.execute_batch("ALTER TABLE api_keys ADD COLUMN expires_unix_secs INTEGER")?;
         }
+        // Ledgers created before 0.2.9 lack key budgets and the policy table's spend limit.
+        let has_key_budget: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('api_keys') WHERE name = 'budget_limit'")?
+            .exists([])?;
+        if !has_key_budget {
+            conn.execute_batch("ALTER TABLE api_keys ADD COLUMN budget_limit INTEGER")?;
+        }
         conn.execute_batch(budget::SCHEMA)?;
+        let has_subject_limit: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('spend') WHERE name = 'subject_limit'")?
+            .exists([])?;
+        if !has_subject_limit {
+            conn.execute_batch("ALTER TABLE spend ADD COLUMN subject_limit INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(Self { conn })
     }
 
     /// Add a pod's spend delta and return the window's total; `None` for
     /// an unknown window.
-    pub fn sync_spend(&self, policy: &str, subject: &str, window: &str, delta: u64, now_micros: u64) -> rusqlite::Result<Option<Synced>> {
-        budget::sync(&self.conn, policy, subject, window, delta, now_micros)
+    pub fn sync_spend(&self, policy: &str, subject: &str, window: &str, delta: u64, now_micros: u64, shape: Option<&Shape>) -> rusqlite::Result<Option<Synced>> {
+        budget::sync(&self.conn, policy, subject, window, delta, now_micros, shape)
+    }
+
+    /// Every synced policy with the current window's spend per subject.
+    pub fn limits(&self, now_micros: u64) -> rusqlite::Result<Vec<PolicyLimits>> {
+        budget::limits(&self.conn, now_micros)
     }
 
     pub fn prune_spend(&self, now_micros: u64) -> rusqlite::Result<usize> {
@@ -263,8 +281,9 @@ impl Store {
         Ok(next)
     }
 
-    pub fn issue_key(&self, tenant: &str, name: &str, models: &[String], tools: &[String], plaintext: Option<&str>, expires_in_secs: Option<u64>) -> rusqlite::Result<(KeyRow, String)> {
-        keys::issue(&self.conn, tenant, name, models, tools, plaintext, expires_in_secs)
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_key(&self, tenant: &str, name: &str, models: &[String], tools: &[String], plaintext: Option<&str>, expires_in_secs: Option<u64>, budget_limit: Option<u64>) -> rusqlite::Result<(KeyRow, String)> {
+        keys::issue(&self.conn, tenant, name, models, tools, plaintext, expires_in_secs, budget_limit)
     }
 
     pub fn update_key(&self, id: u64, patch: &keys::KeyPatch) -> rusqlite::Result<Option<KeyRow>> {
@@ -507,7 +526,7 @@ mod tests {
     #[test]
     fn the_summary_groups_by_subject_model_tool_tenant_or_route_and_breaks_refusals_down() {
         let mut store = Store::in_memory().unwrap();
-        let (hub, _) = store.issue_key("team-a", "hub", &[], &[], None, None).unwrap();
+        let (hub, _) = store.issue_key("team-a", "hub", &[], &[], None, None, None).unwrap();
         let mut rows = Vec::new();
         for (ts, user, model, tokens, refusal, rule, status) in [
             (10, "alice", "claude-opus-5", Some((100, 10)), "", "", 200),
@@ -625,7 +644,7 @@ mod tests {
     #[test]
     fn the_summary_totals_per_key_and_counts_refusals_separately() {
         let mut store = Store::in_memory().unwrap();
-        let (row, _) = store.issue_key("team-a", "ci", &[], &[], None, None).unwrap();
+        let (row, _) = store.issue_key("team-a", "ci", &[], &[], None, None, None).unwrap();
         let mut ok1 = record(10, "claude-opus-5", Some((100, 20)));
         ok1.key_id = row.id;
         let mut ok2 = record(20, "claude-opus-5", Some((50, 5)));
@@ -676,7 +695,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].refusal, "", "pre-existing rows read as forwarded");
         assert_eq!((rows[0].rule.as_str(), rows[0].first_byte_micros, rows[0].on_behalf_of.as_str()), ("", 0, ""));
-        let (row, _) = store.issue_key("t", "k", &[], &[], None, Some(60)).unwrap();
+        let (row, _) = store.issue_key("t", "k", &[], &[], None, Some(60), None).unwrap();
         assert!(row.expires_unix_secs.is_some(), "the key table gained its expiry column");
         let _ = std::fs::remove_dir_all(&dir);
     }

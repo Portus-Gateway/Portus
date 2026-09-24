@@ -268,6 +268,15 @@ message AiJwt {
   string tools_claim = 4;
   // Space-separated scopes clients are told to request (metadata and challenge).
   string scopes = 5;
+  // MCP tools by group: a subject may call the union of the tools mapped
+  // from its groups claim and the tools its tools claim lists. When the map
+  // is non-empty a subject with no tools from either is refused every call.
+  repeated AiGroupTools tools_by_group = 6;
+  string groups_claim = 7;    // default "groups"
+}
+message AiGroupTools {
+  string group = 1;
+  repeated string tools = 2;
 }
 
 message AiBudget {

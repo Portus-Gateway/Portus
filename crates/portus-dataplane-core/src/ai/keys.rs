@@ -29,6 +29,9 @@ pub struct KeyInfo {
     /// drops expired keys from the snapshot; this covers the gap between
     /// snapshots.
     pub expires_unix_secs: u64,
+    /// The key's own budget per window, replacing the route policy's limit
+    /// for its counters; 0: the route's limit applies.
+    pub budget_limit: u64,
 }
 
 impl KeyInfo {
@@ -97,6 +100,7 @@ impl KeySet {
                     allowed_models: Arc::from(k.allowed_models.clone()),
                     allowed_tools: Arc::from(k.allowed_tools.clone()),
                     expires_unix_secs: k.expires_unix_secs,
+                    budget_limit: k.budget_limit,
                 },
             );
         }
@@ -238,8 +242,8 @@ mod tests {
             version: 3,
             issuers: vec![],
             keys: vec![
-                KeyEntry { id: 1, hash_sha256: hash_key("portus_sk_any").to_vec(), tenant: "team-a".into(), name: "ci".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0 },
-                KeyEntry { id: 5, hash_sha256: hash_key("portus_sk_old").to_vec(), tenant: "team-a".into(), name: "rotated".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 1_000 },
+                KeyEntry { id: 1, hash_sha256: hash_key("portus_sk_any").to_vec(), tenant: "team-a".into(), name: "ci".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0, budget_limit: 0 },
+                KeyEntry { id: 5, hash_sha256: hash_key("portus_sk_old").to_vec(), tenant: "team-a".into(), name: "rotated".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 1_000, budget_limit: 0 },
                 KeyEntry {
                     id: 2,
                     hash_sha256: hash_key("portus_sk_haiku").to_vec(),
@@ -248,8 +252,9 @@ mod tests {
                     allowed_models: vec!["claude-haiku-4-5".into()],
                     allowed_tools: vec![],
                     expires_unix_secs: 0,
+                    budget_limit: 0,
                 },
-                KeyEntry { id: 3, hash_sha256: vec![1, 2, 3], tenant: "bad".into(), name: "short-hash".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0 },
+                KeyEntry { id: 3, hash_sha256: vec![1, 2, 3], tenant: "bad".into(), name: "short-hash".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0, budget_limit: 0 },
                 KeyEntry {
                     id: 4,
                     hash_sha256: hash_key("portus_sk_tools").to_vec(),
@@ -258,6 +263,7 @@ mod tests {
                     allowed_models: vec![],
                     allowed_tools: vec!["echo".into(), "github.*".into()],
                     expires_unix_secs: 0,
+                    budget_limit: 0,
                 },
             ],
         }

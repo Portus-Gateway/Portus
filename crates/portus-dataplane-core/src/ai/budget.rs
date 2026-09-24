@@ -87,6 +87,15 @@ impl Scope {
             _ => None,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Key => "KEY",
+            Self::Tenant => "TENANT",
+            Self::Route => "ROUTE",
+            Self::Subject => "SUBJECT",
+        }
+    }
 }
 
 /// What a budget counts.
@@ -127,13 +136,26 @@ impl Unit {
 pub struct BudgetPolicy {
     /// namespace/name of the AIUsagePolicy.
     pub id: Arc<str>,
-    /// Units per window.
+    /// Units per window the subject is held to: the route's, or a key's own
+    /// `budget_limit` (see [`BudgetPolicy::for_key`]).
     pub limit: u64,
+    /// The route policy's limit, before any key override.
+    pub route_limit: u64,
     pub unit: Unit,
     pub window: Window,
     pub per: Scope,
     /// With no sync yet and the ledger unreachable: allow or refuse.
     pub fail_open: bool,
+}
+
+impl BudgetPolicy {
+    /// The policy as it applies to a key with its own `budget_limit`: the
+    /// key's limit replaces the route's for `per: Key` and `per: Subject`
+    /// counters (a tenant or route counter is shared, so a key cannot resize
+    /// it). `0`: no override.
+    pub fn for_key(&self, key_budget_limit: u64) -> Option<Self> {
+        (key_budget_limit > 0 && matches!(self.per, Scope::Key | Scope::Subject)).then(|| Self { limit: key_budget_limit, ..self.clone() })
+    }
 }
 
 /// How often a subject's unsynced spend is shipped to the ledger.
@@ -159,7 +181,11 @@ pub struct Counter {
     /// subject makes before its first decision.
     settled: Notify,
     budget: AtomicU64,
+    /// The route policy's limit, told to the ledger for /v1/limits.
+    route_limit: AtomicU64,
     unit: Unit,
+    per: Scope,
+    fail_open: bool,
     window: std::sync::Mutex<Window>,
 }
 
@@ -174,7 +200,10 @@ impl Counter {
             syncing: AtomicBool::new(false),
             settled: Notify::new(),
             budget: AtomicU64::new(policy.limit),
+            route_limit: AtomicU64::new(policy.route_limit),
             unit: policy.unit,
+            per: policy.per,
+            fail_open: policy.fail_open,
             window: std::sync::Mutex::new(policy.window),
         }
     }
@@ -345,6 +374,7 @@ impl Budgets {
             .or_insert_with(|| Arc::new(Counter::new(policy)))
             .clone();
         c.budget.store(policy.limit, Ordering::Relaxed);
+        c.route_limit.store(policy.route_limit, Ordering::Relaxed);
         c
     }
 
@@ -467,6 +497,11 @@ async fn sync_loop(addr: String, node: String, mut asks: mpsc::Receiver<SyncAsk>
             subject: ask.subject.to_string(),
             window: ask.counter.window().as_str().to_string(),
             spent_delta: delta,
+            limit: ask.counter.route_limit.load(Ordering::Relaxed),
+            unit: ask.counter.unit.as_str().to_string(),
+            per: ask.counter.per.as_str().to_string(),
+            fail_open: ask.counter.fail_open,
+            subject_limit: ask.counter.budget.load(Ordering::Relaxed),
         };
         match c.sync(request).await {
             Ok(resp) => {
@@ -513,11 +548,31 @@ mod tests {
     const NOW: u64 = 1_789_673_548_000_000; // 2026-09-17T19:32:28Z
 
     fn policy(tokens: u64) -> BudgetPolicy {
-        BudgetPolicy { id: Arc::from("llm/hourly"), limit: tokens, unit: Unit::Tokens, window: Window::Hourly, per: Scope::Key, fail_open: true }
+        BudgetPolicy { id: Arc::from("llm/hourly"), limit: tokens, route_limit: tokens, unit: Unit::Tokens, window: Window::Hourly, per: Scope::Key, fail_open: true }
     }
 
     fn calls(limit: u64) -> BudgetPolicy {
-        BudgetPolicy { id: Arc::from("mcp/hourly"), limit, unit: Unit::Calls, window: Window::Hourly, per: Scope::Key, fail_open: true }
+        BudgetPolicy { id: Arc::from("mcp/hourly"), limit, route_limit: limit, unit: Unit::Calls, window: Window::Hourly, per: Scope::Key, fail_open: true }
+    }
+
+    #[test]
+    fn a_key_budget_replaces_the_route_limit_for_its_own_counters_only() {
+        let route = policy(1_000);
+        let mine = route.for_key(5_000).expect("per Key takes the override");
+        assert_eq!((mine.limit, mine.route_limit, mine.id.as_ref()), (5_000, 1_000, "llm/hourly"));
+        assert!(route.for_key(0).is_none(), "0 is no override");
+        let per_user = BudgetPolicy { per: Scope::Subject, ..policy(1_000) };
+        assert_eq!(per_user.for_key(20).map(|p| p.limit), Some(20));
+        let shared = BudgetPolicy { per: Scope::Tenant, ..policy(1_000) };
+        assert!(shared.for_key(5_000).is_none(), "a shared tenant counter is not resized by one key");
+        assert!(BudgetPolicy { per: Scope::Route, ..policy(1_000) }.for_key(5_000).is_none());
+        // The counter follows the effective policy and remembers the route's.
+        let (budgets, _asks) = Budgets::detached();
+        let subject: Arc<str> = Arc::from("k1");
+        let c = budgets.counter(&mine, &subject);
+        c.apply_sync(4_500, Window::Hourly.end_of(NOW), 0);
+        assert_eq!(c.remaining(), 500);
+        assert_eq!(c.route_limit.load(Ordering::Relaxed), 1_000);
     }
 
     #[test]

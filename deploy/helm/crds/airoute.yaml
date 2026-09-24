@@ -76,6 +76,16 @@ spec:
                           items:
                             type: string
                           description: "Scopes MCP clients are told to request (metadata scopes_supported and the 401 challenge); default [openid, profile, email, groups]"
+                        groupsClaim:
+                          type: string
+                          description: "Claim listing the subject's groups; default groups"
+                        toolsByGroup:
+                          type: object
+                          additionalProperties:
+                            type: array
+                            items:
+                              type: string
+                          description: "MCP tools granted per group (exact or prefix.*). A subject may call the union of what its groups grant and what toolsClaim lists; with a map in force, a subject granted nothing may call no tool"
                     onBehalfOf:
                       type: object
                       required: [trustedKeys]

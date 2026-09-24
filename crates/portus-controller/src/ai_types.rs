@@ -136,6 +136,15 @@ pub struct AIJwtSpec {
     /// may need `federated:id` as well.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
+    /// Claim listing the subject's groups; default `groups`.
+    #[serde(rename = "groupsClaim", default, skip_serializing_if = "Option::is_none")]
+    pub groups_claim: Option<String>,
+    /// MCP tools granted per group (exact names or `prefix.*`). A subject may
+    /// call the union of the tools its groups grant and the tools its tools
+    /// claim lists; with a map in force, a subject granted nothing may call
+    /// no tool.
+    #[serde(rename = "toolsByGroup", default, skip_serializing_if = "Option::is_none")]
+    pub tools_by_group: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

@@ -908,6 +908,8 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
                     tenant_claim: j.tenant_claim.clone(),
                     tools_claim: j.tools_claim.clone(),
                     scopes: j.scopes.clone(),
+                    groups_claim: j.groups_claim.clone(),
+                    tools_by_group: j.tools_by_group.iter().map(|(group, tools)| portus_types::AiGroupTools { group: group.clone(), tools: tools.clone() }).collect(),
                 },
             ))
         })
@@ -2404,7 +2406,7 @@ mod tests {
                     filters: vec![crate::store::HTTPFilterState::URLRewrite { hostname: None, path: Some("/mcp".into()), path_type: Some("ReplaceFullPath".into()) }],
                 }],
                 require_api_key: true,
-                jwt: Some(crate::store::AIJwtState { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: "groups".into(), tools_claim: "scope".into(), scopes: "openid profile email groups".into() }),
+                jwt: Some(crate::store::AIJwtState { issuer: "https://dex.example.com".into(), audience: None, tenant_claim: "groups".into(), tools_claim: "scope".into(), scopes: "openid profile email groups".into(), groups_claim: "groups".into(), tools_by_group: vec![("eng".into(), vec!["github.*".into()])] }),
                 on_behalf_of: Some(crate::store::AIOnBehalfOfState { header: "x-portus-on-behalf-of".into(), trusted_keys: vec!["default/hub".into()] }),
                 generation: 1,
             },
@@ -2467,6 +2469,7 @@ mod tests {
         let route = &config.routes[0];
         assert!(route.ai_key_required);
         assert_eq!(route.ai_jwt.as_ref().map(|j| (j.issuer.as_str(), j.audience.as_str(), j.tenant_claim.as_str(), j.tools_claim.as_str())), Some(("https://dex.example.com", "", "groups", "scope")));
+        assert_eq!(route.ai_jwt.as_ref().map(|j| (j.groups_claim.as_str(), j.tools_by_group.iter().map(|g| (g.group.as_str(), g.tools.clone())).collect::<Vec<_>>())), Some(("groups", vec![("eng", vec!["github.*".to_string()])])));
         assert_eq!(route.request_timeout_ms, 600_000, "TimeoutPolicy targeting the AIRoute applies");
         assert_eq!(route.rate_limit.as_ref().map(|r| (r.requests_per_second, r.per_client)), Some((5, true)), "RateLimitPolicy targeting the AIRoute applies, the HTTPRoute one does not");
         let budget = route.ai_budget.as_ref().expect("budget attached");

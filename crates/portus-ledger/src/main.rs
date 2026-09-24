@@ -8,7 +8,7 @@
 //! - `LEDGER_HTTP_ADDR` (default `0.0.0.0:8083`): `/healthz`, `/readyz` and
 //!   `/metrics` open; `/export.jsonl?since_us=<µs>&limit=<n>`,
 //!   `/v1/summary?hours=&by=key|subject|model|tool|tenant|route`,
-//!   `/v1/series?hours=&bucket_secs=&by=` and the key API `/v1/keys`
+//!   `/v1/series?hours=&bucket_secs=&by=`, `/v1/limits` and the key API `/v1/keys`
 //!   (GET, POST, PATCH `/v1/keys/{id}`, DELETE) behind bearer
 //!   `LEDGER_ADMIN_TOKEN` (the admin API is disabled when it is unset).
 //! - `LEDGER_OPEN_READS=true`: serve `/export.jsonl` and `/v1/summary`
@@ -65,7 +65,8 @@ enum Op {
     Summary { since: u64, by: GroupBy, done: Done<Vec<store::Summary>> },
     Series { since: u64, bucket_micros: u64, by: GroupBy, done: Done<Vec<store::Summary>> },
     Count(Done<u64>),
-    IssueKey { tenant: String, name: String, models: Vec<String>, tools: Vec<String>, plaintext: Option<String>, expires_in_secs: Option<u64>, done: Done<(KeyRow, String)> },
+    IssueKey { tenant: String, name: String, models: Vec<String>, tools: Vec<String>, plaintext: Option<String>, expires_in_secs: Option<u64>, budget_limit: Option<u64>, done: Done<(KeyRow, String)> },
+    Limits { now_micros: u64, done: Done<Vec<budget::PolicyLimits>> },
     UpdateKey { id: u64, patch: KeyPatch, done: Done<Option<KeyRow>> },
     RevokeKey { id: u64, done: Done<bool> },
     /// Revoke keys whose expiry has passed; how many.
@@ -95,8 +96,11 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
             Op::Count(done) => {
                 let _ = done.send(store.count());
             }
-            Op::IssueKey { tenant, name, models, tools, plaintext, expires_in_secs, done } => {
-                let _ = done.send(store.issue_key(&tenant, &name, &models, &tools, plaintext.as_deref(), expires_in_secs));
+            Op::IssueKey { tenant, name, models, tools, plaintext, expires_in_secs, budget_limit, done } => {
+                let _ = done.send(store.issue_key(&tenant, &name, &models, &tools, plaintext.as_deref(), expires_in_secs, budget_limit));
+            }
+            Op::Limits { now_micros, done } => {
+                let _ = done.send(store.limits(now_micros));
             }
             Op::UpdateKey { id, patch, done } => {
                 let _ = done.send(store.update_key(id, &patch));
@@ -114,7 +118,9 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
                 let _ = done.send(store.bump_key_version().and_then(|v| store.key_snapshot(v)));
             }
             Op::SyncSpend { req, now_micros, done } => {
-                let _ = done.send(store.sync_spend(&req.policy, &req.subject, &req.window, req.spent_delta, now_micros));
+                // Data planes before 0.2.9 send no shape; the spend still counts.
+                let shape = (req.limit > 0).then(|| budget::Shape { limit: req.limit, unit: req.unit.clone(), per: req.per.clone(), fail_open: req.fail_open, subject_limit: req.subject_limit });
+                let _ = done.send(store.sync_spend(&req.policy, &req.subject, &req.window, req.spent_delta, now_micros, shape.as_ref()));
             }
             Op::PruneSpend { now_micros, done } => {
                 let _ = done.send(store.prune_spend(now_micros));
@@ -261,6 +267,10 @@ struct IssueKeyRequest {
     /// Seconds until the key expires; omitted or 0: never.
     #[serde(default)]
     expires_in_secs: Option<u64>,
+    /// The key's own budget per window (the route policy's unit); omitted or
+    /// 0: the policy's limit.
+    #[serde(default)]
+    budget_limit: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -383,6 +393,46 @@ async fn series(State(shared): State<Arc<Shared>>, headers: HeaderMap, Query(p):
     }
 }
 
+/// Every budget policy the data planes have synced, with the current
+/// window's spend and remaining per subject, and the key overrides in
+/// force. What a hub reads instead of the AIUsagePolicy objects.
+async fn limits(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    if let Err(r) = reads_ok(&shared, &headers) {
+        return *r;
+    }
+    let now = now_micros();
+    let policies = match shared.run(|done| Op::Limits { now_micros: now, done }).await {
+        Ok(p) => p,
+        Err(e) => return storage_error(e),
+    };
+    let keys = match shared.run(Op::ListKeys).await {
+        Ok(k) => k,
+        Err(e) => return storage_error(e),
+    };
+    let overrides: Vec<KeyBudget> = keys
+        .into_iter()
+        .filter(|k| k.revoked_unix_micros.is_none())
+        .filter_map(|k| k.budget_limit.map(|budget_limit| KeyBudget { key_id: k.id, tenant: k.tenant, name: k.name, budget_limit }))
+        .collect();
+    Json(Limits { now_unix_micros: now, policies, key_budgets: overrides }).into_response()
+}
+
+#[derive(Serialize)]
+struct Limits {
+    now_unix_micros: u64,
+    policies: Vec<budget::PolicyLimits>,
+    /// Live keys with a budget of their own.
+    key_budgets: Vec<KeyBudget>,
+}
+
+#[derive(Serialize)]
+struct KeyBudget {
+    key_id: u64,
+    tenant: String,
+    name: String,
+    budget_limit: u64,
+}
+
 #[derive(Deserialize, Default)]
 struct SummaryParams {
     hours: Option<u64>,
@@ -408,6 +458,7 @@ async fn issue_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Json(r
             tools: req.allowed_tools.clone(),
             plaintext: req.key.as_deref().map(str::trim).map(str::to_string),
             expires_in_secs: req.expires_in_secs,
+            budget_limit: req.budget_limit,
             done,
         })
         .await;
@@ -475,6 +526,7 @@ fn router(shared: Arc<Shared>) -> Router {
         .route("/export.jsonl", get(export))
         .route("/v1/summary", get(summary))
         .route("/v1/series", get(series))
+        .route("/v1/limits", get(limits))
         .route("/v1/keys", get(list_keys).post(issue_key))
         .route("/v1/keys/{id}", axum::routing::delete(revoke_key).patch(update_key))
         .with_state(shared)
@@ -737,5 +789,31 @@ mod tests {
         assert_eq!(call(&app, "GET", "/v1/summary?by=bogus", Some("Bearer secret-admin"), None).await.0, StatusCode::BAD_REQUEST);
         assert_eq!(call(&app, "GET", "/v1/series?bucket_secs=300&by=model", Some("Bearer secret-admin"), None).await, (StatusCode::OK, "[]".to_string()));
         assert_eq!(call(&app, "GET", "/v1/series", None, None).await.0, StatusCode::UNAUTHORIZED, "the series is a usage read");
+        assert_eq!(call(&app, "GET", "/v1/limits", None, None).await.0, StatusCode::UNAUTHORIZED, "limits name keys");
+    }
+
+    #[tokio::test]
+    async fn limits_list_synced_policies_and_key_budgets() {
+        let (app, shared) = app().await;
+        let (status, body) = call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"tenant":"team-a","name":"big","budget_limit":200000000}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_u64().unwrap();
+        let (status, body) = call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"tenant":"team-a","name":"plain"}"#)).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        // A data plane syncs the big key's spend under a daily policy.
+        let spend = Spend(Arc::clone(&shared));
+        let req = SyncRequest { node: "pod".into(), policy: "llm/daily".into(), subject: id.to_string(), window: "DAILY".into(), spent_delta: 1_500, limit: 1_000_000, unit: "TOKENS".into(), per: "KEY".into(), fail_open: true, subject_limit: 200_000_000 };
+        assert_eq!(spend.sync(Request::new(req)).await.unwrap().into_inner().spent_total, 1_500);
+        let (status, body) = call(&app, "GET", "/v1/limits", Some("Bearer secret-admin"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["policies"][0]["policy"], "llm/daily");
+        assert_eq!((v["policies"][0]["limit"].as_u64(), v["policies"][0]["unit"].as_str(), v["policies"][0]["per"].as_str()), (Some(1_000_000), Some("TOKENS"), Some("KEY")));
+        let s = &v["policies"][0]["subjects"][0];
+        assert_eq!((s["subject"].as_str(), s["limit"].as_u64(), s["spent"].as_u64(), s["remaining"].as_i64()), (Some(id.to_string().as_str()), Some(200_000_000), Some(1_500), Some(199_998_500)));
+        assert_eq!(v["key_budgets"].as_array().unwrap().len(), 1, "only keys with their own budget: {body}");
+        assert_eq!((v["key_budgets"][0]["name"].as_str(), v["key_budgets"][0]["budget_limit"].as_u64()), (Some("big"), Some(200_000_000)));
+        // The snapshot carries the budget to the data planes.
+        assert_eq!(shared.keys.borrow().keys.iter().find(|k| k.id == id).unwrap().budget_limit, 200_000_000);
     }
 }

@@ -4,6 +4,18 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.9] - 2026-09-24
+
+The rest of the first fleet's list: one budget per key, the effective limits without
+reading Kubernetes, and tool restrictions for OAuth users.
+
+### Added
+
+- **Per-key budgets.** `POST`/`PATCH /v1/keys` take `budget_limit`, the key's own budget per window in the route policy's unit; it replaces `budget.tokens`/`budget.calls` for that key's counters (`per: Key`, and each user under it with `per: Subject`). Tenant and route counters stay shared. Ships in the key snapshot, so it applies within a second.
+- **`GET /v1/limits`.** Every AIUsagePolicy the data planes have synced, with the current window's spent, limit and remaining per subject, and the keys with a budget of their own. Data planes now send the policy's shape (limit, unit, per, fail-open, the subject's effective limit) with each budget sync; a policy appears after its first budgeted request.
+- **Tools by group for OAuth users.** `AIRoute.auth.jwt.toolsByGroup {group: [tools]}` (and `groupsClaim`, default `groups`): a subject may call the union of the tools its groups grant and the tools its `toolsClaim` lists. With a map in force, a subject granted nothing may call no tool, so dex users are restricted per tool without a Portus key.
+- Crate versions follow the chart (0.2.9).
+
 ## [0.2.8] - 2026-09-24
 
 What the first fleet asked for after a week on 0.2.5–0.2.7: who is behind a call, richer

@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS api_keys (
     external INTEGER NOT NULL,
     created_unix_micros INTEGER NOT NULL,
     revoked_unix_micros INTEGER,
-    expires_unix_secs INTEGER
+    expires_unix_secs INTEGER,
+    budget_limit INTEGER
 );
 ";
 
@@ -42,6 +43,10 @@ pub struct KeyRow {
     /// Unix seconds the key stops working at; None: never. An expired key
     /// is revoked (with `revoked_unix_micros` set) by the ledger's sweep.
     pub expires_unix_secs: Option<u64>,
+    /// The key's own budget per window, in the route policy's unit; it
+    /// replaces the policy's limit for this key's counters. None: the
+    /// policy's limit.
+    pub budget_limit: Option<u64>,
 }
 
 /// What a PATCH may change on a live key; every field optional.
@@ -53,6 +58,8 @@ pub struct KeyPatch {
     pub allowed_tools: Option<Vec<String>>,
     /// Seconds from now until the key expires; 0 clears an expiry.
     pub expires_in_secs: Option<u64>,
+    /// The key's own budget per window; 0 clears it.
+    pub budget_limit: Option<u64>,
 }
 
 fn now_secs() -> u64 {
@@ -93,16 +100,18 @@ pub fn issue(
     allowed_tools: &[String],
     plaintext: Option<&str>,
     expires_in_secs: Option<u64>,
+    budget_limit: Option<u64>,
 ) -> rusqlite::Result<(KeyRow, String)> {
     let external = plaintext.is_some();
     let key = plaintext.map(str::to_string).unwrap_or_else(generate_key);
     let id: u64 = rand::random::<u64>() >> 1; // fits SQLite's signed INTEGER
     let created = now_micros();
     let expires = expiry(expires_in_secs);
+    let budget_limit = budget_limit.filter(|b| *b > 0);
     conn.execute(
-        "INSERT INTO api_keys (id, hash, tenant, name, allowed_models, allowed_tools, external, created_unix_micros, revoked_unix_micros, expires_unix_secs)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
-        params![id as i64, hash_key(&key).to_vec(), tenant, name, allowed_models.join(","), allowed_tools.join(","), external, created as i64, expires.map(|e| e as i64)],
+        "INSERT INTO api_keys (id, hash, tenant, name, allowed_models, allowed_tools, external, created_unix_micros, revoked_unix_micros, expires_unix_secs, budget_limit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9, ?10)",
+        params![id as i64, hash_key(&key).to_vec(), tenant, name, allowed_models.join(","), allowed_tools.join(","), external, created as i64, expires.map(|e| e as i64), budget_limit.map(|b| b as i64)],
     )?;
     let row = KeyRow {
         id,
@@ -114,6 +123,7 @@ pub fn issue(
         created_unix_micros: created,
         revoked_unix_micros: None,
         expires_unix_secs: expires,
+        budget_limit,
     };
     Ok((row, key))
 }
@@ -131,11 +141,15 @@ pub fn update(conn: &Connection, id: u64, patch: &KeyPatch) -> rusqlite::Result<
         Some(secs) => expiry(Some(secs)),
         None => current.expires_unix_secs,
     };
+    let budget_limit = match patch.budget_limit {
+        Some(b) => Some(b).filter(|b| *b > 0),
+        None => current.budget_limit,
+    };
     conn.execute(
-        "UPDATE api_keys SET tenant = ?2, name = ?3, allowed_models = ?4, allowed_tools = ?5, expires_unix_secs = ?6 WHERE id = ?1 AND revoked_unix_micros IS NULL",
-        params![id as i64, tenant, name, models.join(","), tools.join(","), expires.map(|e| e as i64)],
+        "UPDATE api_keys SET tenant = ?2, name = ?3, allowed_models = ?4, allowed_tools = ?5, expires_unix_secs = ?6, budget_limit = ?7 WHERE id = ?1 AND revoked_unix_micros IS NULL",
+        params![id as i64, tenant, name, models.join(","), tools.join(","), expires.map(|e| e as i64), budget_limit.map(|b| b as i64)],
     )?;
-    Ok(Some(KeyRow { tenant: tenant.to_string(), name: name.to_string(), allowed_models: models.clone(), allowed_tools: tools.clone(), expires_unix_secs: expires, ..current }))
+    Ok(Some(KeyRow { tenant: tenant.to_string(), name: name.to_string(), allowed_models: models.clone(), allowed_tools: tools.clone(), expires_unix_secs: expires, budget_limit, ..current }))
 }
 
 /// Revoke every live key whose expiry has passed. Returns how many.
@@ -162,7 +176,7 @@ fn split_models(s: &str) -> Vec<String> {
 /// Every key, revoked ones included, newest first.
 pub fn list(conn: &Connection) -> rusqlite::Result<Vec<KeyRow>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, tenant, name, allowed_models, external, created_unix_micros, revoked_unix_micros, allowed_tools, expires_unix_secs
+        "SELECT id, tenant, name, allowed_models, external, created_unix_micros, revoked_unix_micros, allowed_tools, expires_unix_secs, budget_limit
          FROM api_keys ORDER BY created_unix_micros DESC, id",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -176,6 +190,7 @@ pub fn list(conn: &Connection) -> rusqlite::Result<Vec<KeyRow>> {
             created_unix_micros: r.get::<_, i64>(5)? as u64,
             revoked_unix_micros: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
             expires_unix_secs: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+            budget_limit: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
         })
     })?;
     rows.collect()
@@ -184,7 +199,7 @@ pub fn list(conn: &Connection) -> rusqlite::Result<Vec<KeyRow>> {
 /// The live keys as the data planes receive them.
 pub fn snapshot(conn: &Connection, version: u64) -> rusqlite::Result<KeySnapshot> {
     let mut stmt = conn.prepare_cached(
-        "SELECT id, hash, tenant, name, allowed_models, allowed_tools, expires_unix_secs FROM api_keys
+        "SELECT id, hash, tenant, name, allowed_models, allowed_tools, expires_unix_secs, budget_limit FROM api_keys
          WHERE revoked_unix_micros IS NULL AND (expires_unix_secs IS NULL OR expires_unix_secs > ?1) ORDER BY id",
     )?;
     let keys = stmt
@@ -197,6 +212,7 @@ pub fn snapshot(conn: &Connection, version: u64) -> rusqlite::Result<KeySnapshot
                 allowed_models: split_models(&r.get::<_, String>(4)?),
                 allowed_tools: split_models(&r.get::<_, String>(5)?),
                 expires_unix_secs: r.get::<_, Option<i64>>(6)?.map(|v| v as u64).unwrap_or(0),
+                budget_limit: r.get::<_, Option<i64>>(7)?.map(|v| v as u64).unwrap_or(0),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -224,8 +240,8 @@ mod tests {
     #[test]
     fn issued_keys_appear_in_the_snapshot_by_hash_until_revoked() {
         let c = conn();
-        let (row, key) = issue(&c, "team-a", "ci", &["claude-haiku-4-5".to_string()], &["echo".to_string(), "github.*".to_string()], None, None).unwrap();
-        let (ext_row, ext_key) = issue(&c, "team-b", "legacy", &[], &[], Some("sk-external-123"), None).unwrap();
+        let (row, key) = issue(&c, "team-a", "ci", &["claude-haiku-4-5".to_string()], &["echo".to_string(), "github.*".to_string()], None, None, None).unwrap();
+        let (ext_row, ext_key) = issue(&c, "team-b", "legacy", &[], &[], Some("sk-external-123"), None, None).unwrap();
         assert_eq!(ext_key, "sk-external-123");
         assert!(ext_row.external && !row.external);
 
@@ -254,14 +270,32 @@ mod tests {
     #[test]
     fn the_same_plaintext_cannot_be_stored_twice() {
         let c = conn();
-        issue(&c, "a", "one", &[], &[], Some("dup"), None).unwrap();
-        assert!(issue(&c, "a", "two", &[], &[], Some("dup"), None).is_err());
+        issue(&c, "a", "one", &[], &[], Some("dup"), None, None).unwrap();
+        assert!(issue(&c, "a", "two", &[], &[], Some("dup"), None, None).is_err());
+    }
+
+    #[test]
+    fn a_key_budget_is_stored_patched_and_pushed_in_the_snapshot() {
+        let c = conn();
+        let (big, _) = issue(&c, "team-a", "big", &[], &[], None, None, Some(200_000_000)).unwrap();
+        let (plain, _) = issue(&c, "team-a", "plain", &[], &[], None, None, Some(0)).unwrap();
+        assert_eq!((big.budget_limit, plain.budget_limit), (Some(200_000_000), None), "0 means none");
+        let snap = snapshot(&c, 1).unwrap();
+        assert_eq!(snap.keys.iter().find(|k| k.id == big.id).unwrap().budget_limit, 200_000_000);
+        assert_eq!(snap.keys.iter().find(|k| k.id == plain.id).unwrap().budget_limit, 0);
+        let patched = update(&c, plain.id, &KeyPatch { budget_limit: Some(5_000_000), ..Default::default() }).unwrap().unwrap();
+        assert_eq!(patched.budget_limit, Some(5_000_000));
+        assert_eq!(list(&c).unwrap().into_iter().find(|k| k.id == plain.id).unwrap().budget_limit, Some(5_000_000));
+        let cleared = update(&c, plain.id, &KeyPatch { budget_limit: Some(0), ..Default::default() }).unwrap().unwrap();
+        assert_eq!(cleared.budget_limit, None);
+        let untouched = update(&c, big.id, &KeyPatch { name: Some("bigger".into()), ..Default::default() }).unwrap().unwrap();
+        assert_eq!(untouched.budget_limit, Some(200_000_000), "a patch without the field keeps it");
     }
 
     #[test]
     fn a_key_is_changed_in_place_and_keeps_its_plaintext() {
         let c = conn();
-        let (row, key) = issue(&c, "team-a", "hub", &["claude-haiku-4-5".to_string()], &[], None, None).unwrap();
+        let (row, key) = issue(&c, "team-a", "hub", &["claude-haiku-4-5".to_string()], &[], None, None, None).unwrap();
         let patched = update(&c, row.id, &KeyPatch { allowed_models: Some(vec!["claude-opus-5".to_string()]), allowed_tools: Some(vec!["github.*".to_string()]), name: Some("hub-2".into()), ..Default::default() }).unwrap().unwrap();
         assert_eq!((patched.id, patched.tenant.as_str(), patched.name.as_str()), (row.id, "team-a", "hub-2"));
         assert_eq!((patched.allowed_models, patched.allowed_tools), (vec!["claude-opus-5".to_string()], vec!["github.*".to_string()]));
@@ -276,8 +310,8 @@ mod tests {
     #[test]
     fn expiring_keys_leave_the_snapshot_and_are_revoked_by_the_sweep() {
         let c = conn();
-        let (forever, _) = issue(&c, "t", "forever", &[], &[], None, None).unwrap();
-        let (soon, _) = issue(&c, "t", "soon", &[], &[], None, Some(3600)).unwrap();
+        let (forever, _) = issue(&c, "t", "forever", &[], &[], None, None, None).unwrap();
+        let (soon, _) = issue(&c, "t", "soon", &[], &[], None, Some(3600), None).unwrap();
         let now = now_secs();
         let exp = soon.expires_unix_secs.unwrap();
         assert!(exp >= now + 3599 && exp <= now + 3601, "{exp} vs {now}");

@@ -584,6 +584,9 @@ pub struct AIJwtState {
     pub tools_claim: String,
     /// Space-separated.
     pub scopes: String,
+    pub groups_claim: String,
+    /// Sorted by group.
+    pub tools_by_group: Vec<(String, Vec<String>)>,
 }
 
 /// An `AIUsagePolicy`: a token budget on an AIRoute.
