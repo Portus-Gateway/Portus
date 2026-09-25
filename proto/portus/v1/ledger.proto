@@ -66,6 +66,28 @@ message ReportAck {
 // the overrun is bounded by one sync interval of spend, not by grants.
 service Budget {
   rpc Sync(SyncRequest) returns (SyncResponse);
+  // The budget policies a data plane holds in its config, sent when the
+  // config changes and every minute, so /v1/limits lists a policy before its
+  // first request and drops one no data plane holds any more.
+  rpc Declare(PolicyDeclaration) returns (DeclareAck);
+}
+
+message PolicyDeclaration {
+  string node = 1;
+  repeated DeclaredPolicy policies = 2;
+}
+
+message DeclaredPolicy {
+  string policy = 1;          // namespace/name of the AIUsagePolicy
+  uint64 limit = 2;
+  string unit = 3;            // TOKENS | CALLS
+  string window = 4;          // HOURLY | DAILY | MONTHLY
+  string per = 5;             // KEY | SUBJECT | TENANT | ROUTE
+  bool fail_open = 6;
+}
+
+message DeclareAck {
+  uint64 accepted = 1;
 }
 
 message SyncRequest {
@@ -131,7 +153,13 @@ message KeyEntry {
   // leaves expired keys out of the snapshot; this lets a data plane refuse
   // one between snapshots.
   uint64 expires_unix_secs = 7;
-  // Per-key budget: replaces the route policy's limit for this key (and for
-  // subjects under it with per: Subject), in the policy's unit. 0: none.
-  uint64 budget_limit = 8;
+  // Was budget_limit: one number applied to token and call policies alike.
+  reserved 8;
+  // The key's own budgets per window, replacing a route policy's limit for
+  // this key's counters (and each user under it with per: Subject): one for
+  // token policies, one for call policies. 0: the policy's limit.
+  uint64 token_limit = 9;
+  uint64 call_limit = 10;
+  // Free-form labels (owner, expert, created-by), for trust rules and rows.
+  map<string, string> labels = 11;
 }

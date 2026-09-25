@@ -23,9 +23,12 @@ pub struct Normalised {
     pub limit: u64,
     /// HOURLY | DAILY | MONTHLY
     pub window: String,
-    /// KEY | TENANT | ROUTE
+    /// KEY | SUBJECT | TENANT | ROUTE
     pub per: String,
     pub fail_open: bool,
+    /// Empty: a spent budget refuses.
+    pub fallback_model: String,
+    pub overflow_limit: u64,
 }
 
 /// Normalise the spec into the data plane's vocabulary, or say what is wrong.
@@ -61,7 +64,22 @@ pub fn normalise(policy: &AIUsagePolicy) -> Result<Normalised, String> {
         "closed" => false,
         other => return Err(format!("onLedgerUnavailable {other:?} is not Open or Closed")),
     };
-    Ok(Normalised { unit: unit.to_string(), limit, window: window.to_string(), per: per.to_string(), fail_open })
+    let (fallback_model, overflow_limit) = match &spec.on_exhausted {
+        None => (String::new(), 0),
+        Some(_) if unit != "TOKENS" => return Err("onExhausted.fallbackModel needs a token budget: a call budget has no model to change".to_string()),
+        Some(o) => {
+            let model = o.fallback_model.trim();
+            if model.is_empty() {
+                return Err("onExhausted.fallbackModel is empty".to_string());
+            }
+            let overflow = o.overflow_tokens.unwrap_or((limit / 10).max(1));
+            if overflow == 0 {
+                return Err("onExhausted.overflowTokens must be at least 1".to_string());
+            }
+            (model.to_string(), overflow)
+        }
+    };
+    Ok(Normalised { unit: unit.to_string(), limit, window: window.to_string(), per: per.to_string(), fail_open, fallback_model, overflow_limit })
 }
 
 pub fn reconcile_inner(policy: &AIUsagePolicy, store: &ConfigStore) -> Result<Vec<Condition>, ReconcileError> {
@@ -79,7 +97,7 @@ pub fn reconcile_inner(policy: &AIUsagePolicy, store: &ConfigStore) -> Result<Ve
     };
 
     let (accepted, reason, message) = match normalise(policy) {
-        Ok(Normalised { unit, limit, window, per, fail_open }) => {
+        Ok(Normalised { unit, limit, window, per, fail_open, fallback_model, overflow_limit }) => {
             store.ai_usage_policies.insert(
                 my_key.clone(),
                 AIUsagePolicyState {
@@ -89,6 +107,8 @@ pub fn reconcile_inner(policy: &AIUsagePolicy, store: &ConfigStore) -> Result<Ve
                     window,
                     per,
                     fail_open,
+                    fallback_model,
+                    overflow_limit,
                     generation,
                     creation_timestamp: policy.metadata.creation_timestamp.clone(),
                     accepted: true,
@@ -171,13 +191,35 @@ mod tests {
                 target_ref: PolicyTargetRef { group: "portus-gateway.dev".into(), kind: "AIRoute".into(), name: "claude".into(), section_name: None },
                 budget: AIBudgetSpec { tokens: Some(tokens), calls: None, window: window.into(), per: per.map(str::to_string) },
                 on_ledger_unavailable: unavailable.map(str::to_string),
+                on_exhausted: None,
             },
             status: None,
         }
     }
 
     fn n(unit: &str, limit: u64, window: &str, per: &str, fail_open: bool) -> Normalised {
-        Normalised { unit: unit.into(), limit, window: window.into(), per: per.into(), fail_open }
+        Normalised { unit: unit.into(), limit, window: window.into(), per: per.into(), fail_open, fallback_model: String::new(), overflow_limit: 0 }
+    }
+
+    #[test]
+    fn a_fallback_model_needs_a_token_budget_and_defaults_its_overflow_to_a_tenth() {
+        use crate::ai_types::AIOnExhaustedSpec;
+        let mut p = policy("a", "Daily", None, None, 1_000_000);
+        p.spec.on_exhausted = Some(AIOnExhaustedSpec { fallback_model: " claude-haiku-4-5 ".into(), overflow_tokens: None });
+        let got = normalise(&p).unwrap();
+        assert_eq!((got.fallback_model.as_str(), got.overflow_limit), ("claude-haiku-4-5", 100_000));
+        p.spec.on_exhausted = Some(AIOnExhaustedSpec { fallback_model: "claude-haiku-4-5".into(), overflow_tokens: Some(5) });
+        assert_eq!(normalise(&p).unwrap().overflow_limit, 5);
+        p.spec.on_exhausted = Some(AIOnExhaustedSpec { fallback_model: "claude-haiku-4-5".into(), overflow_tokens: Some(0) });
+        assert!(normalise(&p).unwrap_err().contains("overflowTokens"));
+        p.spec.on_exhausted = Some(AIOnExhaustedSpec { fallback_model: " ".into(), overflow_tokens: None });
+        assert!(normalise(&p).unwrap_err().contains("empty"));
+        let mut calls = policy("a", "Daily", None, None, 1);
+        calls.spec.budget = AIBudgetSpec { tokens: None, calls: Some(10), window: "Daily".into(), per: None };
+        calls.spec.on_exhausted = Some(AIOnExhaustedSpec { fallback_model: "m".into(), overflow_tokens: None });
+        assert!(normalise(&calls).unwrap_err().contains("token budget"));
+        let tiny = { let mut t = policy("a", "Daily", None, None, 5); t.spec.on_exhausted = Some(AIOnExhaustedSpec { fallback_model: "m".into(), overflow_tokens: None }); t };
+        assert_eq!(normalise(&tiny).unwrap().overflow_limit, 1, "never zero");
     }
 
     #[test]

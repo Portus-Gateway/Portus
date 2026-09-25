@@ -245,6 +245,22 @@ pub struct AIUsagePolicySpec {
     /// the ledger cannot be reached; `Closed` refuses them.
     #[serde(rename = "onLedgerUnavailable", default, skip_serializing_if = "Option::is_none")]
     pub on_ledger_unavailable: Option<String>,
+    /// What a spent token budget does instead of refusing.
+    #[serde(rename = "onExhausted", default, skip_serializing_if = "Option::is_none")]
+    pub on_exhausted: Option<AIOnExhaustedSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AIOnExhaustedSpec {
+    /// Send the request to this model instead of a 429 (served by the same
+    /// provider as the route). Token budgets only.
+    #[serde(rename = "fallbackModel")]
+    pub fallback_model: String,
+    /// Tokens per window the fallback may spend, per subject, on top of the
+    /// budget; default a tenth of `budget.tokens`. When this is spent too,
+    /// requests are refused.
+    #[serde(rename = "overflowTokens", default, skip_serializing_if = "Option::is_none")]
+    pub overflow_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

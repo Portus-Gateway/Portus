@@ -313,6 +313,11 @@ message AiBudget {
   // When the ledger cannot be reached and no allowance is held: let the
   // request through (true) or refuse it (false).
   bool fail_open = 5;
+  // onExhausted.fallbackModel: a spent token budget sends the request to
+  // this model instead of refusing it, spending from an overflow allowance
+  // of overflow_limit tokens per window (same subject, same window).
+  string fallback_model = 7;
+  uint64 overflow_limit = 8;
 }
 
 // Phase 7: Gateway API Core matching types

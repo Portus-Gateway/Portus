@@ -54,6 +54,28 @@ pub struct LedgerReporter {
     pub budgets: Arc<Budgets>,
     /// OAuth tokens verified on this pod, until they expire.
     pub tokens: Arc<super::jwt::TokenCache>,
+    addr: String,
+    node: String,
+}
+
+/// How often the data plane checks its config for budget policies to
+/// declare, and the longest it goes without redeclaring them.
+const DECLARE_CHECK: Duration = Duration::from_secs(5);
+const DECLARE_EVERY: Duration = Duration::from_secs(60);
+
+/// The policies as the ledger's Declare call takes them.
+pub fn declared(policies: &[super::budget::BudgetPolicy]) -> Vec<portus_types::proto::portus::ledger::v1::DeclaredPolicy> {
+    policies
+        .iter()
+        .map(|p| portus_types::proto::portus::ledger::v1::DeclaredPolicy {
+            policy: p.id.to_string(),
+            limit: p.route_limit,
+            unit: p.unit.as_str().to_string(),
+            window: p.window.as_str().to_string(),
+            per: p.per.as_str().to_string(),
+            fail_open: p.fail_open,
+        })
+        .collect()
 }
 
 impl LedgerReporter {
@@ -72,11 +94,63 @@ impl LedgerReporter {
             keys: Arc::new(ArcSwap::from_pointee(KeySet::default())),
             budgets: Budgets::start(addr.clone(), node.clone()),
             tokens: Arc::new(super::jwt::TokenCache::new(TOKEN_CACHE_CAPACITY)),
+            addr: addr.clone(),
+            node: node.clone(),
         });
         tokio::spawn(drain_loop(addr.clone(), node.clone(), Arc::clone(&reporter.ring), Arc::clone(&reporter.stats)));
         tokio::spawn(watch_keys_loop(addr, node, Arc::clone(&reporter.keys)));
         log::info!("usage records are reported to the ledger at {}", reporter_addr_for_log());
         reporter
+    }
+}
+
+impl LedgerReporter {
+    /// Tell the ledger which budget policies this pod's config holds: at
+    /// once, whenever the set changes, and every minute (the ledger drops a
+    /// policy nobody has declared for ten minutes).
+    pub fn declare_policies_from(self: &Arc<Self>, snapshot: crate::router::SnapshotSlot) {
+        let (addr, node) = (self.addr.clone(), self.node.clone());
+        tokio::spawn(async move {
+            use portus_types::proto::portus::ledger::v1::budget_client::BudgetClient;
+            use portus_types::proto::portus::ledger::v1::PolicyDeclaration;
+            let mut client: Option<BudgetClient<tonic::transport::Channel>> = None;
+            let mut sent: Option<(Vec<portus_types::proto::portus::ledger::v1::DeclaredPolicy>, tokio::time::Instant)> = None;
+            let mut tick = tokio::time::interval(DECLARE_CHECK);
+            loop {
+                tick.tick().await;
+                let policies = declared(&snapshot.load().budget_policies);
+                let due = match &sent {
+                    Some((last, at)) => *last != policies || at.elapsed() >= DECLARE_EVERY,
+                    None => true,
+                };
+                if !due || (policies.is_empty() && sent.is_none()) {
+                    continue;
+                }
+                if client.is_none() {
+                    match crate::config_receiver::grpc_client_endpoint(&addr) {
+                        Ok(endpoint) => match endpoint.connect().await {
+                            Ok(channel) => client = Some(BudgetClient::new(channel)),
+                            Err(e) => {
+                                log::warn!("ledger at {addr} unreachable for policy declaration: {e}");
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            log::error!("ledger endpoint {addr} is invalid: {e}; budget policies are not declared");
+                            return;
+                        }
+                    }
+                }
+                let Some(c) = client.as_mut() else { continue };
+                match c.declare(PolicyDeclaration { node: node.clone(), policies: policies.clone() }).await {
+                    Ok(_) => sent = Some((policies, tokio::time::Instant::now())),
+                    Err(e) => {
+                        log::warn!("declaring budget policies to the ledger failed: {e}");
+                        client = None;
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -237,6 +311,15 @@ mod tests {
     use super::*;
     use crate::ai::usage::{Dialect, Tokens};
     use arrayvec::ArrayString;
+
+    #[test]
+    fn declared_policies_carry_the_route_limit_not_a_key_override() {
+        use crate::ai::budget::{BudgetPolicy, Scope, Unit, Window};
+        let p = BudgetPolicy { id: Arc::from("llm/d"), limit: 1_000, route_limit: 1_000, unit: Unit::Calls, window: Window::Daily, per: Scope::Subject, fail_open: false, fallback: None };
+        let keyed = p.for_key(0, 5).unwrap();
+        let d = declared(&[keyed]);
+        assert_eq!((d[0].policy.as_str(), d[0].limit, d[0].unit.as_str(), d[0].window.as_str(), d[0].per.as_str(), d[0].fail_open), ("llm/d", 1_000, "CALLS", "DAILY", "SUBJECT", false));
+    }
 
     #[test]
     fn wire_records_carry_every_field_and_flag_missing_usage() {

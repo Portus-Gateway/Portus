@@ -4,6 +4,27 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.11] - 2026-09-25
+
+The first fleet's second list.
+
+### Fixed
+
+- **A key's budget override applied to every unit.** 0.2.9's `budget_limit` was one number read as tokens on token policies and as calls on call policies, so a token budget for an expert quietly lifted its MCP call cap. Keys now carry `token_limit` and `call_limit`, each applied only to policies of its unit. `budget_limit` is gone: a ledger that has one set logs the key's name at startup and stops applying it; set `token_limit` or `call_limit` instead.
+- `/v1/limits` listed a policy only after its first budgeted request. Data planes now declare the policies in their config (`Budget.Declare`) within seconds of a config change and every minute, so a cap is listed as soon as it is configured, and one no data plane holds for ten minutes drops out.
+- **Budgets let requests past a spent cap on pods that had been idle for that subject.** A pod decided from the global total it last heard, and refreshed it only after its own next spend; with traffic spread across pods (a few calls a minute, as agents make them) a pod could admit calls long after another pod had spent the budget. A counter not heard from within a sync interval now asks the ledger before deciding (bounded wait, 250 ms). Busy counters sync every second anyway and do not wait.
+- The chart's webhook refusal default in the ledger template was `none` while `values.yaml` listed three kinds, so an upgrade that did not see the new values sent no refusal events; both now default to `model_not_allowed, tool_not_allowed, budget_exhausted`.
+- Federated MCP requests copied the gateway's whole pool map each time; they borrow the snapshot now.
+
+### Added
+
+- **Budget and refusal events.** `aiGateway.ledger.webhook {url, secretName, thresholds, refusals}`: the ledger POSTs `budget.threshold` events when a subject crosses a threshold (default 80 % and 100 %, once per subject and window) and `refusal` events for the configured refusal kinds. At least once, from an outbox written in the same transaction as the row that caused the event; deduplicate on `id`; retried with backoff; signed with HMAC-SHA256 (`x-portus-signature`).
+- **Trusted keys by tenant or label.** `auth.onBehalfOf.trustedKeys` takes `tenant/*` and `label:key=value` next to names, so a key a hub issues later is trusted without a route change. `*` alone is refused.
+- **Key labels.** `labels` on `POST`/`PATCH /v1/keys` (replaced whole on PATCH), returned on keys, export rows (`key_labels`), by-key summary rows and events.
+- **Export cursor.** `/export.jsonl?after_id=` pages by row id, never repeating or skipping a row when timestamps tie; `x-portus-next-after-id` names the next cursor.
+- **Fallback model.** `AIUsagePolicy.onExhausted {fallbackModel, overflowTokens}` (token budgets): a spent budget sends the request to the fallback model instead of a 429, spending from a separate overflow allowance (default a tenth of the budget, `<policy>#overflow` in `/v1/limits`). Responses carry `x-portus-fallback-model`; rows record `rule: <policy>#fallback`.
+- Crate versions follow the chart (0.2.11).
+
 ## [0.2.10] - 2026-09-24
 
 ### Added

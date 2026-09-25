@@ -106,6 +106,19 @@ aiGateway:
     # name keys, tenants and subjects; leave this off unless nothing but
     # operators can reach the ledger's port.
     openReads: false
+    # Budget and refusal events POSTed to a webhook (JSON, one event per
+    # request, at least once: deduplicate on the event's "id"). Empty url: off.
+    webhook:
+      url: ""
+      # Secret (key secretKey) with the HMAC key; each request carries
+      # x-portus-signature: sha256=<hex HMAC-SHA256 of the body>.
+      secretName: ""
+      secretKey: secret
+      # Percent of a subject's limit; each fires once per subject and window.
+      thresholds: [80, 100]
+      # Refusal kinds that become events: unauthenticated, model_not_allowed,
+      # tool_not_allowed, budget_exhausted. [none] for no refusal events.
+      refusals: [model_not_allowed, tool_not_allowed, budget_exhausted]
     # Persistent volume for the SQLite ledger. Empty storageClassName uses
     # the cluster default.
     storage:

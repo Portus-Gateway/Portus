@@ -10,11 +10,15 @@ use serde::Serialize;
 
 use portus_types::proto::portus::ledger::v1::{KeySnapshot, UsageRecord};
 
-use crate::budget::{self, PolicyLimits, Shape, Synced};
-use crate::keys::{self, KeyRow};
+use crate::budget::{self, Declared, PolicyLimits, Shape, Synced};
+use crate::events::{self, EventConfig, Pending};
+use crate::keys::{self, KeyRow, Labels, NewKey};
 
 pub struct Store {
     conn: Connection,
+    /// Set when a webhook is configured: which crossings and refusals
+    /// become outbox events.
+    events: Option<EventConfig>,
 }
 
 /// How `/v1/summary` and `/v1/series` group rows.
@@ -95,6 +99,9 @@ pub struct Summary {
     pub first_byte_micros_total: u64,
     pub first_byte_samples: u64,
     pub last_seen_unix_micros: u64,
+    /// The key's labels, when grouped by key and the key has any.
+    #[serde(skip_serializing_if = "Labels::is_empty")]
+    pub key_labels: Labels,
 }
 
 /// One stored record, as exported.
@@ -134,6 +141,9 @@ pub struct Row {
     pub first_byte_micros: u64,
     /// The user a trusted caller acted for; empty otherwise.
     pub on_behalf_of: String,
+    /// The key's labels, when it has any.
+    #[serde(skip_serializing_if = "Labels::is_empty")]
+    pub key_labels: Labels,
 }
 
 const SCHEMA: &str = "
@@ -232,27 +242,87 @@ impl Store {
         if !has_expiry {
             conn.execute_batch("ALTER TABLE api_keys ADD COLUMN expires_unix_secs INTEGER")?;
         }
-        // Ledgers created before 0.2.9 lack key budgets and the policy table's spend limit.
-        let has_key_budget: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('api_keys') WHERE name = 'budget_limit'")?
-            .exists([])?;
-        if !has_key_budget {
-            conn.execute_batch("ALTER TABLE api_keys ADD COLUMN budget_limit INTEGER")?;
+        // Ledgers created before 0.2.11 lack the per-unit key budgets and labels.
+        let has_column = |table: &str, column: &str| -> rusqlite::Result<bool> {
+            conn.prepare(&format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"))?.exists(params![column])
+        };
+        if !has_column("api_keys", "token_limit")? {
+            conn.execute_batch("ALTER TABLE api_keys ADD COLUMN token_limit INTEGER; ALTER TABLE api_keys ADD COLUMN call_limit INTEGER")?;
+        }
+        if !has_column("api_keys", "labels")? {
+            conn.execute_batch("ALTER TABLE api_keys ADD COLUMN labels TEXT NOT NULL DEFAULT '{}'")?;
+        }
+        // 0.2.9's budget_limit applied one number to token and call policies
+        // alike; its unit cannot be recovered, so it is cleared and named.
+        if has_column("api_keys", "budget_limit")? {
+            let mut stmt = conn.prepare("SELECT id, tenant, name, budget_limit FROM api_keys WHERE budget_limit IS NOT NULL AND revoked_unix_micros IS NULL")?;
+            let old: Vec<(i64, String, String, i64)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            for (id, tenant, name, limit) in &old {
+                log::warn!("key {tenant}/{name} ({id}) had budget_limit {limit}; it is no longer applied: set token_limit or call_limit instead");
+            }
+            conn.execute_batch("UPDATE api_keys SET budget_limit = NULL")?;
         }
         conn.execute_batch(budget::SCHEMA)?;
-        let has_subject_limit: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('spend') WHERE name = 'subject_limit'")?
-            .exists([])?;
-        if !has_subject_limit {
+        if !has_column("spend", "subject_limit")? {
             conn.execute_batch("ALTER TABLE spend ADD COLUMN subject_limit INTEGER NOT NULL DEFAULT 0")?;
         }
-        Ok(Self { conn })
+        if !has_column("spend", "alerted")? {
+            conn.execute_batch("ALTER TABLE spend ADD COLUMN alerted INTEGER NOT NULL DEFAULT 0")?;
+        }
+        conn.execute_batch(events::SCHEMA)?;
+        Ok(Self { conn, events: None })
+    }
+
+    /// Write budget and refusal events to the outbox from now on.
+    pub fn with_events(mut self, config: EventConfig) -> Self {
+        self.events = Some(config);
+        self
     }
 
     /// Add a pod's spend delta and return the window's total; `None` for
     /// an unknown window.
+    /// With events on, a threshold the new total crossed is queued in the
+    /// same transaction, so the crossing and its event land together.
     pub fn sync_spend(&self, policy: &str, subject: &str, window: &str, delta: u64, now_micros: u64, shape: Option<&Shape>) -> rusqlite::Result<Option<Synced>> {
-        budget::sync(&self.conn, policy, subject, window, delta, now_micros, shape)
+        let thresholds = self.events.as_ref().map(|e| e.thresholds.as_slice()).unwrap_or(&[]);
+        let tx = self.conn.unchecked_transaction()?;
+        let synced = budget::sync_alerting(&tx, policy, subject, window, delta, now_micros, shape, thresholds)?;
+        if let Some(s) = synced.as_ref().filter(|s| !s.crossed.is_empty()) {
+            let who = events::subject_key(subject);
+            let key = match &who {
+                Some(w) => keys::list(&tx)?.into_iter().find(|k| k.id == w.key_id),
+                None => None,
+            };
+            let unit = shape.map(|s| s.unit.as_str()).unwrap_or("");
+            for c in &s.crossed {
+                let event = events::threshold_event(policy, subject, window, s.window_end_unix_micros, unit, c, key.as_ref().map(|k| (k, who.as_ref().and_then(|w| w.user.as_deref()))), now_micros);
+                events::enqueue(&tx, &event, now_micros)?;
+            }
+        }
+        tx.commit()?;
+        Ok(synced)
+    }
+
+    /// Policies a data plane holds, before any spend.
+    pub fn declare(&self, policies: &[Declared], now_micros: u64) -> rusqlite::Result<usize> {
+        budget::declare(&self.conn, policies, now_micros)
+    }
+
+    pub fn due_events(&self, now_micros: u64, limit: usize) -> rusqlite::Result<Vec<Pending>> {
+        events::due(&self.conn, now_micros, limit)
+    }
+
+    pub fn event_delivered(&self, id: i64) -> rusqlite::Result<()> {
+        events::delivered(&self.conn, id)
+    }
+
+    pub fn event_failed(&self, id: i64, attempts: u32, now_micros: u64) -> rusqlite::Result<bool> {
+        events::failed(&self.conn, id, attempts, now_micros)
+    }
+
+    pub fn events_pending(&self) -> rusqlite::Result<u64> {
+        events::pending(&self.conn)
     }
 
     /// Every synced policy with the current window's spend per subject.
@@ -281,9 +351,8 @@ impl Store {
         Ok(next)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn issue_key(&self, tenant: &str, name: &str, models: &[String], tools: &[String], plaintext: Option<&str>, expires_in_secs: Option<u64>, budget_limit: Option<u64>) -> rusqlite::Result<(KeyRow, String)> {
-        keys::issue(&self.conn, tenant, name, models, tools, plaintext, expires_in_secs, budget_limit)
+    pub fn issue_key(&self, new: &NewKey) -> rusqlite::Result<(KeyRow, String)> {
+        keys::issue(&self.conn, new)
     }
 
     pub fn update_key(&self, id: u64, patch: &keys::KeyPatch) -> rusqlite::Result<Option<KeyRow>> {
@@ -348,21 +417,38 @@ impl Store {
                     r.on_behalf_of,
                 ])?;
             }
+            // Refusals of the configured kinds become events in the same
+            // transaction as their rows.
+            if let Some(cfg) = self.events.as_ref().filter(|c| !c.refusals.is_empty()) {
+                let refused: Vec<&UsageRecord> = records.iter().filter(|r| !r.refusal.is_empty() && cfg.refusals.contains(&r.refusal)).collect();
+                if !refused.is_empty() {
+                    let labels = keys::labels_by_id(&tx)?;
+                    let now = refused.iter().map(|r| r.ts_unix_micros).max().unwrap_or(0);
+                    for r in refused {
+                        events::enqueue(&tx, &events::refusal_event(r, labels.get(&r.key_id)), now)?;
+                    }
+                }
+            }
         }
         tx.commit()?;
         Ok(records.len())
     }
 
-    /// Rows with `ts_unix_micros >= since`, oldest first, at most `limit`.
-    pub fn export(&self, since: u64, limit: usize) -> rusqlite::Result<Vec<Row>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT id, node, ts_unix_micros, duration_micros, status, dialect, stream, provider, route_host,
+    /// Rows oldest first, at most `limit`: with `after_id`, the rows stored
+    /// after that row id (a cursor that never repeats or skips a row);
+    /// otherwise rows with `ts_unix_micros >= since`.
+    pub fn export(&self, since: u64, after_id: Option<i64>, limit: usize) -> rusqlite::Result<Vec<Row>> {
+        const COLUMNS: &str = "SELECT id, node, ts_unix_micros, duration_micros, status, dialect, stream, provider, route_host,
              requested_model, served_model, has_usage, input_tokens, output_tokens, cache_read_tokens,
              cache_creation_tokens, request_bytes, response_bytes, key_id, request_id, refusal, tenant, subject,
-             rule, client_request_id, first_byte_micros, on_behalf_of
-             FROM usage WHERE ts_unix_micros >= ?1 ORDER BY ts_unix_micros, id LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![since as i64, limit as i64], |r| {
+             rule, client_request_id, first_byte_micros, on_behalf_of FROM usage";
+        let (sql, from) = match after_id {
+            Some(id) => (format!("{COLUMNS} WHERE id > ?1 ORDER BY id LIMIT ?2"), id),
+            None => (format!("{COLUMNS} WHERE ts_unix_micros >= ?1 ORDER BY ts_unix_micros, id LIMIT ?2"), since as i64),
+        };
+        let labels = keys::labels_by_id(&self.conn)?;
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(params![from, limit as i64], |r| {
             Ok(Row {
                 id: r.get(0)?,
                 node: r.get(1)?,
@@ -391,9 +477,16 @@ impl Store {
                 client_request_id: r.get(24)?,
                 first_byte_micros: r.get::<_, i64>(25)? as u64,
                 on_behalf_of: r.get(26)?,
+                key_labels: Labels::new(),
             })
         })?;
-        rows.collect()
+        let mut out = rows.collect::<rusqlite::Result<Vec<Row>>>()?;
+        for row in &mut out {
+            if let Some(l) = labels.get(&row.key_id) {
+                row.key_labels = l.clone();
+            }
+        }
+        Ok(out)
     }
 
     /// Totals since `since` (unix µs), grouped by `by`: what an operator
@@ -477,9 +570,19 @@ impl Store {
                 first_byte_micros_total: n(21)?,
                 first_byte_samples: n(22)?,
                 last_seen_unix_micros: n(23)?,
+                key_labels: Labels::new(),
             })
         })?;
-        rows.collect()
+        let mut out = rows.collect::<rusqlite::Result<Vec<Summary>>>()?;
+        if by_key {
+            let labels = keys::labels_by_id(&self.conn)?;
+            for s in &mut out {
+                if let Some(l) = labels.get(&s.key_id) {
+                    s.key_labels = l.clone();
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Rows stored, for `/metrics`.
@@ -526,7 +629,7 @@ mod tests {
     #[test]
     fn the_summary_groups_by_subject_model_tool_tenant_or_route_and_breaks_refusals_down() {
         let mut store = Store::in_memory().unwrap();
-        let (hub, _) = store.issue_key("team-a", "hub", &[], &[], None, None, None).unwrap();
+        let (hub, _) = store.issue_key(&keys::new_key("team-a", "hub")).unwrap();
         let mut rows = Vec::new();
         for (ts, user, model, tokens, refusal, rule, status) in [
             (10, "alice", "claude-opus-5", Some((100, 10)), "", "", 200),
@@ -604,7 +707,7 @@ mod tests {
         r.first_byte_micros = 321;
         r.on_behalf_of = "alice@example.com".into();
         store.insert_batch("pod", &[r]).unwrap();
-        let rows = store.export(0, 10).unwrap();
+        let rows = store.export(0, None, 10).unwrap();
         assert_eq!((rows[0].rule.as_str(), rows[0].client_request_id.as_str(), rows[0].first_byte_micros, rows[0].on_behalf_of.as_str()), ("llm/daily", "turn-12", 321, "alice@example.com"));
         let line = serde_json::to_string(&rows[0]).unwrap();
         assert!(line.contains("\"on_behalf_of\":\"alice@example.com\"") && line.contains("\"first_byte_micros\":321"), "{line}");
@@ -622,7 +725,7 @@ mod tests {
         b.tenant = "team-oauth".into();
         b.subject = "alice@example.com".into();
         store.insert_batch("pod", &[a, b]).unwrap();
-        let rows = store.export(0, 10).unwrap();
+        let rows = store.export(0, None, 10).unwrap();
         assert_eq!((rows[0].tenant.as_str(), rows[0].subject.as_str()), ("team-oauth", "alice@example.com"));
         let s = store.summary(0, GroupBy::Key).unwrap();
         let alice = s.iter().find(|k| k.key_id == 4242).unwrap();
@@ -637,14 +740,14 @@ mod tests {
         r.key_id = 77;
         r.refusal = "budget_exhausted".into();
         store.insert_batch("pod", &[r]).unwrap();
-        let rows = store.export(0, 10).unwrap();
+        let rows = store.export(0, None, 10).unwrap();
         assert_eq!((rows[0].status, rows[0].key_id, rows[0].refusal.as_str(), rows[0].has_usage), (429, 77, "budget_exhausted", false));
     }
 
     #[test]
     fn the_summary_totals_per_key_and_counts_refusals_separately() {
         let mut store = Store::in_memory().unwrap();
-        let (row, _) = store.issue_key("team-a", "ci", &[], &[], None, None, None).unwrap();
+        let (row, _) = store.issue_key(&keys::new_key("team-a", "ci")).unwrap();
         let mut ok1 = record(10, "claude-opus-5", Some((100, 20)));
         ok1.key_id = row.id;
         let mut ok2 = record(20, "claude-opus-5", Some((50, 5)));
@@ -691,11 +794,11 @@ mod tests {
             c.execute("INSERT INTO usage (node, ts_unix_micros, duration_micros, status, dialect, stream, provider, route_host, requested_model, served_model, has_usage, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, request_bytes, response_bytes, key_id, request_id) VALUES ('p',1,1,200,'anthropic',0,'a','h','m','m',1,1,1,0,0,0,0,0,1)", []).unwrap();
         }
         let store = Store::open(&path).unwrap();
-        let rows = store.export(0, 10).unwrap();
+        let rows = store.export(0, None, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].refusal, "", "pre-existing rows read as forwarded");
         assert_eq!((rows[0].rule.as_str(), rows[0].first_byte_micros, rows[0].on_behalf_of.as_str()), ("", 0, ""));
-        let (row, _) = store.issue_key("t", "k", &[], &[], None, Some(60), None).unwrap();
+        let (row, _) = store.issue_key(&keys::NewKey { expires_in_secs: Some(60), ..keys::new_key("t", "k") }).unwrap();
         assert!(row.expires_unix_secs.is_some(), "the key table gained its expiry column");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -707,15 +810,15 @@ mod tests {
         assert_eq!(store.insert_batch("pod-b", &[record(20, "claude-opus-5", Some((7, 1)))]).unwrap(), 1);
         assert_eq!(store.count().unwrap(), 3);
 
-        let all = store.export(0, 100).unwrap();
+        let all = store.export(0, None, 100).unwrap();
         assert_eq!(all.iter().map(|r| r.ts_unix_micros).collect::<Vec<_>>(), vec![10, 20, 30]);
         assert_eq!(all[0].node, "pod-a");
         assert!(!all[0].has_usage);
         assert_eq!((all[2].input_tokens, all[2].output_tokens, all[2].served_model.as_str()), (10, 4, "claude-opus-5"));
 
-        let since = store.export(20, 100).unwrap();
+        let since = store.export(20, None, 100).unwrap();
         assert_eq!(since.len(), 2);
-        assert_eq!(store.export(0, 1).unwrap().len(), 1);
+        assert_eq!(store.export(0, None, 1).unwrap().len(), 1);
         let line = serde_json::to_string(&all[2]).unwrap();
         assert!(line.contains("\"requested_model\":\"claude-opus-5\""), "{line}");
     }
@@ -734,6 +837,107 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.key_version().unwrap(), 3, "a restart continues the count");
         assert_eq!(store.bump_key_version().unwrap(), 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_after_id_cursor_pages_without_repeats_even_when_timestamps_tie() {
+        let mut store = Store::in_memory().unwrap();
+        // Five rows, three sharing one timestamp: a since_us page boundary repeats them.
+        let rows: Vec<UsageRecord> = [10, 20, 20, 20, 30].iter().map(|ts| record(*ts, "m", None)).collect();
+        store.insert_batch("pod", &rows).unwrap();
+        let mut seen = Vec::new();
+        let mut cursor = Some(0);
+        loop {
+            let page = store.export(0, cursor, 2).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().map(|r| r.id);
+            seen.extend(page.iter().map(|r| r.id));
+        }
+        let mut unique = seen.clone();
+        unique.dedup();
+        assert_eq!((seen.len(), unique.len()), (5, 5), "every row once: {seen:?}");
+        assert!(seen.windows(2).all(|w| w[0] < w[1]), "in id order");
+    }
+
+    #[test]
+    fn events_are_written_with_the_crossing_and_the_refusal_rows_that_caused_them() {
+        let mut store = Store::in_memory().unwrap().with_events(EventConfig::parse("80,100", "budget_exhausted,tool_not_allowed").unwrap());
+        let (key, _) = store.issue_key(&NewKey { labels: [("expert".to_string(), "ns".to_string())].into_iter().collect(), ..keys::new_key("team-a", "ns") }).unwrap();
+        let shape = Shape { limit: 100, unit: "CALLS".into(), per: "SUBJECT".into(), fail_open: false, subject_limit: 0 };
+        let subject = format!("{}:alice@example.com", key.id);
+        store.sync_spend("mcp/calls", &subject, "DAILY", 79, 1_000, Some(&shape)).unwrap();
+        assert_eq!(store.events_pending().unwrap(), 0);
+        store.sync_spend("mcp/calls", &subject, "DAILY", 30, 1_000, Some(&shape)).unwrap();
+        let due = store.due_events(1_000, 10).unwrap();
+        let kinds: Vec<serde_json::Value> = due.iter().map(|p| serde_json::from_str(&p.body).unwrap()).collect();
+        assert_eq!(kinds.iter().map(|e| e["threshold_pct"].as_u64().unwrap()).collect::<Vec<_>>(), vec![80, 100], "109 of 100 crosses both");
+        assert_eq!((kinds[0]["key_name"].as_str(), kinds[0]["user"].as_str(), kinds[0]["key_labels"]["expert"].as_str()), (Some("ns"), Some("alice@example.com"), Some("ns")));
+        for p in &due {
+            store.event_delivered(p.id).unwrap();
+        }
+        store.sync_spend("mcp/calls", &subject, "DAILY", 5, 1_000, Some(&shape)).unwrap();
+        assert_eq!(store.events_pending().unwrap(), 0, "each threshold once");
+        let mut refused = record(2_000, "tools/call", None);
+        refused.dialect = "mcp".into();
+        refused.served_model = "qompass.fleet_report".into();
+        refused.refusal = "tool_not_allowed".into();
+        refused.key_id = key.id;
+        let mut unauth = record(2_001, "tools/call", None);
+        unauth.refusal = "unauthenticated".into();
+        store.insert_batch("pod", &[refused, unauth, record(2_002, "m", Some((1, 1)))]).unwrap();
+        let due = store.due_events(3_000, 10).unwrap();
+        assert_eq!(due.len(), 1, "only configured refusal kinds");
+        let e: serde_json::Value = serde_json::from_str(&due[0].body).unwrap();
+        assert_eq!((e["type"].as_str(), e["tool"].as_str(), e["key_labels"]["expert"].as_str()), (Some("refusal"), Some("qompass.fleet_report"), Some("ns")));
+        // No webhook configured: no outbox writes.
+        let mut quiet = Store::in_memory().unwrap();
+        quiet.sync_spend("mcp/calls", "7", "DAILY", 500, 1_000, Some(&shape)).unwrap();
+        let mut r = record(1, "m", None);
+        r.refusal = "budget_exhausted".into();
+        quiet.insert_batch("pod", &[r]).unwrap();
+        assert_eq!(quiet.events_pending().unwrap(), 0);
+    }
+
+    #[test]
+    fn labels_ride_on_export_and_by_key_summary_rows() {
+        let mut store = Store::in_memory().unwrap();
+        let (key, _) = store.issue_key(&NewKey { labels: [("owner".to_string(), "alice".to_string())].into_iter().collect(), ..keys::new_key("t", "k") }).unwrap();
+        let mut r = record(5, "m", Some((1, 1)));
+        r.key_id = key.id;
+        store.insert_batch("pod", &[r, record(6, "m", None)]).unwrap();
+        let rows = store.export(0, None, 10).unwrap();
+        assert_eq!(rows[0].key_labels.get("owner").map(String::as_str), Some("alice"));
+        assert!(rows[1].key_labels.is_empty());
+        assert!(!serde_json::to_string(&rows[1]).unwrap().contains("key_labels"), "omitted when empty");
+        let s = store.summary(0, GroupBy::Key).unwrap();
+        assert_eq!(s.iter().find(|x| x.key_id == key.id).unwrap().key_labels.len(), 1);
+        assert!(store.summary(0, GroupBy::Tenant).unwrap()[0].key_labels.is_empty(), "no key, no labels");
+    }
+
+    #[test]
+    fn a_0_2_9_budget_limit_is_cleared_on_open() {
+        let dir = std::env::temp_dir().join(format!("portus-ledger-budget-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE api_keys (id INTEGER PRIMARY KEY, hash BLOB NOT NULL UNIQUE, tenant TEXT NOT NULL, name TEXT NOT NULL,
+                 allowed_models TEXT NOT NULL, allowed_tools TEXT NOT NULL DEFAULT '', external INTEGER NOT NULL, created_unix_micros INTEGER NOT NULL,
+                 revoked_unix_micros INTEGER, expires_unix_secs INTEGER, budget_limit INTEGER);
+                 INSERT INTO api_keys VALUES (7, x'00', 't', 'expert', '', '', 0, 1, NULL, NULL, 5000000);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let k = store.list_keys().unwrap().into_iter().find(|k| k.id == 7).unwrap();
+        assert_eq!((k.token_limit, k.call_limit), (None, None), "an ambiguous unit is not guessed");
+        assert!(k.labels.is_empty());
+        let still: Option<i64> = store.conn.query_row("SELECT budget_limit FROM api_keys WHERE id = 7", [], |r| r.get(0)).unwrap();
+        assert_eq!(still, None, "cleared, so the warning is logged once");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

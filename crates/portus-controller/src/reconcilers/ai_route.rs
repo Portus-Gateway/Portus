@@ -133,9 +133,33 @@ pub fn on_behalf_of_state(spec: &crate::ai_types::AIOnBehalfOfSpec) -> Result<AI
     }
     let trusted_keys: Vec<String> = spec.trusted_keys.iter().map(|k| k.trim()).filter(|k| !k.is_empty()).map(str::to_string).collect();
     if trusted_keys.is_empty() {
-        return Err("trustedKeys must name at least one key (name or tenant/name)".to_string());
+        return Err("trustedKeys must name at least one key (name, tenant/name, tenant/* or label:key=value)".to_string());
+    }
+    for k in &trusted_keys {
+        trusted_key_form(k)?;
     }
     Ok(AIOnBehalfOfState { header, trusted_keys })
+}
+
+/// One `trustedKeys` entry is `name`, `tenant/name`, `tenant/*` or
+/// `label:key=value`. A bare `*` or `*/…` would trust every key and is
+/// refused: an agent could then name any user.
+fn trusted_key_form(k: &str) -> Result<(), String> {
+    if let Some(label) = k.strip_prefix("label:") {
+        return match label.split_once('=') {
+            Some((key, _)) if !key.is_empty() => Ok(()),
+            _ => Err(format!("trustedKeys entry {k:?} must be label:key=value")),
+        };
+    }
+    let wildcard_all = k == "*" || k.starts_with("*/");
+    let bad = match k.split_once('/') {
+        Some((tenant, name)) => tenant.is_empty() || name.is_empty() || (name.contains('*') && name != "*") || name.contains('/'),
+        None => k.contains('*'),
+    };
+    if wildcard_all || bad {
+        return Err(format!("trustedKeys entry {k:?} must be name, tenant/name, tenant/* or label:key=value"));
+    }
+    Ok(())
 }
 
 /// A rule's `urlRewrite` as the HTTPRoute filter state the compiler consumes.
@@ -434,6 +458,18 @@ mod tests {
         r.spec.auth = Some(AIRouteAuth { jwt: None, on_behalf_of: Some(AIOnBehalfOfSpec { header: Some("bad header".into()), trusted_keys: vec!["hub".into()] }) });
         let (_, conditions) = reconcile_inner(&r, &store).unwrap();
         assert!(conditions[1].message.contains("header"), "{}", conditions[1].message);
+    }
+
+    #[test]
+    fn trusted_keys_take_tenant_wildcards_and_labels_but_never_everyone() {
+        for ok in ["hub", "team-a/hub", "team-a/*", "label:role=hub", "label:owner="] {
+            assert!(trusted_key_form(ok).is_ok(), "{ok}");
+        }
+        for bad in ["*", "*/*", "*/hub", "/hub", "team-a/", "team-a/h*", "h*", "label:role", "label:=x", "a/b/c"] {
+            assert!(trusted_key_form(bad).is_err(), "{bad}");
+        }
+        let spec = crate::ai_types::AIOnBehalfOfSpec { header: None, trusted_keys: vec!["team-a/*".into(), "*".into()] };
+        assert!(on_behalf_of_state(&spec).unwrap_err().contains("\"*\""), "one bad entry fails the lot");
     }
 
     #[test]

@@ -40,7 +40,7 @@ use super::body::scan_body;
 use super::client::{Upstream, UpstreamTarget};
 use super::usage::{observe, record_refusal, RequestSide};
 use portus_dataplane_core::ai::usage::RefusalKind;
-use portus_dataplane_core::ai::budget::{cost, exhausted_reply, now_micros, remaining_header, Scope, Verdict};
+use portus_dataplane_core::ai::budget::{cost, exhausted_reply, now_micros, remaining_header, rewrite_model, BudgetPolicy, Scope, Verdict, FALLBACK_HEADER};
 use portus_dataplane_core::ai::keys::{authorize, check_access, presented_key, Access, KeyInfo, Refusal};
 use portus_dataplane_core::ai::jwt::{challenge_header, looks_like_jwt};
 use portus_dataplane_core::readiness::unix_now;
@@ -277,8 +277,9 @@ impl ProxyService {
         // the caller proved itself with a JWT rather than a Portus key.
         let mut on_behalf_of: Option<String> = None;
         let mut via_jwt = false;
-        // A key's own budget replaces the route policy's limit for its counters.
-        let mut key_budget_limit = 0u64;
+        // A key's own budgets replace the route policy's limit for its
+        // counters: one for token policies, one for call policies.
+        let (mut key_token_limit, mut key_call_limit) = (0u64, 0u64);
         // One id per request: the ledger row carries it and the client gets
         // it back in x-portus-request-id; the client's own id, if it sent
         // one in the same header, is recorded next to it.
@@ -334,7 +335,7 @@ impl ProxyService {
                     key_id = info.id;
                     tenant = Some(Arc::clone(&info.tenant));
                     who_name = Some(Arc::clone(&info.name));
-                    key_budget_limit = info.budget_limit;
+                    (key_token_limit, key_call_limit) = (info.token_limit, info.call_limit);
                     if let Some(policy) = ai.on_behalf_of.as_ref() {
                         on_behalf_of = policy.user(&Headers(req.headers()), &info).map(str::to_string);
                     }
@@ -404,8 +405,11 @@ impl ProxyService {
         // counter syncs with the ledger in the background.
         let mut reservation = None;
         let mut remaining_after: Option<i64> = None;
+        // A spent token budget with onExhausted.fallbackModel: the model the
+        // request goes to instead, and the rule its row records.
+        let mut fallback: Option<(Arc<str>, String)> = None;
         if let (Some(ai), Some(route_budget)) = (plan.ai.as_ref(), plan.ai.as_ref().and_then(|ai| ai.budget.as_ref())) {
-            let key_budget = route_budget.for_key(key_budget_limit);
+            let key_budget = route_budget.for_key(key_token_limit, key_call_limit);
             let budget = key_budget.as_ref().unwrap_or(route_budget);
             let subject: Arc<str> = match budget.per {
                 Scope::Key if key_id != 0 => Arc::from(key_id.to_string()),
@@ -418,21 +422,9 @@ impl ProxyService {
             };
             let max_tokens = field("max_tokens").and_then(|v| v.parse::<u64>().ok());
             let cost = cost(budget.unit, max_tokens, request_bytes);
-            let verdict = match self.ledger.as_ref() {
-                Some(ledger) => {
-                    let mut v = ledger.budgets.check(budget, &subject, cost, now_micros());
-                    if v == Verdict::Unknown {
-                        // A subject this pod has not synced in this window:
-                        // give the ledger one bounded chance to answer before
-                        // the fail-open/closed knob decides.
-                        ledger.budgets.counter(budget, &subject).wait_for_sync(Duration::from_millis(250)).await;
-                        v = ledger.budgets.check(budget, &subject, cost, now_micros());
-                    }
-                    v
-                }
-                None => Verdict::Unknown,
-            };
-            let refuse = match verdict {
+            let verdict = self.budget_verdict(budget, &subject, cost).await;
+            let spent = matches!(verdict, Verdict::Exhausted { .. });
+            let mut refuse = match verdict {
                 Verdict::Allow(r) => {
                     remaining_after = Some(r.remaining());
                     reservation = Some(r);
@@ -442,6 +434,19 @@ impl ProxyService {
                 Verdict::Unknown if budget.fail_open => None,
                 Verdict::Unknown => Some((1, 0, cost)),
             };
+            // Spent, not unknown: a fallback model finishes the turn from the
+            // overflow allowance instead of a 429.
+            if spent
+                && ai.dialect != Dialect::Mcp
+                && let (Some(fb), Some(overflow)) = (budget.fallback.as_ref(), budget.overflow())
+                && model.is_some_and(|m| m != fb.model.as_ref())
+                && let Verdict::Allow(r) = self.budget_verdict(&overflow, &subject, cost).await
+            {
+                reservation = Some(r);
+                remaining_after = Some(0);
+                refuse = None;
+                fallback = Some((Arc::clone(&fb.model), format!("{}#fallback", budget.id)));
+            }
             if let Some((retry, remaining, needed)) = refuse {
                 let reply = exhausted_reply(ai.dialect, budget.unit, retry, remaining, needed, request_id)
                     .with_header(http::header::HeaderName::from_static(REQUEST_ID_HEADER), request_id_value(gateway_request_id));
@@ -457,15 +462,32 @@ impl ProxyService {
                 return reply_response(reply);
             }
         }
+        // The fallback model goes into the body; everything else is replayed as sent.
+        if let Some((model, _)) = &fallback {
+            let (mut parts, body) = req.into_parts();
+            let bytes = match body.limited(portus_dataplane_core::plan::AI_BODY_SCAN_LIMIT).collect().await {
+                Ok(c) => c.to_bytes(),
+                Err(_) => return status_response(StatusCode::PAYLOAD_TOO_LARGE),
+            };
+            let Some(rewritten) = rewrite_model(&bytes, model) else { return status_response(StatusCode::BAD_REQUEST) };
+            parts.headers.insert("content-length", HeaderValue::from(rewritten.len()));
+            parts.headers.remove("transfer-encoding");
+            req = Request::from_parts(parts, Body::new(Full::new(Bytes::from(rewritten))));
+        }
         // A federated MCP route fans out to its members instead of forwarding.
         let federation = plan.ai.as_ref().and_then(|ai| ai.federation.as_ref()).and_then(|id| {
-            let snap = self.snapshot.load();
-            snap.federations.get(id).cloned().map(|f| (f, Arc::new(snap.lbs.clone())))
+            let snap = self.snapshot.load_full();
+            snap.federations.get(id).cloned().map(|f| (f, snap))
         });
         let mut response = match federation {
-            Some((fed, lbs)) => self.federate(req, &plan, &fed, &lbs, body_fields.as_ref(), request_id).await,
+            Some((fed, snap)) => self.federate(req, &plan, &fed, &snap.lbs, body_fields.as_ref(), request_id).await,
             None => self.forward(req, &plan, peer_ip, authority).await,
         };
+        if let Some((model, _)) = &fallback
+            && let (Some(n), Ok(v)) = (rama_name_str(FALLBACK_HEADER), HeaderValue::from_str(model))
+        {
+            response.headers_mut().insert(n, v);
+        }
 
         let status = response.status().as_u16();
         if let (Some(remaining), Some(budget)) = (remaining_after, plan.ai.as_ref().and_then(|ai| ai.budget.as_ref()))
@@ -480,7 +502,7 @@ impl ProxyService {
             response.headers_mut().insert(n, v);
         }
         if let (Some(ai), Some(ledger)) = (plan.ai.as_ref(), self.ledger.as_ref()) {
-            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: acting.as_deref(), on_behalf_of: on_behalf_of.as_deref(), request_id: gateway_request_id, client_request_id: client_request_id.as_deref(), rule: None, reservation };
+            let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: acting.as_deref(), on_behalf_of: on_behalf_of.as_deref(), request_id: gateway_request_id, client_request_id: client_request_id.as_deref(), rule: fallback.as_ref().map(|(_, rule)| rule.as_str()), reservation };
             let body = std::mem::replace(response.body_mut(), Body::empty());
             // A provider that compressed anyway cannot be metered; say so once.
             let readable = response
@@ -738,6 +760,24 @@ impl ProxyService {
             apply_cors_response_headers(&mut sink, origin, cors, *has_credentials);
         }
         response
+    }
+
+    /// The budget's answer for one request, giving a subject this pod has
+    /// not synced in this window one bounded chance to hear from the ledger
+    /// before the fail-open/closed knob decides.
+    async fn budget_verdict(&self, budget: &BudgetPolicy, subject: &Arc<str>, cost: u64) -> Verdict {
+        let Some(ledger) = self.ledger.as_ref() else { return Verdict::Unknown };
+        // A view older than a sync interval is refreshed first: other pods
+        // may have spent this subject's budget since this pod last heard.
+        if let Some(counter) = ledger.budgets.refresh_if_stale(budget, subject, now_micros()) {
+            counter.wait_for_sync(Duration::from_millis(250)).await;
+        }
+        let v = ledger.budgets.check(budget, subject, cost, now_micros());
+        if v != Verdict::Unknown {
+            return v;
+        }
+        ledger.budgets.counter(budget, subject).wait_for_sync(Duration::from_millis(250)).await;
+        ledger.budgets.check(budget, subject, cost, now_micros())
     }
 
     pub(super) async fn attempt(&self, req: Request, deadline: Option<Duration>) -> Result<Response, AttemptError> {

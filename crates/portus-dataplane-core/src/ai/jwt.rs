@@ -214,7 +214,9 @@ pub fn verify(token: &str, policy: &JwtPolicy, jwks: &Jwks, now_unix_secs: u64) 
         allowed_models: Arc::from(Vec::new()),
         allowed_tools: Arc::from(tools),
         expires_unix_secs: exp,
-        budget_limit: 0,
+        token_limit: 0,
+        call_limit: 0,
+        labels: Arc::from(Vec::new()),
     };
     Some((info, exp))
 }

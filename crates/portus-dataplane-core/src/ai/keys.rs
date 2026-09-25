@@ -29,9 +29,13 @@ pub struct KeyInfo {
     /// drops expired keys from the snapshot; this covers the gap between
     /// snapshots.
     pub expires_unix_secs: u64,
-    /// The key's own budget per window, replacing the route policy's limit
-    /// for its counters; 0: the route's limit applies.
-    pub budget_limit: u64,
+    /// The key's own budgets per window, replacing a route policy's limit
+    /// for its counters: one for token policies, one for call policies.
+    /// 0: the policy's limit.
+    pub token_limit: u64,
+    pub call_limit: u64,
+    /// Labels, sorted by key, for trust rules (`label:owner=hub`).
+    pub labels: Arc<[(String, String)]>,
 }
 
 impl KeyInfo {
@@ -45,7 +49,8 @@ impl KeyInfo {
 pub struct OnBehalfOf {
     /// Lower-case header name.
     pub header: Arc<str>,
-    /// Keys believed, by `name` or `tenant/name`.
+    /// Keys believed: `name`, `tenant/name`, `tenant/*` (every key of the
+    /// tenant) or `label:key=value` (every key carrying that label).
     pub trusted_keys: Arc<[String]>,
 }
 
@@ -54,9 +59,16 @@ pub const ON_BEHALF_OF_HEADER: &str = "x-portus-on-behalf-of";
 
 impl OnBehalfOf {
     pub fn trusts(&self, info: &KeyInfo) -> bool {
-        self.trusted_keys.iter().any(|k| match k.split_once('/') {
-            Some((tenant, name)) => tenant == info.tenant.as_ref() && name == info.name.as_ref(),
-            None => k == info.name.as_ref(),
+        self.trusted_keys.iter().any(|k| {
+            if let Some(label) = k.strip_prefix("label:") {
+                let Some((key, value)) = label.split_once('=') else { return false };
+                return info.labels.iter().any(|(k, v)| k == key && v == value);
+            }
+            match k.split_once('/') {
+                Some((tenant, "*")) => !tenant.is_empty() && tenant == info.tenant.as_ref(),
+                Some((tenant, name)) => tenant == info.tenant.as_ref() && name == info.name.as_ref(),
+                None => k == info.name.as_ref(),
+            }
         })
     }
 
@@ -100,7 +112,13 @@ impl KeySet {
                     allowed_models: Arc::from(k.allowed_models.clone()),
                     allowed_tools: Arc::from(k.allowed_tools.clone()),
                     expires_unix_secs: k.expires_unix_secs,
-                    budget_limit: k.budget_limit,
+                    token_limit: k.token_limit,
+                    call_limit: k.call_limit,
+                    labels: {
+                        let mut l: Vec<(String, String)> = k.labels.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+                        l.sort();
+                        Arc::from(l)
+                    },
                 },
             );
         }
@@ -242,8 +260,8 @@ mod tests {
             version: 3,
             issuers: vec![],
             keys: vec![
-                KeyEntry { id: 1, hash_sha256: hash_key("portus_sk_any").to_vec(), tenant: "team-a".into(), name: "ci".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0, budget_limit: 0 },
-                KeyEntry { id: 5, hash_sha256: hash_key("portus_sk_old").to_vec(), tenant: "team-a".into(), name: "rotated".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 1_000, budget_limit: 0 },
+                KeyEntry { id: 1, hash_sha256: hash_key("portus_sk_any").to_vec(), tenant: "team-a".into(), name: "ci".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0, token_limit: 0, call_limit: 0, labels: Default::default() },
+                KeyEntry { id: 5, hash_sha256: hash_key("portus_sk_old").to_vec(), tenant: "team-a".into(), name: "rotated".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 1_000, token_limit: 0, call_limit: 0, labels: Default::default() },
                 KeyEntry {
                     id: 2,
                     hash_sha256: hash_key("portus_sk_haiku").to_vec(),
@@ -252,9 +270,11 @@ mod tests {
                     allowed_models: vec!["claude-haiku-4-5".into()],
                     allowed_tools: vec![],
                     expires_unix_secs: 0,
-                    budget_limit: 0,
+                    token_limit: 0,
+                    call_limit: 0,
+                    labels: [("role".to_string(), "hub".to_string())].into_iter().collect(),
                 },
-                KeyEntry { id: 3, hash_sha256: vec![1, 2, 3], tenant: "bad".into(), name: "short-hash".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0, budget_limit: 0 },
+                KeyEntry { id: 3, hash_sha256: vec![1, 2, 3], tenant: "bad".into(), name: "short-hash".into(), allowed_models: vec![], allowed_tools: vec![], expires_unix_secs: 0, token_limit: 0, call_limit: 0, labels: Default::default() },
                 KeyEntry {
                     id: 4,
                     hash_sha256: hash_key("portus_sk_tools").to_vec(),
@@ -263,7 +283,9 @@ mod tests {
                     allowed_models: vec![],
                     allowed_tools: vec!["echo".into(), "github.*".into()],
                     expires_unix_secs: 0,
-                    budget_limit: 0,
+                    token_limit: 0,
+                    call_limit: 0,
+                    labels: Default::default(),
                 },
             ],
         }
@@ -327,6 +349,24 @@ mod tests {
         assert_eq!(policy.user(&headers(&[("x-portus-on-behalf-of", &"a".repeat(65))]), hub), None, "too long");
         let same_name_other_tenant = KeyInfo { tenant: Arc::from("team-z"), ..hub.clone() };
         assert!(!policy.trusts(&same_name_other_tenant), "team-a/ci does not trust team-z/ci");
+    }
+
+    #[test]
+    fn whole_tenants_and_labels_can_be_trusted_without_listing_each_key() {
+        let set = KeySet::from_snapshot(&snapshot());
+        let by = |entries: &[&str]| OnBehalfOf { header: Arc::from(ON_BEHALF_OF_HEADER), trusted_keys: Arc::from(entries.iter().map(|s| s.to_string()).collect::<Vec<_>>()) };
+        let hub = set.lookup("portus_sk_any").unwrap(); // team-a/ci
+        let bot = set.lookup("portus_sk_haiku").unwrap(); // team-b/bot, labelled role=hub
+        assert!(by(&["team-a/*"]).trusts(hub));
+        assert!(!by(&["team-a/*"]).trusts(bot), "another tenant");
+        assert!(!by(&["/*"]).trusts(&KeyInfo { tenant: Arc::from(""), ..hub.clone() }), "an empty tenant is not a wildcard for tenant-less keys");
+        assert!(by(&["label:role=hub"]).trusts(bot));
+        assert!(!by(&["label:role=hub"]).trusts(hub), "no such label");
+        assert!(!by(&["label:role=agent"]).trusts(bot), "the value must match");
+        assert!(!by(&["label:role"]).trusts(bot), "a label rule needs a value");
+        // A new key under a trusted tenant is trusted with no route change.
+        let fresh = KeyInfo { id: 99, name: Arc::from("haiku-agent-built-live"), ..hub.clone() };
+        assert!(by(&["team-a/*"]).trusts(&fresh));
     }
 
     #[test]

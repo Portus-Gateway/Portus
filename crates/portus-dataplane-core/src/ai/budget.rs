@@ -137,7 +137,7 @@ pub struct BudgetPolicy {
     /// namespace/name of the AIUsagePolicy.
     pub id: Arc<str>,
     /// Units per window the subject is held to: the route's, or a key's own
-    /// `budget_limit` (see [`BudgetPolicy::for_key`]).
+    /// limit for this unit (see [`BudgetPolicy::for_key`]).
     pub limit: u64,
     /// The route policy's limit, before any key override.
     pub route_limit: u64,
@@ -146,15 +146,53 @@ pub struct BudgetPolicy {
     pub per: Scope,
     /// With no sync yet and the ledger unreachable: allow or refuse.
     pub fail_open: bool,
+    /// `onExhausted.fallbackModel` on a token budget.
+    pub fallback: Option<Fallback>,
+}
+
+/// What a spent token budget does instead of refusing: send the request to
+/// a cheaper model, spending from a separate allowance so the cap stays a
+/// cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fallback {
+    pub model: Arc<str>,
+    /// Tokens per window the fallback may spend, per subject.
+    pub overflow_limit: u64,
+}
+
+/// Suffix of the counter a fallback spends from.
+pub const OVERFLOW_SUFFIX: &str = "#overflow";
+
+/// Response header naming the model a spent budget fell back to.
+pub const FALLBACK_HEADER: &str = "x-portus-fallback-model";
+
+/// The request body with its top-level `model` replaced; `None` when the
+/// body is not a JSON object.
+pub fn rewrite_model(body: &[u8], model: &str) -> Option<Vec<u8>> {
+    let mut v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    v.as_object_mut()?.insert("model".to_string(), serde_json::Value::String(model.to_string()));
+    serde_json::to_vec(&v).ok()
 }
 
 impl BudgetPolicy {
-    /// The policy as it applies to a key with its own `budget_limit`: the
-    /// key's limit replaces the route's for `per: Key` and `per: Subject`
-    /// counters (a tenant or route counter is shared, so a key cannot resize
-    /// it). `0`: no override.
-    pub fn for_key(&self, key_budget_limit: u64) -> Option<Self> {
-        (key_budget_limit > 0 && matches!(self.per, Scope::Key | Scope::Subject)).then(|| Self { limit: key_budget_limit, ..self.clone() })
+    /// The policy as it applies to a key with its own limits: the key's
+    /// limit for this policy's unit (tokens or calls) replaces the route's on
+    /// `per: Key` and `per: Subject` counters (a tenant or route counter is
+    /// shared, so a key cannot resize it). `0`: no override.
+    pub fn for_key(&self, token_limit: u64, call_limit: u64) -> Option<Self> {
+        let limit = match self.unit {
+            Unit::Tokens => token_limit,
+            Unit::Calls => call_limit,
+        };
+        (limit > 0 && matches!(self.per, Scope::Key | Scope::Subject)).then(|| Self { limit, ..self.clone() })
+    }
+
+    /// The counter a fallback spends from: same unit, window and subject,
+    /// the overflow allowance as its limit, and no fallback of its own.
+    pub fn overflow(&self) -> Option<Self> {
+        let f = self.fallback.as_ref()?;
+        let id: Arc<str> = Arc::from(format!("{}{OVERFLOW_SUFFIX}", self.id));
+        Some(Self { id, limit: f.overflow_limit, route_limit: f.overflow_limit, fallback: None, ..self.clone() })
     }
 }
 
@@ -183,6 +221,8 @@ pub struct Counter {
     budget: AtomicU64,
     /// The route policy's limit, told to the ledger for /v1/limits.
     route_limit: AtomicU64,
+    /// When the global total was last heard, unix µs; 0 before the first sync.
+    synced_at: AtomicU64,
     unit: Unit,
     per: Scope,
     fail_open: bool,
@@ -201,6 +241,7 @@ impl Counter {
             settled: Notify::new(),
             budget: AtomicU64::new(policy.limit),
             route_limit: AtomicU64::new(policy.route_limit),
+            synced_at: AtomicU64::new(0),
             unit: policy.unit,
             per: policy.per,
             fail_open: policy.fail_open,
@@ -227,6 +268,7 @@ impl Counter {
     }
 
     fn apply_sync(&self, spent_total: u64, window_end: u64, reported: u64) {
+        self.synced_at.store(now_micros(), Ordering::Relaxed);
         let previous = self.window_end.swap(window_end, Ordering::Relaxed);
         if previous == window_end {
             // The delta we shipped is now inside the global total.
@@ -376,6 +418,25 @@ impl Budgets {
         c.budget.store(policy.limit, Ordering::Relaxed);
         c.route_limit.store(policy.route_limit, Ordering::Relaxed);
         c
+    }
+
+    /// A counter whose global total is older than [`SYNC_INTERVAL`] asks the
+    /// ledger again before the next decision and returns itself so the caller
+    /// can wait (bounded) for the answer. A busy counter syncs every interval
+    /// anyway; this catches the pod that has not spent for this subject
+    /// lately while other pods have, whose view would otherwise stay stale
+    /// until its own next spend and let requests past a spent budget.
+    pub fn refresh_if_stale(&self, policy: &BudgetPolicy, subject: &Arc<str>, now_micros: u64) -> Option<Arc<Counter>> {
+        let counter = self.counter(policy, subject);
+        if !counter.synced.load(Ordering::Relaxed) {
+            return None; // the cold path asks and waits already
+        }
+        let age = now_micros.saturating_sub(counter.synced_at.load(Ordering::Relaxed));
+        if age < SYNC_INTERVAL.as_micros() as u64 {
+            return None;
+        }
+        self.ask(&policy.id, subject, &counter);
+        Some(counter)
     }
 
     /// Decide for one request that will cost about `estimate` tokens.
@@ -548,24 +609,80 @@ mod tests {
     const NOW: u64 = 1_789_673_548_000_000; // 2026-09-17T19:32:28Z
 
     fn policy(tokens: u64) -> BudgetPolicy {
-        BudgetPolicy { id: Arc::from("llm/hourly"), limit: tokens, route_limit: tokens, unit: Unit::Tokens, window: Window::Hourly, per: Scope::Key, fail_open: true }
+        BudgetPolicy { id: Arc::from("llm/hourly"), limit: tokens, route_limit: tokens, unit: Unit::Tokens, window: Window::Hourly, per: Scope::Key, fail_open: true, fallback: None }
     }
 
     fn calls(limit: u64) -> BudgetPolicy {
-        BudgetPolicy { id: Arc::from("mcp/hourly"), limit, route_limit: limit, unit: Unit::Calls, window: Window::Hourly, per: Scope::Key, fail_open: true }
+        BudgetPolicy { id: Arc::from("mcp/hourly"), limit, route_limit: limit, unit: Unit::Calls, window: Window::Hourly, per: Scope::Key, fail_open: true, fallback: None }
+    }
+
+    #[test]
+    fn a_counter_not_heard_from_for_a_sync_interval_asks_before_deciding() {
+        let (budgets, mut asks) = Budgets::detached();
+        let p = calls(2);
+        let subject: Arc<str> = Arc::from("k1");
+        assert!(budgets.refresh_if_stale(&p, &subject, now_micros()).is_none(), "cold: the Unknown path asks");
+        let c = budgets.counter(&p, &subject);
+        c.apply_sync(0, Window::Hourly.end_of(now_micros()), 0);
+        assert!(budgets.refresh_if_stale(&p, &subject, now_micros()).is_none(), "just synced");
+        let later = now_micros() + SYNC_INTERVAL.as_micros() as u64 + 1;
+        let stale = budgets.refresh_if_stale(&p, &subject, later).expect("stale view refreshes");
+        assert!(Arc::ptr_eq(&stale, &c));
+        assert!(asks.try_recv().is_ok(), "a sync was asked for");
+        assert!(budgets.refresh_if_stale(&p, &subject, later).is_some() && asks.try_recv().is_err(), "one sync in flight at a time");
+        // What the refresh fixes: another pod spent both calls meanwhile.
+        c.syncing.store(false, Ordering::Relaxed);
+        c.apply_sync(2, Window::Hourly.end_of(now_micros()), 0);
+        assert!(matches!(budgets.check(&p, &subject, 1, now_micros()), Verdict::Exhausted { .. }));
+    }
+
+    #[test]
+    fn a_key_override_applies_only_to_policies_of_its_unit() {
+        // The 0.2.9 bug: one number was read as tokens and calls alike, so a
+        // token budget quietly lifted a call cap.
+        let tokens = policy(1_000);
+        let mcp = calls(10);
+        assert_eq!(tokens.for_key(5_000_000, 0).map(|p| p.limit), Some(5_000_000));
+        assert!(mcp.for_key(5_000_000, 0).is_none(), "a token limit leaves the call cap alone");
+        assert_eq!(mcp.for_key(5_000_000, 50).map(|p| p.limit), Some(50));
+        assert!(tokens.for_key(0, 50).is_none(), "a call limit leaves the token budget alone");
+    }
+
+    #[test]
+    fn a_fallback_rewrites_only_the_model() {
+        let body = br#"{"model":"claude-opus-5","max_tokens":64,"messages":[{"role":"user","content":"model: keep me"}]}"#;
+        let out: serde_json::Value = serde_json::from_slice(&rewrite_model(body, "claude-haiku-4-5").unwrap()).unwrap();
+        assert_eq!(out["model"], "claude-haiku-4-5");
+        assert_eq!((out["max_tokens"].as_u64(), out["messages"][0]["content"].as_str()), (Some(64), Some("model: keep me")));
+        assert!(rewrite_model(b"[1]", "m").is_none() && rewrite_model(b"{", "m").is_none());
+    }
+
+    #[test]
+    fn the_overflow_counter_is_its_own_policy_with_the_allowance_as_limit() {
+        let p = BudgetPolicy { fallback: Some(Fallback { model: Arc::from("claude-haiku-4-5"), overflow_limit: 100 }), ..policy(1_000) };
+        let o = p.overflow().expect("a fallback has an overflow");
+        assert_eq!((o.id.as_ref(), o.limit, o.route_limit, o.unit, o.fallback.is_none()), ("llm/hourly#overflow", 100, 100, Unit::Tokens, true));
+        assert!(policy(1_000).overflow().is_none());
+        // The overflow counter is separate: the main one being spent does not touch it.
+        let (budgets, _asks) = Budgets::detached();
+        let subject: Arc<str> = Arc::from("k1");
+        budgets.counter(&p, &subject).apply_sync(1_000, Window::Hourly.end_of(NOW), 0);
+        budgets.counter(&o, &subject).apply_sync(0, Window::Hourly.end_of(NOW), 0);
+        assert!(matches!(budgets.check(&p, &subject, 10, NOW), Verdict::Exhausted { .. }));
+        assert!(matches!(budgets.check(&o, &subject, 10, NOW), Verdict::Allow(_)));
     }
 
     #[test]
     fn a_key_budget_replaces_the_route_limit_for_its_own_counters_only() {
         let route = policy(1_000);
-        let mine = route.for_key(5_000).expect("per Key takes the override");
+        let mine = route.for_key(5_000, 0).expect("per Key takes the override");
         assert_eq!((mine.limit, mine.route_limit, mine.id.as_ref()), (5_000, 1_000, "llm/hourly"));
-        assert!(route.for_key(0).is_none(), "0 is no override");
+        assert!(route.for_key(0, 0).is_none(), "0 is no override");
         let per_user = BudgetPolicy { per: Scope::Subject, ..policy(1_000) };
-        assert_eq!(per_user.for_key(20).map(|p| p.limit), Some(20));
+        assert_eq!(per_user.for_key(20, 0).map(|p| p.limit), Some(20));
         let shared = BudgetPolicy { per: Scope::Tenant, ..policy(1_000) };
-        assert!(shared.for_key(5_000).is_none(), "a shared tenant counter is not resized by one key");
-        assert!(BudgetPolicy { per: Scope::Route, ..policy(1_000) }.for_key(5_000).is_none());
+        assert!(shared.for_key(5_000, 0).is_none(), "a shared tenant counter is not resized by one key");
+        assert!(BudgetPolicy { per: Scope::Route, ..policy(1_000) }.for_key(5_000, 0).is_none());
         // The counter follows the effective policy and remembers the route's.
         let (budgets, _asks) = Budgets::detached();
         let subject: Arc<str> = Arc::from("k1");

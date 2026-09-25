@@ -78,6 +78,9 @@ pub fn run(boot: Bootstrap) -> ! {
 
         // Usage records for AI routes go to the ledger when one is configured.
         let ledger = portus_dataplane_core::ai::ledger::LedgerReporter::from_env();
+        if let Some(l) = ledger.as_ref() {
+            l.declare_policies_from(snapshot.clone());
+        }
         let proxy = Arc::new(ProxyService::new(snapshot, metrics, outliers, client::Upstream::new(plain.clone()), ledger));
 
         let http = http_server(exec.clone()).service(proxy.clone());

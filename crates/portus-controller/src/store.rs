@@ -610,9 +610,13 @@ pub struct AIUsagePolicyState {
     pub unit: String,
     /// HOURLY | DAILY | MONTHLY
     pub window: String,
-    /// KEY | TENANT | ROUTE
+    /// KEY | SUBJECT | TENANT | ROUTE
     pub per: String,
     pub fail_open: bool,
+    /// `onExhausted.fallbackModel`; empty: refuse.
+    pub fallback_model: String,
+    /// The fallback's overflow allowance per window.
+    pub overflow_limit: u64,
     pub generation: i64,
     pub creation_timestamp: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
     pub accepted: bool,

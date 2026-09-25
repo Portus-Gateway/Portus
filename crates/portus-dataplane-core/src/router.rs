@@ -844,6 +844,9 @@ pub struct ProxySnapshot {
     /// MCP federations by namespace/name; routes point at them by
     /// `AiBackend::federation`.
     pub federations: HashMap<Arc<str>, Arc<crate::ai::federation::Federation>>,
+    /// Every budget policy in the config (with fallback overflow counters),
+    /// declared to the ledger so `/v1/limits` lists them before first use.
+    pub budget_policies: Vec<crate::ai::budget::BudgetPolicy>,
 }
 
 impl Default for ProxySnapshot {
@@ -853,6 +856,7 @@ impl Default for ProxySnapshot {
             any_port_listeners: Vec::new(),
             lbs: HashMap::new(),
             federations: HashMap::new(),
+            budget_policies: Vec::new(),
             circuit_breakers: HashMap::new(),
             connection_limiters: HashMap::new(),
             per_ip_limiters: Vec::new(),

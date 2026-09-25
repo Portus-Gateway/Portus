@@ -92,6 +92,23 @@ spec:
             - name: LEDGER_OPEN_READS
               value: "true"
             {{- end }}
+            {{- with .Values.aiGateway.ledger.webhook }}
+            {{- if .url }}
+            - name: LEDGER_WEBHOOK_URL
+              value: {{ .url | quote }}
+            - name: LEDGER_WEBHOOK_THRESHOLDS
+              value: {{ join "," (.thresholds | default (list 80 100)) | quote }}
+            - name: LEDGER_WEBHOOK_REFUSALS
+              value: {{ join "," (.refusals | default (list "model_not_allowed" "tool_not_allowed" "budget_exhausted")) | quote }}
+            {{- if .secretName }}
+            - name: LEDGER_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .secretKey | default "secret" }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.aiGateway.jwt }}
             {{- with .issuers }}
             - name: LEDGER_JWT_ISSUERS

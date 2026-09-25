@@ -887,6 +887,8 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
                     window: p.window.clone(),
                     per: p.per.clone(),
                     fail_open: p.fail_open,
+                    fallback_model: p.fallback_model.clone(),
+                    overflow_limit: p.overflow_limit,
                 },
             )
         })
@@ -2480,6 +2482,8 @@ mod tests {
                 window: "DAILY".into(),
                 per: "KEY".into(),
                 fail_open: false,
+                fallback_model: "claude-haiku-4-5".into(),
+                overflow_limit: 100_000,
                 generation: 1,
                 creation_timestamp: None,
                 accepted: true,
@@ -2583,6 +2587,7 @@ mod tests {
         assert_eq!(route.request_timeout_ms, 600_000, "TimeoutPolicy targeting the AIRoute applies");
         assert_eq!(route.rate_limit.as_ref().map(|r| (r.requests_per_second, r.per_client)), Some((5, true)), "RateLimitPolicy targeting the AIRoute applies, the HTTPRoute one does not");
         let budget = route.ai_budget.as_ref().expect("budget attached");
+        assert_eq!((budget.fallback_model.as_str(), budget.overflow_limit), ("claude-haiku-4-5", 100_000), "the fallback reaches the route");
         assert_eq!((budget.policy.as_str(), budget.limit, budget.unit.as_str(), budget.window.as_str(), budget.per.as_str(), budget.fail_open), ("default/cap", 1_000_000, "TOKENS", "DAILY", "KEY", false));
         assert_eq!(route.host, "llm.example.com");
         assert_eq!(route.service_name, "aiprovider/default/anthropic");

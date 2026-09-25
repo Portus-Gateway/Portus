@@ -9,6 +9,8 @@
 //!   `/metrics` open; `/export.jsonl?since_us=<µs>&limit=<n>`,
 //!   `/v1/summary?hours=&by=key|subject|model|tool|tenant|route`,
 //!   `/v1/series?hours=&bucket_secs=&by=`, `/v1/limits` and the key API `/v1/keys`
+//!   (`/export.jsonl?after_id=<row id>` pages by row id; the response names
+//!   the next cursor in `x-portus-next-after-id`)
 //!   (GET, POST, PATCH `/v1/keys/{id}`, DELETE) behind bearer
 //!   `LEDGER_ADMIN_TOKEN` (the admin API is disabled when it is unset).
 //! - `LEDGER_OPEN_READS=true`: serve `/export.jsonl` and `/v1/summary`
@@ -19,6 +21,7 @@
 //!   client certificates (the data planes present the config-stream cert).
 
 mod budget;
+mod events;
 mod jwks;
 mod keys;
 mod store;
@@ -36,13 +39,15 @@ use axum::{Json, Router};
 use portus_types::proto::portus::ledger::v1::budget_server::{Budget, BudgetServer};
 use portus_types::proto::portus::ledger::v1::key_distribution_server::{KeyDistribution, KeyDistributionServer};
 use portus_types::proto::portus::ledger::v1::ledger_ingest_server::{LedgerIngest, LedgerIngestServer};
-use portus_types::proto::portus::ledger::v1::{KeySnapshot, KeyWatchRequest, ReportAck, SyncRequest, SyncResponse, UsageBatch};
+use portus_types::proto::portus::ledger::v1::{
+    DeclareAck, KeySnapshot, KeyWatchRequest, PolicyDeclaration, ReportAck, SyncRequest, SyncResponse, UsageBatch,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Status};
 
-use keys::{KeyPatch, KeyRow};
+use keys::{KeyPatch, KeyRow, NewKey};
 use store::{GroupBy, Store};
 
 #[derive(Default)]
@@ -52,6 +57,9 @@ struct Stats {
     write_errors: AtomicU64,
     syncs: AtomicU64,
     synced_tokens: AtomicU64,
+    events_delivered: AtomicU64,
+    events_failed: AtomicU64,
+    events_dropped: AtomicU64,
     /// Sum of the data planes' own drop counters, as last reported per node.
     dataplane_dropped: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
@@ -61,11 +69,16 @@ type Done<T> = oneshot::Sender<rusqlite::Result<T>>;
 /// Every storage operation queues to the one SQLite thread.
 enum Op {
     Write { node: String, records: Vec<portus_types::proto::portus::ledger::v1::UsageRecord>, done: Done<usize> },
-    Export { since: u64, limit: usize, done: Done<Vec<store::Row>> },
+    Export { since: u64, after_id: Option<i64>, limit: usize, done: Done<Vec<store::Row>> },
     Summary { since: u64, by: GroupBy, done: Done<Vec<store::Summary>> },
     Series { since: u64, bucket_micros: u64, by: GroupBy, done: Done<Vec<store::Summary>> },
     Count(Done<u64>),
-    IssueKey { tenant: String, name: String, models: Vec<String>, tools: Vec<String>, plaintext: Option<String>, expires_in_secs: Option<u64>, budget_limit: Option<u64>, done: Done<(KeyRow, String)> },
+    IssueKey { new: NewKey, done: Done<(KeyRow, String)> },
+    Declare { policies: Vec<budget::Declared>, now_micros: u64, done: Done<usize> },
+    DueEvents { now_micros: u64, limit: usize, done: Done<Vec<events::Pending>> },
+    EventDelivered { id: i64, done: Done<()> },
+    EventFailed { id: i64, attempts: u32, now_micros: u64, done: Done<bool> },
+    EventsPending(Done<u64>),
     Limits { now_micros: u64, done: Done<Vec<budget::PolicyLimits>> },
     UpdateKey { id: u64, patch: KeyPatch, done: Done<Option<KeyRow>> },
     RevokeKey { id: u64, done: Done<bool> },
@@ -84,8 +97,8 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
             Op::Write { node, records, done } => {
                 let _ = done.send(store.insert_batch(&node, &records));
             }
-            Op::Export { since, limit, done } => {
-                let _ = done.send(store.export(since, limit));
+            Op::Export { since, after_id, limit, done } => {
+                let _ = done.send(store.export(since, after_id, limit));
             }
             Op::Summary { since, by, done } => {
                 let _ = done.send(store.summary(since, by));
@@ -96,8 +109,23 @@ fn storage_thread(mut store: Store, mut ops: mpsc::Receiver<Op>) {
             Op::Count(done) => {
                 let _ = done.send(store.count());
             }
-            Op::IssueKey { tenant, name, models, tools, plaintext, expires_in_secs, budget_limit, done } => {
-                let _ = done.send(store.issue_key(&tenant, &name, &models, &tools, plaintext.as_deref(), expires_in_secs, budget_limit));
+            Op::IssueKey { new, done } => {
+                let _ = done.send(store.issue_key(&new));
+            }
+            Op::Declare { policies, now_micros, done } => {
+                let _ = done.send(store.declare(&policies, now_micros));
+            }
+            Op::DueEvents { now_micros, limit, done } => {
+                let _ = done.send(store.due_events(now_micros, limit));
+            }
+            Op::EventDelivered { id, done } => {
+                let _ = done.send(store.event_delivered(id));
+            }
+            Op::EventFailed { id, attempts, now_micros, done } => {
+                let _ = done.send(store.event_failed(id, attempts, now_micros));
+            }
+            Op::EventsPending(done) => {
+                let _ = done.send(store.events_pending());
             }
             Op::Limits { now_micros, done } => {
                 let _ = done.send(store.limits(now_micros));
@@ -221,6 +249,27 @@ impl Budget for Spend {
             }
         }
     }
+
+    async fn declare(&self, request: Request<PolicyDeclaration>) -> Result<tonic::Response<DeclareAck>, Status> {
+        let req = request.into_inner();
+        let policies: Vec<budget::Declared> = req
+            .policies
+            .into_iter()
+            .filter(|p| !p.policy.is_empty())
+            .map(|p| budget::Declared {
+                policy: p.policy,
+                window: p.window,
+                shape: budget::Shape { limit: p.limit, unit: p.unit, per: p.per, fail_open: p.fail_open, subject_limit: 0 },
+            })
+            .collect();
+        match self.0.run(|done| Op::Declare { policies, now_micros: now_micros(), done }).await {
+            Ok(n) => Ok(tonic::Response::new(DeclareAck { accepted: n as u64 })),
+            Err(e) => {
+                log::error!("policy declaration from {} failed: {e}", req.node);
+                Err(Status::internal("declare failed"))
+            }
+        }
+    }
 }
 
 fn now_micros() -> u64 {
@@ -248,29 +297,9 @@ impl KeyDistribution for Keys {
 struct ExportParams {
     #[serde(default)]
     since_us: u64,
+    /// Row-id cursor: the rows stored after this one, in id order.
+    after_id: Option<i64>,
     limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct IssueKeyRequest {
-    #[serde(default)]
-    tenant: String,
-    name: String,
-    #[serde(default)]
-    allowed_models: Vec<String>,
-    /// MCP tools the key may call (`tools/call` names, exact or `prefix.*`).
-    #[serde(default)]
-    allowed_tools: Vec<String>,
-    /// An externally issued key to accept as-is; omitted to generate one.
-    #[serde(default)]
-    key: Option<String>,
-    /// Seconds until the key expires; omitted or 0: never.
-    #[serde(default)]
-    expires_in_secs: Option<u64>,
-    /// The key's own budget per window (the route policy's unit); omitted or
-    /// 0: the policy's limit.
-    #[serde(default)]
-    budget_limit: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -319,7 +348,11 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> Response {
          # TYPE ledger_api_keys_live gauge\nledger_api_keys_live {}\n\
          # TYPE ledger_key_snapshot_version gauge\nledger_key_snapshot_version {}\n\
          # TYPE ledger_budget_syncs_total counter\nledger_budget_syncs_total {}\n\
-         # TYPE ledger_budget_tokens_total counter\nledger_budget_tokens_total {}\n",
+         # TYPE ledger_budget_tokens_total counter\nledger_budget_tokens_total {}\n\
+         # TYPE ledger_events_pending gauge\nledger_events_pending {}\n\
+         # TYPE ledger_events_delivered_total counter\nledger_events_delivered_total {}\n\
+         # TYPE ledger_events_failed_total counter\nledger_events_failed_total {}\n\
+         # TYPE ledger_events_dropped_total counter\nledger_events_dropped_total {}\n",
         shared.stats.batches.load(Ordering::Relaxed),
         shared.stats.records.load(Ordering::Relaxed),
         shared.stats.write_errors.load(Ordering::Relaxed),
@@ -329,6 +362,10 @@ async fn metrics(State(shared): State<Arc<Shared>>) -> Response {
         shared.key_version.load(Ordering::Relaxed),
         shared.stats.syncs.load(Ordering::Relaxed),
         shared.stats.synced_tokens.load(Ordering::Relaxed),
+        shared.run(Op::EventsPending).await.unwrap_or(0),
+        shared.stats.events_delivered.load(Ordering::Relaxed),
+        shared.stats.events_failed.load(Ordering::Relaxed),
+        shared.stats.events_dropped.load(Ordering::Relaxed),
     );
     ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response()
 }
@@ -344,8 +381,12 @@ async fn export(State(shared): State<Arc<Shared>>, headers: HeaderMap, Query(p):
         return *r;
     }
     let limit = p.limit.unwrap_or(10_000).clamp(1, 100_000);
-    match shared.run(|done| Op::Export { since: p.since_us, limit, done }).await {
+    let after_id = p.after_id.map(|a| a.max(0));
+    match shared.run(|done| Op::Export { since: p.since_us, after_id, limit, done }).await {
         Ok(rows) => {
+            // The cursor for the next page: the last row's id, or the one
+            // asked for when there were no newer rows.
+            let next = rows.last().map(|r| r.id).or(after_id).unwrap_or(0);
             let mut out = String::new();
             for row in rows {
                 if let Ok(line) = serde_json::to_string(&row) {
@@ -353,7 +394,11 @@ async fn export(State(shared): State<Arc<Shared>>, headers: HeaderMap, Query(p):
                     out.push('\n');
                 }
             }
-            ([(axum::http::header::CONTENT_TYPE, "application/x-ndjson")], out).into_response()
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/x-ndjson".to_string()), (axum::http::HeaderName::from_static("x-portus-next-after-id"), next.to_string())],
+                out,
+            )
+                .into_response()
         }
         Err(e) => storage_error(e),
     }
@@ -411,8 +456,8 @@ async fn limits(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respon
     };
     let overrides: Vec<KeyBudget> = keys
         .into_iter()
-        .filter(|k| k.revoked_unix_micros.is_none())
-        .filter_map(|k| k.budget_limit.map(|budget_limit| KeyBudget { key_id: k.id, tenant: k.tenant, name: k.name, budget_limit }))
+        .filter(|k| k.revoked_unix_micros.is_none() && (k.token_limit.is_some() || k.call_limit.is_some()))
+        .map(|k| KeyBudget { key_id: k.id, tenant: k.tenant, name: k.name, token_limit: k.token_limit, call_limit: k.call_limit, labels: k.labels })
         .collect();
     Json(Limits { now_unix_micros: now, policies, key_budgets: overrides }).into_response()
 }
@@ -430,7 +475,10 @@ struct KeyBudget {
     key_id: u64,
     tenant: String,
     name: String,
-    budget_limit: u64,
+    token_limit: Option<u64>,
+    call_limit: Option<u64>,
+    #[serde(skip_serializing_if = "keys::Labels::is_empty")]
+    labels: keys::Labels,
 }
 
 #[derive(Deserialize, Default)]
@@ -440,28 +488,23 @@ struct SummaryParams {
     bucket_secs: Option<u64>,
 }
 
-async fn issue_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Json(req): Json<IssueKeyRequest>) -> Response {
+async fn issue_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Json(mut new): Json<NewKey>) -> Response {
     if let Err(r) = admin_ok(&shared, &headers) {
         return *r;
     }
-    if req.name.trim().is_empty() {
+    new.tenant = new.tenant.trim().to_string();
+    new.name = new.name.trim().to_string();
+    new.plaintext = new.plaintext.as_deref().map(str::trim).map(str::to_string);
+    if new.name.is_empty() {
         return (StatusCode::BAD_REQUEST, "name is required").into_response();
     }
-    if req.key.as_deref().is_some_and(|k| k.trim().len() < 16) {
+    if new.plaintext.as_deref().is_some_and(|k| k.len() < 16) {
         return (StatusCode::BAD_REQUEST, "an imported key must be at least 16 characters").into_response();
     }
-    let issued = shared
-        .run(|done| Op::IssueKey {
-            tenant: req.tenant.trim().to_string(),
-            name: req.name.trim().to_string(),
-            models: req.allowed_models.clone(),
-            tools: req.allowed_tools.clone(),
-            plaintext: req.key.as_deref().map(str::trim).map(str::to_string),
-            expires_in_secs: req.expires_in_secs,
-            budget_limit: req.budget_limit,
-            done,
-        })
-        .await;
+    if let Err(e) = keys::validate_labels(&new.labels) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
+    }
+    let issued = shared.run(|done| Op::IssueKey { new, done }).await;
     match issued {
         Ok((row, key)) => {
             if let Err(e) = shared.publish_keys().await {
@@ -493,6 +536,9 @@ async fn update_key(State(shared): State<Arc<Shared>>, headers: HeaderMap, Path(
     }
     if patch.name.as_deref().is_some_and(|n| n.trim().is_empty()) {
         return (StatusCode::BAD_REQUEST, "name cannot be empty").into_response();
+    }
+    if let Some(Err(e)) = patch.labels.as_ref().map(keys::validate_labels) {
+        return (StatusCode::BAD_REQUEST, e).into_response();
     }
     match shared.run(|done| Op::UpdateKey { id, patch, done }).await {
         Ok(Some(row)) => match shared.publish_keys().await {
@@ -532,6 +578,66 @@ fn router(shared: Arc<Shared>) -> Router {
         .with_state(shared)
 }
 
+/// Deliver outbox events in id order: POST each one, delete it on a 2xx,
+/// back off on anything else, drop it after `events::MAX_ATTEMPTS`.
+async fn deliver_events(shared: Arc<Shared>, url: String, secret: Option<String>) {
+    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("webhook client: {e}; no events will be delivered");
+            return;
+        }
+    };
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        let due = match shared.run(|done| Op::DueEvents { now_micros: now_micros(), limit: 100, done }).await {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("reading the event outbox: {e}");
+                continue;
+            }
+        };
+        for event in due {
+            let mut req = client
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("x-portus-event-id", event.id.to_string())
+                .body(event.body.clone());
+            if let Some(s) = &secret {
+                req = req.header("x-portus-signature", events::signature(s, &event.body));
+            }
+            let outcome = match req.send().await {
+                Ok(resp) if resp.status().is_success() => Ok(()),
+                Ok(resp) => Err(format!("answered {}", resp.status())),
+                Err(e) => Err(e.to_string()),
+            };
+            let (id, attempts) = (event.id, event.attempts);
+            match outcome {
+                Ok(()) => {
+                    shared.stats.events_delivered.fetch_add(1, Ordering::Relaxed);
+                    if let Err(e) = shared.run(|done| Op::EventDelivered { id, done }).await {
+                        log::warn!("event {id} delivered but not cleared: {e}; it will be sent again");
+                    }
+                }
+                Err(why) => {
+                    shared.stats.events_failed.fetch_add(1, Ordering::Relaxed);
+                    match shared.run(|done| Op::EventFailed { id, attempts, now_micros: now_micros(), done }).await {
+                        Ok(true) => {
+                            shared.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+                            log::error!("event {id} dropped after {} attempts to {url}: {why}", events::MAX_ATTEMPTS);
+                        }
+                        Ok(false) => log::warn!("event {id} to {url} failed (attempt {}): {why}", attempts + 1),
+                        Err(e) => log::warn!("event {id}: {e}"),
+                    }
+                    // The receiver is down: stop this round, keep the order.
+                    break;
+                }
+            }
+        }
+    }
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| default.to_string())
 }
@@ -567,7 +673,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(dir) = db_path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let store = Store::open(&db_path)?;
+    // Budget and refusal events for a webhook, when one is configured.
+    let webhook_url = std::env::var("LEDGER_WEBHOOK_URL").ok().map(|u| u.trim().to_string()).filter(|u| !u.is_empty());
+    let webhook_secret = std::env::var("LEDGER_WEBHOOK_SECRET").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut store = Store::open(&db_path)?;
+    if let Some(url) = &webhook_url {
+        let config = events::EventConfig::parse(
+            &env_or("LEDGER_WEBHOOK_THRESHOLDS", "80,100"),
+            &env_or("LEDGER_WEBHOOK_REFUSALS", "model_not_allowed,tool_not_allowed,budget_exhausted"),
+        )?;
+        log::info!("budget events to {url}: thresholds {:?}%, refusals {:?}{}", config.thresholds, config.refusals, if webhook_secret.is_some() { ", signed" } else { ", UNSIGNED (set LEDGER_WEBHOOK_SECRET)" });
+        store = store.with_events(config);
+    }
     let initial = store.key_snapshot(store.key_version()?)?;
     log::info!("ledger store at {} ({} live API keys, key snapshot v{})", db_path.display(), initial.keys.len(), initial.version);
 
@@ -626,6 +743,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    if let Some(url) = webhook_url {
+        tokio::spawn(deliver_events(Arc::clone(&shared), url, webhook_secret));
+    }
     // Closed budget windows are dead weight; sweep them hourly.
     let sweeper = Arc::clone(&shared);
     tokio::spawn(async move {
@@ -683,6 +803,29 @@ mod tests {
             jwks: std::sync::Mutex::new(Vec::new()),
         });
         (router(Arc::clone(&shared)), shared)
+    }
+
+    #[tokio::test]
+    async fn export_pages_by_row_id_and_names_the_next_cursor() {
+        let (app, shared) = app().await;
+        let rows: Vec<portus_types::proto::portus::ledger::v1::UsageRecord> =
+            (0..3).map(|i| portus_types::proto::portus::ledger::v1::UsageRecord { ts_unix_micros: 5, dialect: "anthropic".into(), request_id: i, ..Default::default() }).collect();
+        shared.run(|done| Op::Write { node: "pod".into(), records: rows, done }).await.unwrap();
+        let page = |after: i64| {
+            let app = app.clone();
+            async move {
+                let req = HttpRequest::builder().uri(format!("/export.jsonl?after_id={after}&limit=2")).header("authorization", "Bearer secret-admin").body(Body::empty()).unwrap();
+                let resp = app.oneshot(req).await.unwrap();
+                let next: i64 = resp.headers().get("x-portus-next-after-id").unwrap().to_str().unwrap().parse().unwrap();
+                let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                (String::from_utf8_lossy(&body).lines().count(), next)
+            }
+        };
+        let (n1, c1) = page(0).await;
+        let (n2, c2) = page(c1).await;
+        let (n3, c3) = page(c2).await;
+        assert_eq!((n1, n2, n3), (2, 1, 0), "three rows with one timestamp, each once");
+        assert_eq!(c3, c2, "an empty page keeps the cursor");
     }
 
     #[tokio::test]
@@ -795,7 +938,7 @@ mod tests {
     #[tokio::test]
     async fn limits_list_synced_policies_and_key_budgets() {
         let (app, shared) = app().await;
-        let (status, body) = call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"tenant":"team-a","name":"big","budget_limit":200000000}"#)).await;
+        let (status, body) = call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"tenant":"team-a","name":"big","token_limit":200000000,"call_limit":50,"labels":{"expert":"ns"}}"#)).await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
         let id = serde_json::from_str::<serde_json::Value>(&body).unwrap()["id"].as_u64().unwrap();
         let (status, body) = call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"tenant":"team-a","name":"plain"}"#)).await;
@@ -812,8 +955,20 @@ mod tests {
         let s = &v["policies"][0]["subjects"][0];
         assert_eq!((s["subject"].as_str(), s["limit"].as_u64(), s["spent"].as_u64(), s["remaining"].as_i64()), (Some(id.to_string().as_str()), Some(200_000_000), Some(1_500), Some(199_998_500)));
         assert_eq!(v["key_budgets"].as_array().unwrap().len(), 1, "only keys with their own budget: {body}");
-        assert_eq!((v["key_budgets"][0]["name"].as_str(), v["key_budgets"][0]["budget_limit"].as_u64()), (Some("big"), Some(200_000_000)));
-        // The snapshot carries the budget to the data planes.
-        assert_eq!(shared.keys.borrow().keys.iter().find(|k| k.id == id).unwrap().budget_limit, 200_000_000);
+        assert_eq!((v["key_budgets"][0]["name"].as_str(), v["key_budgets"][0]["token_limit"].as_u64(), v["key_budgets"][0]["call_limit"].as_u64()), (Some("big"), Some(200_000_000), Some(50)));
+        assert_eq!(v["key_budgets"][0]["labels"]["expert"], "ns");
+        // The snapshot carries both limits and the labels to the data planes.
+        let entry = shared.keys.borrow().keys.iter().find(|k| k.id == id).unwrap().clone();
+        assert_eq!((entry.token_limit, entry.call_limit, entry.labels.get("expert").map(String::as_str)), (200_000_000, 50, Some("ns")));
+        // A declared policy shows before any spend.
+        let ack = spend.declare(Request::new(PolicyDeclaration { node: "pod".into(), policies: vec![portus_types::proto::portus::ledger::v1::DeclaredPolicy { policy: "mcp/calls".into(), limit: 100, unit: "CALLS".into(), window: "DAILY".into(), per: "SUBJECT".into(), fail_open: false }] })).await.unwrap().into_inner();
+        assert_eq!(ack.accepted, 1);
+        let (_, body) = call(&app, "GET", "/v1/limits", Some("Bearer secret-admin"), None).await;
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let calls = v["policies"].as_array().unwrap().iter().find(|p| p["policy"] == "mcp/calls").expect("declared policy listed").clone();
+        assert_eq!((calls["limit"].as_u64(), calls["subjects"].as_array().map(Vec::len)), (Some(100), Some(0)));
+        // Bad labels are refused on POST and PATCH.
+        assert_eq!(call(&app, "POST", "/v1/keys", Some("Bearer secret-admin"), Some(r#"{"name":"x","labels":{"bad key":"v"}}"#)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(call(&app, "PATCH", &format!("/v1/keys/{id}"), Some("Bearer secret-admin"), Some(r#"{"labels":{"":"v"}}"#)).await.0, StatusCode::BAD_REQUEST);
     }
 }

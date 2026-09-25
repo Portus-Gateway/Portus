@@ -11,7 +11,7 @@ the request path.
 ## Install
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.10 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.11 \
   --namespace portus --create-namespace --set aiGateway.enabled=true
 ```
 
@@ -88,8 +88,10 @@ key (see [OAuth clients](#oauth-clients)).
 orchestrator): it names the user it acts for in a header, the gateway records that user as
 the row's `subject` (the key stays on the row as the one that vouched, and `on_behalf_of`
 repeats the name), an `AIUsagePolicy` with `budget.per: Subject` limits each user
-separately, and the header never reaches the provider. Only keys listed in `trustedKeys`
-(`name` or `tenant/name`) are believed; from any other key the header is dropped, so an
+separately, and the header never reaches the provider. Only keys matching `trustedKeys`
+are believed: `name`, `tenant/name`, `tenant/*` (every key of the tenant, including keys a
+hub issues later) or `label:key=value` (every key with that label; see
+[Keys](#keys)). A bare `*` is refused. From any other key the header is dropped, so an
 agent cannot claim to be someone else.
 
 ```yaml
@@ -130,11 +132,21 @@ route; the oldest wins a conflict).
 | `budget.window` | `Hourly`, `Daily`, `Monthly` | Fixed windows in UTC |
 | `budget.per` | `Key` (default), `Subject`, `Tenant`, `Route` | Whose counter the request spends from. `Subject`: the user behind the call, the `auth.onBehalfOf` name under its key, else the key or OAuth subject itself |
 
-A key with its own `budget_limit` (see [Keys](#keys)) is held to that instead of
-`budget.tokens`/`budget.calls` on `per: Key` and `per: Subject` counters (each user under
-the key gets the key's limit); tenant and route counters are shared and a key cannot resize
-them. `GET /v1/limits` on the ledger shows the effective figures.
 | `onLedgerUnavailable` | `Open` (default), `Closed` | Before the first sync of a window with the ledger unreachable |
+| `onExhausted.fallbackModel` | model name | Token budgets only: a spent budget sends the request to this model (same provider) instead of a 429 |
+| `onExhausted.overflowTokens` | integer ≥ 1, default a tenth of `budget.tokens` | What the fallback may spend per subject and window; when it is spent too, requests are refused |
+
+A key with its own `token_limit` or `call_limit` (see [Keys](#keys)) is held to that on
+policies of that unit instead of `budget.tokens` / `budget.calls`, on `per: Key` and
+`per: Subject` counters (each user under the key gets the key's limit). A token limit
+never touches a call budget and the other way round. Tenant and route counters are shared
+and a key cannot resize them. `GET /v1/limits` on the ledger shows the effective figures.
+
+With `onExhausted`, the request whose budget is spent is rewritten to the fallback model
+and forwarded; its response carries `x-portus-fallback-model`, its row keeps the model the
+client asked for in `requested_model` and records `rule: <policy>#fallback`. The overflow
+spends from its own counter (`<policy>#overflow` in `/v1/limits`), so the cap is still a
+cap: budget plus overflow.
 
 Exactly one of `tokens` and `calls` is set. The gateway forwards `Accept-Encoding: identity`
 to providers on AI routes so it can read usage from the response; clients may still request
@@ -142,7 +154,9 @@ compression, it just does not reach the provider. Each data plane keeps a counte
 reserves an estimate before forwarding (`max_tokens` plus a quarter of the request
 bytes, or one call), settles to the provider's reported usage when the response ends and
 syncs the delta with the ledger about once a second, so overrun is bounded by one sync
-interval. Every budgeted response carries `x-portus-tokens-remaining` or
+interval. A pod whose view of a subject is older than that asks the ledger before deciding
+(one in-cluster round trip, at most 250 ms), so slow traffic spread across pods sees the
+true total. A fallback's overflow can run over by what one request's estimate missed. Every budgeted response carries `x-portus-tokens-remaining` or
 `x-portus-calls-remaining`.
 
 ## Keys
@@ -155,14 +169,14 @@ tenants and subjects. `aiGateway.ledger.openReads: true` serves `/export.jsonl` 
 
 | Call | Body / result |
 |---|---|
-| `POST /v1/keys` | `{"tenant","name","allowed_models":[…],"allowed_tools":[…],"key","expires_in_secs","budget_limit"}`; `key` imports an external key (≥ 16 characters), omitted generates `portus_sk_` + 40 hex; `expires_in_secs` sets an expiry (omitted: never); `budget_limit` gives the key its own budget per window in the route policy's unit, replacing the policy's limit for this key (omitted or 0: the policy's). The plaintext is returned once |
-| `PATCH /v1/keys/{id}` | Change `tenant`, `name`, `allowed_models`, `allowed_tools`, `expires_in_secs` (0 clears) or `budget_limit` (0 clears) in place; the plaintext keeps working and the data planes get the change within a second, so a policy change needs no new key and no restart. Rotation grace: issue the new key, give the old one `expires_in_secs` |
+| `POST /v1/keys` | `{"tenant","name","allowed_models":[…],"allowed_tools":[…],"key","expires_in_secs","token_limit","call_limit","labels":{…}}`; `key` imports an external key (≥ 16 characters), omitted generates `portus_sk_` + 40 hex; `expires_in_secs` sets an expiry (omitted: never); `token_limit` and `call_limit` give the key its own budget per window on token and call policies, replacing the policy's limit for this key (omitted or 0: the policy's); `labels` (up to 32, keys of letters, digits, `-_./`) are returned on the key, its usage rows and events, and match `label:key=value` in `trustedKeys`. The plaintext is returned once |
+| `PATCH /v1/keys/{id}` | Change `tenant`, `name`, `allowed_models`, `allowed_tools`, `expires_in_secs`, `token_limit`, `call_limit` (0 clears each) or `labels` (replaces the map; `{}` clears) in place; the plaintext keeps working and the data planes get the change within a second, so a policy change needs no new key and no restart. Rotation grace: issue the new key, give the old one `expires_in_secs` |
 | `GET /v1/keys` | Every key, revoked ones included, without plaintext or hash; `expires_unix_secs` when set. Expired keys are revoked by the ledger within a minute and refused by the data planes at the second |
 | `DELETE /v1/keys/{id}` | Revoke; data planes drop the key within a second |
 | `GET /v1/summary?hours=N&by=` | Totals per group: `by=key` (default: a key's tenant and name, or an OAuth token's tenant claim and `sub`), `subject` (the user behind each key), `model` (per key and model; MCP: method), `tool` (per key, method and tool), `tenant`, `route` (host and provider). Each row: requests, refusals broken down by reason (`refused_unauthenticated`, `refused_model_not_allowed`, `refused_tool_not_allowed`, `refused_budget_exhausted`), `upstream_errors` (5xx from the provider), tokens, `duration_micros_total` and `first_byte_micros_total`/`first_byte_samples` for averages, `last_seen_unix_micros` |
 | `GET /v1/series?hours=N&bucket_secs=S&by=` | The same rows per time bucket (`bucket_start_unix_micros`; default 3600 s, 60 s to 7 d, epoch-aligned) for charts and spike detection |
-| `GET /v1/limits` | The effective limits: every AIUsagePolicy the data planes have synced (`limit`, `unit`, `window`, `per`, `fail_open`, `window_end_unix_micros`) with the current window's `spent`, `limit` and `remaining` per subject (a key override shows as that subject's limit), plus `key_budgets`, the live keys with a `budget_limit`. A policy appears after its first budgeted request; a subject after its first sync in the window. Reads the ledger, not Kubernetes |
-| `GET /export.jsonl?since_us=&limit=` | One JSON row per request: status, dialect, provider, model or method, tool, tokens, bytes, key id, tenant, subject, `on_behalf_of`, refusal and `rule` (the AIUsagePolicy that refused, or `key`/`jwt` for an allow list), `request_id`, `client_request_id`, `duration_micros`, `first_byte_micros` |
+| `GET /v1/limits` | The effective limits: every AIUsagePolicy the data planes hold (`limit`, `unit`, `window`, `per`, `fail_open`, `window_end_unix_micros`), listed from the moment it is configured (data planes declare their policies within seconds of a config change and every minute; one no data plane holds for ten minutes drops out), with the current window's `spent`, `limit` and `remaining` per subject (a key override shows as that subject's limit), plus `key_budgets`: the live keys with a `token_limit` or `call_limit`, and their labels |
+| `GET /export.jsonl?after_id=&limit=` (or `?since_us=`) | Page with `after_id`: the rows stored after that row id, in id order, never repeated or skipped; `x-portus-next-after-id` on the response is the cursor for the next page (start at `0`). One JSON row per request: status, dialect, provider, model or method, tool, tokens, bytes, key id, tenant, subject, `on_behalf_of`, refusal and `rule` (the AIUsagePolicy that refused, or `key`/`jwt` for an allow list), `request_id`, `client_request_id`, `duration_micros`, `first_byte_micros`, and `key_labels` when the key has labels |
 | `GET /metrics` | Prometheus; no token |
 
 `allowed_models` applies to LLM requests (empty: any model). `allowed_tools` applies to
@@ -220,6 +234,24 @@ the session down. Every refusal is recorded in the ledger with its reason
 rule behind it (`rule`: the AIUsagePolicy's `namespace/name`, or `key`/`jwt` for an
 allow list); `/v1/summary` counts them per reason. Refusals carry `x-portus-request-id`
 too.
+
+## Events
+
+With `aiGateway.ledger.webhook.url` set, the ledger POSTs one JSON event per request to it:
+
+| `type` | When | Fields |
+|---|---|---|
+| `budget.threshold` | A subject's spend crosses a threshold (`webhook.thresholds`, default `[80, 100]` percent of its limit); each fires once per subject and window, whichever pod's sync crossed it | `policy`, `subject`, `window`, `window_end_unix_micros`, `unit`, `threshold_pct`, `spent`, `limit`, and for key subjects `key_id`, `tenant`, `key_name`, `key_labels`, `user` (the on-behalf-of user under `per: Subject`) |
+| `refusal` | The gateway refused a request of a kind in `webhook.refusals` (default `model_not_allowed`, `tool_not_allowed`, `budget_exhausted`) | `refusal`, `rule`, `status`, `key_id`, `tenant`, `subject`, `on_behalf_of`, `route_host`, `provider`, `model` or `method` and `tool`, `request_id`, `client_request_id`, `key_labels` |
+
+Every event carries `id` and `ts_unix_micros`; `x-portus-event-id` repeats the id. Delivery
+is at least once: events are written to an outbox in the same transaction as the spend or
+usage row that caused them and deleted only after a 2xx, so a ledger restart can resend one
+but never loses one. Deduplicate on `id`. A failed delivery is retried with backoff (2 s
+doubling to 5 min) in order; after 20 attempts the event is dropped and logged. With
+`webhook.secretName` set, `x-portus-signature: sha256=<hex>` is the HMAC-SHA256 of the
+exact body with that Secret's key. `/metrics` has `ledger_events_pending` and delivered,
+failed and dropped counters.
 
 ## MCP
 

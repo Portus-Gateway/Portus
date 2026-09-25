@@ -75,6 +75,17 @@ spec:
                   type: string
                   enum: [Open, Closed]
                   description: "With no allowance held and the ledger unreachable: Open lets requests through (default), Closed refuses them"
+                onExhausted:
+                  type: object
+                  required: [fallbackModel]
+                  description: "Token budgets only: a spent budget sends the request to fallbackModel (same provider) instead of a 429, spending from a separate overflow allowance per subject and window; when that is spent too, requests are refused. Responses carry x-portus-fallback-model; rows carry rule <policy>#fallback"
+                  properties:
+                    fallbackModel:
+                      type: string
+                    overflowTokens:
+                      type: integer
+                      minimum: 1
+                      description: "Tokens per window the fallback may spend; default a tenth of budget.tokens"
             status:
               type: object
               properties:

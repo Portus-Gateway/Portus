@@ -605,17 +605,7 @@ pub fn build_listener_buckets_from_proto(
                             header: Arc::from(if o.header.is_empty() { crate::ai::keys::ON_BEHALF_OF_HEADER } else { o.header.as_str() }.to_ascii_lowercase().as_str()),
                             trusted_keys: Arc::from(o.trusted_keys.clone()),
                         }),
-                        budget: spec.ai_budget.as_ref().and_then(|b| {
-                            Some(crate::ai::budget::BudgetPolicy {
-                                id: Arc::from(b.policy.as_str()),
-                                limit: b.limit,
-                                route_limit: b.limit,
-                                unit: crate::ai::budget::Unit::parse(&b.unit)?,
-                                window: crate::ai::budget::Window::parse(&b.window)?,
-                                per: crate::ai::budget::Scope::parse(&b.per)?,
-                                fail_open: b.fail_open,
-                            })
-                        }),
+                        budget: spec.ai_budget.as_ref().and_then(budget_policy_from_proto),
                     }),
                 }
             };
@@ -767,6 +757,42 @@ pub fn lb_signature(group: &portus_types::BackendGroup) -> u64 {
 /// since the previous snapshot is reused rather than rebuilt, so round-robin
 /// position and — more importantly — health-check state survive unrelated
 /// config changes. Returns the new map and its signatures.
+/// A route's AIUsagePolicy as the budget code applies it; `None` for a
+/// window, unit or scope this build does not know.
+pub fn budget_policy_from_proto(b: &portus_types::AiBudget) -> Option<crate::ai::budget::BudgetPolicy> {
+    use crate::ai::budget::{BudgetPolicy, Fallback, Scope, Unit, Window};
+    let unit = Unit::parse(&b.unit)?;
+    Some(BudgetPolicy {
+        id: Arc::from(b.policy.as_str()),
+        limit: b.limit,
+        route_limit: b.limit,
+        unit,
+        window: Window::parse(&b.window)?,
+        per: Scope::parse(&b.per)?,
+        fail_open: b.fail_open,
+        // A fallback model only makes sense for tokens: a call budget has no model.
+        fallback: (unit == Unit::Tokens && !b.fallback_model.is_empty() && b.overflow_limit > 0)
+            .then(|| Fallback { model: Arc::from(b.fallback_model.as_str()), overflow_limit: b.overflow_limit }),
+    })
+}
+
+/// Every budget policy in the config, once each, with the overflow counter
+/// of each fallback: what the data plane declares to the ledger.
+pub fn budget_policies_from_proto(routes: &[portus_types::RouteConfig]) -> Vec<crate::ai::budget::BudgetPolicy> {
+    let mut out: Vec<crate::ai::budget::BudgetPolicy> = Vec::new();
+    for p in routes.iter().filter_map(|r| r.ai_budget.as_ref()).filter_map(budget_policy_from_proto) {
+        if out.iter().any(|o| o.id == p.id) {
+            continue;
+        }
+        if let Some(o) = p.overflow() {
+            out.push(o);
+        }
+        out.push(p);
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
 /// MCP federations as the stack fans out to them; members keep the pool key
 /// and the fixed headers, the pool itself comes from the snapshot's `lbs`.
 pub fn build_federations_from_proto(federations: &[portus_types::McpFederation]) -> HashMap<Arc<str>, Arc<crate::ai::federation::Federation>> {
@@ -1504,6 +1530,7 @@ pub fn apply_config(mut config: portus_types::CompiledConfig, state: &ProxyState
         backend_client_cert: new_backend_client_cert,
         lb_signatures: new_lb_signatures,
         federations: build_federations_from_proto(&config.mcp_federations),
+        budget_policies: budget_policies_from_proto(&config.routes),
     }));
     state.l4_config.store(Arc::new(new_l4));
 
@@ -2579,6 +2606,33 @@ mod tests {
         let redir = route.redirect.as_ref().unwrap();
         assert_eq!(redir.status_code, 301);
         assert_eq!(redir.hostname.as_deref(), Some("example.org"));
+    }
+
+    #[test]
+    fn budget_policies_are_collected_once_with_their_fallback_overflow() {
+        let budget = |policy: &str, unit: &str, fallback: &str, overflow: u64| portus_types::AiBudget {
+            policy: policy.into(),
+            limit: 1_000,
+            window: "DAILY".into(),
+            per: "KEY".into(),
+            unit: unit.into(),
+            fail_open: true,
+            fallback_model: fallback.into(),
+            overflow_limit: overflow,
+        };
+        let route = |b: portus_types::AiBudget| RouteConfig { ai_budget: Some(b), ..Default::default() };
+        let routes = vec![
+            route(budget("llm/daily", "TOKENS", "claude-haiku-4-5", 100)),
+            route(budget("llm/daily", "TOKENS", "claude-haiku-4-5", 100)),
+            route(budget("mcp/calls", "CALLS", "ignored-model", 5)),
+            RouteConfig::default(),
+        ];
+        let got = budget_policies_from_proto(&routes);
+        assert_eq!(got.iter().map(|p| (p.id.as_ref(), p.limit)).collect::<Vec<_>>(), vec![("llm/daily", 1_000), ("llm/daily#overflow", 100), ("mcp/calls", 1_000)]);
+        let llm = budget_policy_from_proto(&budget("llm/daily", "TOKENS", "claude-haiku-4-5", 100)).unwrap();
+        assert_eq!(llm.fallback.map(|f| (f.model.to_string(), f.overflow_limit)), Some(("claude-haiku-4-5".to_string(), 100)));
+        assert!(budget_policy_from_proto(&budget("mcp/calls", "CALLS", "m", 5)).unwrap().fallback.is_none(), "a call budget has no model to fall back to");
+        assert!(budget_policy_from_proto(&budget("llm/x", "TOKENS", "m", 0)).unwrap().fallback.is_none(), "no allowance, no fallback");
     }
 
     #[test]

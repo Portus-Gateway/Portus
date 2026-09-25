@@ -89,7 +89,7 @@ spec:
                     onBehalfOf:
                       type: object
                       required: [trustedKeys]
-                      description: "A trusted caller (a hub holding one key for many users) names the user it acts for in a header; the gateway records that user as the subject, can budget per subject (AIUsagePolicy budget.per: Subject) and strips the header before forwarding. From any key not listed the header is ignored."
+                      description: "A trusted caller (a hub holding one key for many users) names the user it acts for in a header; the gateway records that user as the subject, can budget per subject (AIUsagePolicy budget.per: Subject) and strips the header before forwarding. From any key not trusted the header is ignored. Entries: name, tenant/name, tenant/* (every key of the tenant, including ones issued later) or label:key=value (every key with that label)."
                       properties:
                         header:
                           type: string

@@ -39,7 +39,7 @@ kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
 # Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.10 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.11 \
   --namespace portus --create-namespace
 ```
 
@@ -361,7 +361,7 @@ budget syncs and usage records on the ledger stream.
 ### Helm Values
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.10 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.11 \
   --namespace portus --create-namespace \
   --set dataplane.replicasPerGateway=3
 ```
@@ -388,7 +388,8 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `aiGateway.enabled` | `false` | Deploy the ledger and enable AI routes (Rama stack). Upgrade with your values in a file (`-f`), not a reuse flag; installs first created before 0.2.6 delete the generated grpc-tls Secret once |
 | `aiGateway.ledger.storage.size` | `1Gi` | PersistentVolumeClaim for the ledger's SQLite file |
 | `aiGateway.ledger.adminTokenSecretName` | `""` | Bring your own admin token Secret (key `token`) for the key API and the usage reads |
-| `aiGateway.ledger.openReads` | `false` | Serve `/export.jsonl`, `/v1/summary` and `/v1/series` without the token |
+| `aiGateway.ledger.openReads` | `false` | Serve `/export.jsonl`, `/v1/summary`, `/v1/series` and `/v1/limits` without the token |
+| `aiGateway.ledger.webhook.url` | `""` | POST budget-threshold and refusal events here (at least once, HMAC-signed with `webhook.secretName`) |
 | `aiGateway.jwt.issuers` | `[]` | OAuth issuers whose tokens `AIRoute.auth.jwt` may accept; the ledger fetches their JWKS every 5 minutes |
 
 Full reference: [`docs/deployment.md`](docs/deployment.md). Policies: [`docs/policies.md`](docs/policies.md).

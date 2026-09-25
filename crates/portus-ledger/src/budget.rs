@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS spend (
     window_end_unix_micros INTEGER NOT NULL,
     spent INTEGER NOT NULL,
     subject_limit INTEGER NOT NULL DEFAULT 0,
+    alerted INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (policy, subject, window_end_unix_micros)
 );
 CREATE TABLE IF NOT EXISTS policies (
@@ -77,16 +78,75 @@ pub fn window_end(window: &str, now_micros: u64) -> Option<u64> {
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A policy is listed by `/v1/limits` while a data plane has declared or
+/// synced it this recently; data planes redeclare every minute.
+pub const POLICY_FRESH_MICROS: u64 = 10 * 60 * 1_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Synced {
     pub spent_total: u64,
     pub window_end_unix_micros: u64,
+    /// Thresholds (percent of the subject's limit) this sync crossed for
+    /// the first time in the window, lowest first.
+    pub crossed: Vec<Crossing>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Crossing {
+    pub threshold_pct: u32,
+    pub spent: u64,
+    pub limit: u64,
+}
+
+/// A policy as a data plane holds it in its config, declared before any
+/// request spends under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    pub policy: String,
+    pub window: String,
+    pub shape: Shape,
+}
+
+/// Record the policies a data plane holds, so `/v1/limits` lists them
+/// before their first request.
+pub fn declare(conn: &Connection, policies: &[Declared], now_micros: u64) -> rusqlite::Result<usize> {
+    let mut n = 0;
+    for d in policies.iter().filter(|d| d.shape.limit > 0 && !d.shape.unit.is_empty() && window_end(&d.window, now_micros).is_some()) {
+        upsert_policy(conn, &d.policy, &d.window, &d.shape, now_micros)?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+fn upsert_policy(conn: &Connection, policy: &str, window: &str, s: &Shape, now_micros: u64) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO policies (policy, limit_units, unit, window, per, fail_open, updated_unix_micros) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(policy) DO UPDATE SET limit_units = ?2, unit = ?3, window = ?4, per = ?5, fail_open = ?6, updated_unix_micros = ?7",
+        params![policy, s.limit as i64, s.unit, window.to_ascii_uppercase(), s.per, s.fail_open, now_micros as i64],
+    )
 }
 
 /// Add a pod's delta to the window's counter and return the new total.
 /// `shape` (when the data plane sent one) keeps the policy table and the
 /// subject's limit current for `/v1/limits`.
 pub fn sync(conn: &Connection, policy: &str, subject: &str, window: &str, delta: u64, now_micros: u64, shape: Option<&Shape>) -> rusqlite::Result<Option<Synced>> {
+    sync_alerting(conn, policy, subject, window, delta, now_micros, shape, &[])
+}
+
+/// [`sync`], also reporting the `thresholds` (percent, ascending) the new
+/// total crossed for the first time in this window. Each threshold is
+/// reported once per subject and window, however many pods sync.
+#[allow(clippy::too_many_arguments)]
+pub fn sync_alerting(
+    conn: &Connection,
+    policy: &str,
+    subject: &str,
+    window: &str,
+    delta: u64,
+    now_micros: u64,
+    shape: Option<&Shape>,
+    thresholds: &[u32],
+) -> rusqlite::Result<Option<Synced>> {
     let Some(end) = window_end(window, now_micros) else { return Ok(None) };
     let subject_limit = shape.map_or(0, |s| if s.subject_limit > 0 { s.subject_limit } else { s.limit });
     conn.execute(
@@ -95,18 +155,30 @@ pub fn sync(conn: &Connection, policy: &str, subject: &str, window: &str, delta:
         params![policy, subject, end as i64, delta as i64, subject_limit as i64],
     )?;
     if let Some(s) = shape.filter(|s| s.limit > 0 && !s.unit.is_empty()) {
-        conn.execute(
-            "INSERT INTO policies (policy, limit_units, unit, window, per, fail_open, updated_unix_micros) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(policy) DO UPDATE SET limit_units = ?2, unit = ?3, window = ?4, per = ?5, fail_open = ?6, updated_unix_micros = ?7",
-            params![policy, s.limit as i64, s.unit, window.to_ascii_uppercase(), s.per, s.fail_open, now_micros as i64],
-        )?;
+        upsert_policy(conn, policy, window, s, now_micros)?;
     }
-    let total: i64 = conn.query_row(
-        "SELECT spent FROM spend WHERE policy = ?1 AND subject = ?2 AND window_end_unix_micros = ?3",
+    let (total, stored_limit, alerted): (i64, i64, i64) = conn.query_row(
+        "SELECT spent, subject_limit, alerted FROM spend WHERE policy = ?1 AND subject = ?2 AND window_end_unix_micros = ?3",
         params![policy, subject, end as i64],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     )?;
-    Ok(Some(Synced { spent_total: total as u64, window_end_unix_micros: end }))
+    let (total, limit, alerted) = (total.max(0) as u64, stored_limit.max(0) as u64, alerted.max(0) as u32);
+    let mut crossed = Vec::new();
+    if limit > 0 && !thresholds.is_empty() {
+        let pct = total.saturating_mul(100) / limit;
+        crossed = thresholds
+            .iter()
+            .filter(|t| **t > alerted && pct >= u64::from(**t))
+            .map(|t| Crossing { threshold_pct: *t, spent: total, limit })
+            .collect();
+        if let Some(top) = crossed.last() {
+            conn.execute(
+                "UPDATE spend SET alerted = ?4 WHERE policy = ?1 AND subject = ?2 AND window_end_unix_micros = ?3",
+                params![policy, subject, end as i64, top.threshold_pct],
+            )?;
+        }
+    }
+    Ok(Some(Synced { spent_total: total, window_end_unix_micros: end, crossed }))
 }
 
 /// Drop windows that ended before `now_micros`.
@@ -114,13 +186,15 @@ pub fn prune(conn: &Connection, now_micros: u64) -> rusqlite::Result<usize> {
     conn.execute("DELETE FROM spend WHERE window_end_unix_micros < ?1", params![now_micros as i64])
 }
 
-/// Every policy a data plane has synced, with the current window's spend
-/// per subject. A policy appears after its first budgeted request; a
-/// subject after its first sync in the window.
+/// Every policy a data plane has declared or synced in the last
+/// [`POLICY_FRESH_MICROS`], with the current window's spend per subject.
+/// A subject appears after its first sync in the window.
 pub fn limits(conn: &Connection, now_micros: u64) -> rusqlite::Result<Vec<PolicyLimits>> {
-    let mut stmt = conn.prepare_cached("SELECT policy, limit_units, unit, window, per, fail_open, updated_unix_micros FROM policies ORDER BY policy")?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT policy, limit_units, unit, window, per, fail_open, updated_unix_micros FROM policies WHERE updated_unix_micros >= ?1 ORDER BY policy",
+    )?;
     let policies = stmt
-        .query_map([], |r| {
+        .query_map(params![now_micros.saturating_sub(POLICY_FRESH_MICROS) as i64], |r| {
             Ok(PolicyLimits {
                 policy: r.get(0)?,
                 limit: r.get::<_, i64>(1)? as u64,
@@ -232,7 +306,50 @@ mod tests {
         sync(&c, "llm/daily", "101", "DAILY", 0, NOW, Some(&shape(2_000, 0))).unwrap();
         let l = limits(&c, NOW).unwrap();
         assert_eq!((l[0].limit, l[0].subjects.iter().find(|s| s.subject == "101").unwrap().limit), (2_000, 2_000));
-        assert!(limits(&c, window_end("DAILY", NOW).unwrap() + 1).unwrap()[0].subjects.is_empty(), "a new window starts empty");
+        let next = window_end("DAILY", NOW).unwrap() + 1;
+        declare(&c, &[Declared { policy: "llm/daily".into(), window: "DAILY".into(), shape: shape(2_000, 0) }], next).unwrap();
+        assert!(limits(&c, next).unwrap()[0].subjects.is_empty(), "a new window starts empty");
+    }
+
+    #[test]
+    fn thresholds_fire_once_per_subject_and_window_whatever_the_pods() {
+        let c = conn();
+        let shape = Shape { limit: 1_000, unit: "TOKENS".into(), per: "KEY".into(), fail_open: true, subject_limit: 0 };
+        let t = [80, 100];
+        let s = sync_alerting(&c, "llm/d", "7", "DAILY", 500, NOW, Some(&shape), &t).unwrap().unwrap();
+        assert!(s.crossed.is_empty(), "50 %");
+        let s = sync_alerting(&c, "llm/d", "7", "DAILY", 300, NOW, Some(&shape), &t).unwrap().unwrap();
+        assert_eq!(s.crossed, vec![Crossing { threshold_pct: 80, spent: 800, limit: 1_000 }]);
+        let s = sync_alerting(&c, "llm/d", "7", "DAILY", 50, NOW, Some(&shape), &t).unwrap().unwrap();
+        assert!(s.crossed.is_empty(), "another pod at 85 %: already told");
+        let s = sync_alerting(&c, "llm/d", "7", "DAILY", 400, NOW, Some(&shape), &t).unwrap().unwrap();
+        assert_eq!(s.crossed.iter().map(|x| x.threshold_pct).collect::<Vec<_>>(), vec![100], "only the new one");
+        assert!(sync_alerting(&c, "llm/d", "7", "DAILY", 0, NOW, Some(&shape), &t).unwrap().unwrap().crossed.is_empty());
+        // One jump over both thresholds reports both, lowest first.
+        let s = sync_alerting(&c, "llm/d", "8", "DAILY", 2_000, NOW, Some(&shape), &t).unwrap().unwrap();
+        assert_eq!(s.crossed.iter().map(|x| x.threshold_pct).collect::<Vec<_>>(), vec![80, 100]);
+        // A key's own limit is what the percentage is of.
+        let own = Shape { subject_limit: 10_000, ..shape.clone() };
+        assert!(sync_alerting(&c, "llm/d", "9", "DAILY", 2_000, NOW, Some(&own), &t).unwrap().unwrap().crossed.is_empty(), "20 % of the key's 10k");
+        // A new window starts over.
+        let next = window_end("DAILY", NOW).unwrap() + 1;
+        assert_eq!(sync_alerting(&c, "llm/d", "7", "DAILY", 900, next, Some(&shape), &t).unwrap().unwrap().crossed.len(), 1);
+        // No thresholds configured: nothing, ever.
+        assert!(sync_alerting(&c, "llm/d", "10", "DAILY", 5_000, NOW, Some(&shape), &[]).unwrap().unwrap().crossed.is_empty());
+    }
+
+    #[test]
+    fn declared_policies_are_listed_before_any_spend_and_drop_out_when_stale() {
+        let c = conn();
+        let d = |policy: &str, limit: u64| Declared { policy: policy.into(), window: "Daily".into(), shape: Shape { limit, unit: "CALLS".into(), per: "SUBJECT".into(), fail_open: false, subject_limit: 0 } };
+        assert_eq!(declare(&c, &[d("mcp/calls", 50), d("bad/none", 0)], NOW).unwrap(), 1, "a zero limit is not a policy");
+        let l = limits(&c, NOW).unwrap();
+        assert_eq!(l.len(), 1);
+        assert_eq!((l[0].policy.as_str(), l[0].limit, l[0].window.as_str(), l[0].per.as_str()), ("mcp/calls", 50, "DAILY", "SUBJECT"));
+        assert!(l[0].subjects.is_empty(), "no request yet");
+        assert!(limits(&c, NOW + POLICY_FRESH_MICROS + 1).unwrap().is_empty(), "not redeclared: gone from the config");
+        declare(&c, &[d("mcp/calls", 60)], NOW + POLICY_FRESH_MICROS).unwrap();
+        assert_eq!(limits(&c, NOW + POLICY_FRESH_MICROS + 1).unwrap()[0].limit, 60, "a redeclaration refreshes it and its limit");
     }
 
     #[test]
