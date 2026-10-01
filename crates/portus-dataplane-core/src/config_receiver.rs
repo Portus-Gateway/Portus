@@ -849,7 +849,16 @@ pub fn build_lb_map_from_proto(
         let addrs: Vec<std::net::SocketAddr> = group
             .endpoints
             .iter()
-            .filter_map(|ep| format!("{}:{}", ep.address, ep.port).parse().ok())
+            .filter_map(|ep| match format!("{}:{}", ep.address, ep.port).parse() {
+                Ok(addr) => Some(addr),
+                Err(_) => {
+                    warn!(
+                        "backend {}:{}: endpoint '{}:{}' is not an IP address and port; skipped",
+                        group.service_name, group.port, ep.address, ep.port
+                    );
+                    None
+                }
+            })
             .collect();
         if addrs.is_empty() {
             continue;

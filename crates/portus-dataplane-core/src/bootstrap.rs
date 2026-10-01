@@ -91,13 +91,11 @@ pub fn bootstrap() -> Result<Bootstrap, String> {
         health_check_min_interval: health_check_min_interval.clone(),
     });
 
-    if let Ok(config_path) = std::env::var("PORTUS_CONFIG_FILE") {
+    let standalone_config = std::env::var("PORTUS_CONFIG_FILE").ok();
+    if let Some(config_path) = &standalone_config {
         info!("standalone mode: loading config from {}", config_path);
-        standalone::load_and_apply(&config_path, &state)
+        standalone::start(config_path, state.clone())
             .map_err(|e| format!("failed to load initial standalone config {config_path}: {e}"))?;
-        let watch_state = state.clone();
-        let watch_path = config_path.clone();
-        std::thread::spawn(move || standalone::watch_config_file(&watch_path, watch_state));
         readiness.mark_configured();
         info!("standalone mode: config loaded");
     } else {
@@ -179,7 +177,8 @@ pub fn bootstrap() -> Result<Bootstrap, String> {
     }
 
     let outliers = Arc::new(Outliers::new(OutlierConfig::default()));
-    let tls = frontend_tls(&tls_cert, &tls_cert_notify, &metrics)?;
+    // Standalone ACME may validate over TLS-ALPN-01 on any HTTPS listener.
+    let tls = frontend_tls(&tls_cert, &tls_cert_notify, &metrics, standalone_config.is_some())?;
 
     Ok(Bootstrap {
         state,
@@ -206,6 +205,7 @@ fn frontend_tls(
     tls_cert: &TlsCertSlot,
     notify: &Arc<tokio::sync::Notify>,
     metrics: &Arc<ProxyMetrics>,
+    answer_tls_alpn01: bool,
 ) -> Result<FrontendTls, String> {
     let initial_key = {
         let guard = tls_cert.load();
@@ -229,7 +229,8 @@ fn frontend_tls(
         }
     };
 
-    let resolver = Arc::new(ReloadableCertResolver::new(initial_key));
+    let resolver = ReloadableCertResolver::new(initial_key);
+    let resolver = Arc::new(if answer_tls_alpn01 { resolver.answering_tls_alpn01() } else { resolver });
     let server_config = Arc::new(build_reloadable_tls_config(resolver.clone()));
     // Frontend mTLS: ports whose Gateway configures client certificate
     // validation get their own ServerConfig (same certs, plus a verifier),

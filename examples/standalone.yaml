@@ -4,6 +4,17 @@
 #
 # This file configures the Portus proxy without a Kubernetes controller.
 # Changes are hot-reloaded automatically (no restart needed).
+# Reference: docs/standalone.md
+
+# Re-resolve backend hostnames this often (seconds; 0 disables).
+dns_refresh_secs: 30
+
+# ACME account for listeners with `tls: { acme: ... }` (see the 443 listener).
+# acme:
+#   email: ops@example.com
+#   directory: letsencrypt-staging   # switch to letsencrypt once issuance works
+#   cache_dir: /var/lib/portus/acme
+#   challenge: http-01               # needs the port 80 listener below
 
 listeners:
   # HTTP listener on port 80
@@ -15,7 +26,13 @@ listeners:
         backends:
           - address: "10.0.0.1:8080"
 
-      # Path-based routing with multiple backends
+      # Backends by DNS name (docker compose service, VM hostname): every
+      # address the name resolves to joins the pool
+      - hosts: ["compose.example.com"]
+        backends:
+          - address: "web:8080"
+
+      # Path-based routing with a 3:1 weighted split
       - hosts: ["api.example.com"]
         paths:
           - path: /v1
@@ -37,12 +54,25 @@ listeners:
         backends:
           - address: "10.0.0.100:8080"
 
-  # HTTPS listener on port 443
+  # HTTPS listener on port 443 with certificate files (watched: a renewed
+  # certificate is served without a restart)
   # - port: 443
   #   protocol: HTTPS
   #   tls:
   #     cert_file: /etc/tls/cert.pem
   #     key_file: /etc/tls/key.pem
+  #   routes:
+  #     - hosts: ["secure.example.com"]
+  #       backends:
+  #         - address: "10.0.0.2:8080"
+
+  # ...or with certificates from ACME (uncomment the `acme:` block above).
+  # Domains default to the listener hostname, else the exact route hosts.
+  # - port: 443
+  #   protocol: HTTPS
+  #   tls:
+  #     acme:
+  #       domains: ["secure.example.com"]
   #   routes:
   #     - hosts: ["secure.example.com"]
   #       backends:

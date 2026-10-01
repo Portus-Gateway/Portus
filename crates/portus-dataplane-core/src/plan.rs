@@ -298,6 +298,25 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
     facts: RequestFacts<'_, H>,
     metrics: &ProxyMetrics,
 ) -> Plan {
+    // ACME HTTP-01 (standalone mode): a token the ACME client is waiting on
+    // is answered before routing, whatever the routes say (an HTTP->HTTPS
+    // redirect included). Unknown tokens, and every token in Kubernetes mode,
+    // route as usual.
+    if !facts.socket_is_tls
+        && let Some(token) = facts.path.strip_prefix(crate::acme_challenge::HTTP01_PATH_PREFIX)
+        && let Some(key_authorization) = crate::acme_challenge::http01_key_authorization(token)
+    {
+        return Plan::Respond(Reply {
+            status: 200,
+            headers: vec![
+                (http::header::CONTENT_LENGTH, HeaderValue::from(key_authorization.len())),
+                (http::header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream")),
+            ],
+            body: Bytes::from(key_authorization),
+            keepalive: true,
+        });
+    }
+
     let (original_scheme, local_port) = listener_scheme_and_port(facts.local_port, facts.socket_is_tls);
     let host = facts.host;
 
@@ -963,4 +982,93 @@ mod tests {
         assert_eq!(r.headers[0].1, "8");
         assert_eq!(Reply::empty(421).headers[0].1, "0");
     }
+
+    /// A snapshot with one host routing everything to `service`, the shape of
+    /// cert-manager's HTTP-01 solver route in Kubernetes mode.
+    fn catch_all_snapshot(host: &str, service: &str) -> ProxySnapshot {
+        let mut route = crate::router::test_support::path_route("/", PathMatchType::Prefix);
+        route.service_name = Arc::from(service);
+        let host_routes = HostRoutes { exact_map: HashMap::new(), rules: vec![route], catch_all: None, needs_body: false, oauth: None };
+        let bucket = ListenerBucket {
+            listener_hostname: Arc::from(""),
+            exact: HashMap::from([(host.to_string(), host_routes)]),
+            domain_wildcards: HashMap::new(),
+            catch_all: None,
+        };
+        let mut snap = ProxySnapshot::default();
+        snap.listeners_by_port.insert(80, vec![bucket]);
+        snap
+    }
+
+    fn challenge_facts<'a>(headers: &'a HeaderMap, path: &'a str, tls: bool) -> RequestFacts<'a, HeaderMap> {
+        RequestFacts {
+            host: "acme.example.com",
+            path,
+            path_and_query: path,
+            query: None,
+            method: "GET",
+            headers,
+            local_port: 80,
+            socket_is_tls: tls,
+            sni: None,
+            peer_ip: None,
+            body_fields: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn acme_http01_token_is_answered_before_routing() {
+        crate::acme_challenge::set_http01("plan-token-1", "plan-token-1.thumbprint");
+        let headers = HeaderMap::new();
+        // No route for the host at all: the challenge is still answered.
+        let plan = plan_request(
+            &ProxySnapshot::default(),
+            challenge_facts(&headers, "/.well-known/acme-challenge/plan-token-1", false),
+            metrics(),
+        )
+        .await;
+        crate::acme_challenge::clear_http01("plan-token-1");
+        match plan {
+            Plan::Respond(r) => {
+                assert_eq!(r.status, 200);
+                assert_eq!(&r.body[..], b"plan-token-1.thumbprint");
+                assert!(r.headers.contains(&(http::header::CONTENT_LENGTH, HeaderValue::from(23usize))));
+            }
+            _ => panic!("expected the key authorization"),
+        }
+    }
+
+    /// Kubernetes mode never registers tokens, so a challenge request routes
+    /// to whatever HTTPRoute claims it (cert-manager's solver).
+    #[tokio::test]
+    async fn unknown_acme_tokens_route_as_usual() {
+        crate::acme_challenge::set_http01("plan-token-other", "x");
+        let snap = catch_all_snapshot("acme.example.com", "cm-acme-solver");
+        let headers = HeaderMap::new();
+        let plan = plan_request(&snap, challenge_facts(&headers, "/.well-known/acme-challenge/k8s-token", false), metrics()).await;
+        crate::acme_challenge::clear_http01("plan-token-other");
+        match plan {
+            Plan::Forward(f) => assert_eq!(&*f.service_name, "cm-acme-solver"),
+            Plan::Respond(r) => panic!("expected the solver route, got a {} reply", r.status),
+            Plan::NeedsBody(_) => panic!("expected the solver route"),
+        }
+    }
+
+    /// HTTP-01 is plain HTTP only; a TLS request for a pending token routes.
+    #[tokio::test]
+    async fn acme_http01_is_not_answered_over_tls() {
+        crate::acme_challenge::set_http01("plan-token-tls", "plan-token-tls.thumbprint");
+        let headers = HeaderMap::new();
+        let plan = plan_request(
+            &ProxySnapshot::default(),
+            challenge_facts(&headers, "/.well-known/acme-challenge/plan-token-tls", true),
+            metrics(),
+        )
+        .await;
+        crate::acme_challenge::clear_http01("plan-token-tls");
+        if let Plan::Respond(r) = &plan {
+            assert_ne!(&r.body[..], b"plan-token-tls.thumbprint");
+        }
+    }
+
 }

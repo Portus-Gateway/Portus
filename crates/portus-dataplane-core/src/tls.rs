@@ -62,6 +62,8 @@ pub struct ReloadableCertResolver {
     pub certified_key: ArcSwap<CertifiedKey>,
     /// SNI-based cert map for multi-listener support.
     cert_map: ArcSwap<CertMap>,
+    /// Answer TLS-ALPN-01 validation handshakes (standalone ACME).
+    tls_alpn01: bool,
 }
 
 impl ReloadableCertResolver {
@@ -76,7 +78,16 @@ impl ReloadableCertResolver {
         Self {
             certified_key: ArcSwap::from(arc_key),
             cert_map: ArcSwap::from_pointee(map),
+            tls_alpn01: false,
         }
+    }
+
+    /// Also answer TLS-ALPN-01 (RFC 8737) handshakes with the pending
+    /// challenge certificate; the TLS config built from this resolver then
+    /// offers `acme-tls/1`. Standalone mode only.
+    pub fn answering_tls_alpn01(mut self) -> Self {
+        self.tls_alpn01 = true;
+        self
     }
 
     /// Atomically swap the stored certified key (single-cert mode).
@@ -151,6 +162,16 @@ impl ResolvesServerCert for ReloadableCertResolver {
         &self,
         client_hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<CertifiedKey>> {
+        // TLS-ALPN-01 (RFC 8737, standalone ACME): a validation handshake gets
+        // the challenge certificate for its SNI or nothing, never a real one.
+        if self.tls_alpn01
+            && client_hello
+                .alpn()
+                .is_some_and(|mut protocols| protocols.any(|p| p == crate::acme_challenge::ACME_TLS_ALPN))
+        {
+            return client_hello.server_name().and_then(crate::acme_challenge::tls_alpn01_cert);
+        }
+
         let map = self.cert_map.load();
 
         if let Some(sni) = client_hello.server_name() {
@@ -264,6 +285,7 @@ pub fn load_certified_key(
 pub fn build_reloadable_tls_config(
     resolver: Arc<ReloadableCertResolver>,
 ) -> ServerConfig {
+    let tls_alpn01 = resolver.tls_alpn01;
     let mut config = ServerConfig::builder_with_protocol_versions(&[
         &rustls::version::TLS12,
         &rustls::version::TLS13,
@@ -272,6 +294,10 @@ pub fn build_reloadable_tls_config(
     .with_cert_resolver(resolver);
 
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // Last, so a client offering h2 or http/1.1 as well never selects it.
+    if tls_alpn01 {
+        config.alpn_protocols.push(crate::acme_challenge::ACME_TLS_ALPN.to_vec());
+    }
     config
 }
 
@@ -1253,4 +1279,111 @@ mod fingerprint_tests {
         assert_ne!(client_validation_fingerprint(&base), client_validation_fingerprint(&ca));
         assert_eq!(client_validation_fingerprint(&[]), 0);
     }
+
+    /// One handshake offering only `acme-tls/1` (an ACME validator) for
+    /// `sni`, trusting any certificate. Returns the leaf the server presented
+    /// and the negotiated ALPN, or the handshake error.
+    fn acme_validator_handshake(
+        server_config: Arc<ServerConfig>,
+        sni: &str,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+        #[derive(Debug)]
+        struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+        impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+            fn verify_server_cert(
+                &self,
+                _: &rustls_pki_types::CertificateDer<'_>,
+                _: &[rustls_pki_types::CertificateDer<'_>],
+                _: &rustls_pki_types::ServerName<'_>,
+                _: &[u8],
+                _: rustls_pki_types::UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                m: &[u8],
+                c: &rustls_pki_types::CertificateDer<'_>,
+                d: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+            }
+            fn verify_tls13_signature(
+                &self,
+                m: &[u8],
+                c: &rustls_pki_types::CertificateDer<'_>,
+                d: &rustls::DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                self.0.signature_verification_algorithms.supported_schemes()
+            }
+        }
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![crate::acme_challenge::ACME_TLS_ALPN.to_vec()];
+        let name = rustls_pki_types::ServerName::try_from(sni.to_string()).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+            let server = tokio::spawn(async move { acceptor.accept(server_io).await.map(|_| ()) });
+            let client = connector.connect(name, client_io).await.map_err(|e| e.to_string());
+            let _ = server.await;
+            let c = client?;
+            let conn = c.get_ref().1;
+            let leaf = conn.peer_certificates().and_then(|p| p.first()).map(|c| c.to_vec()).unwrap_or_default();
+            Ok((leaf, conn.alpn_protocol().map(<[u8]>::to_vec)))
+        })
+    }
+
+    fn resolver_with_cert() -> ReloadableCertResolver {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let (cert, key) = generate_self_signed_cert().unwrap();
+        ReloadableCertResolver::new(load_certified_key_from_pem(&cert, &key).unwrap())
+    }
+
+    #[test]
+    fn tls_alpn01_handshake_gets_the_challenge_certificate() {
+        let resolver = Arc::new(resolver_with_cert().answering_tls_alpn01());
+        let config = Arc::new(build_reloadable_tls_config(resolver));
+        assert_eq!(config.alpn_protocols.last().map(Vec::as_slice), Some(crate::acme_challenge::ACME_TLS_ALPN));
+
+        let (cert, key) = crate::tls::generate_self_signed_cert().unwrap();
+        let challenge = load_certified_key_from_pem(&cert, &key).unwrap();
+        let challenge_der = challenge.cert[0].to_vec();
+        crate::acme_challenge::set_tls_alpn01("alpn-handshake.example.com", challenge);
+        let got = acme_validator_handshake(config.clone(), "alpn-handshake.example.com");
+        // No challenge pending for another name: the handshake fails rather
+        // than show the validator a real certificate.
+        let other = acme_validator_handshake(config, "no-challenge.example.com");
+        crate::acme_challenge::clear_tls_alpn01("alpn-handshake.example.com");
+
+        let (leaf, alpn) = got.unwrap();
+        assert_eq!(leaf, challenge_der);
+        assert_eq!(alpn.as_deref(), Some(crate::acme_challenge::ACME_TLS_ALPN));
+        assert!(other.is_err());
+    }
+
+    /// Kubernetes mode: the resolver does not answer TLS-ALPN-01 and the TLS
+    /// config does not offer `acme-tls/1`, so such a handshake fails on ALPN.
+    #[test]
+    fn tls_alpn01_is_off_unless_asked_for() {
+        let resolver = Arc::new(resolver_with_cert());
+        let config = Arc::new(build_reloadable_tls_config(resolver));
+        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let (cert, key) = crate::tls::generate_self_signed_cert().unwrap();
+        crate::acme_challenge::set_tls_alpn01("alpn-off.example.com", load_certified_key_from_pem(&cert, &key).unwrap());
+        let got = acme_validator_handshake(config, "alpn-off.example.com");
+        crate::acme_challenge::clear_tls_alpn01("alpn-off.example.com");
+        assert!(got.is_err());
+    }
+
 }

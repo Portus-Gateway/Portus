@@ -7,15 +7,21 @@
 //! The YAML format maps directly to the proto `CompiledConfig` schema, with
 //! ergonomic naming (snake_case, nested objects instead of flat proto fields).
 //!
-//! File watching with debounce enables hot-reload: edit the YAML and the proxy
-//! picks up changes within ~500ms, with zero downtime.
+//! Hot reload ([`reload`]): the YAML and every certificate file it names are
+//! watched, backend hostnames are re-resolved periodically, and certificates
+//! issued over ACME ([`acme`]) are swapped in without a restart.
 
-use log::{info, warn};
+pub mod acme;
+pub mod reload;
+
+pub use reload::start;
+
+use log::warn;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
-
-use crate::config_receiver::{apply_config, validate_config, ProxyState};
+use std::net::IpAddr;
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
 // YAML deserialization types
@@ -26,6 +32,16 @@ use crate::config_receiver::{apply_config, validate_config, ProxyState};
 pub struct StandaloneConfig {
     #[serde(default)]
     pub listeners: Vec<YamlListener>,
+    /// Seconds between re-resolutions of backend hostnames; 0 disables.
+    #[serde(default = "default_dns_refresh_secs")]
+    pub dns_refresh_secs: u64,
+    /// ACME account and CA settings, shared by every `tls.acme` listener.
+    #[serde(default)]
+    pub acme: acme::AcmeSettings,
+}
+
+fn default_dns_refresh_secs() -> u64 {
+    30
 }
 
 /// A listener defines a port, protocol, optional TLS, and a set of routes.
@@ -47,11 +63,16 @@ fn default_protocol() -> String {
     "HTTP".to_string()
 }
 
-/// TLS configuration for an HTTPS listener.
+/// TLS configuration for an HTTPS listener: certificate files on disk, or
+/// certificates obtained over ACME.
 #[derive(Debug, Deserialize)]
 pub struct YamlListenerTls {
-    pub cert_file: String,
-    pub key_file: String,
+    #[serde(default)]
+    pub cert_file: Option<String>,
+    #[serde(default)]
+    pub key_file: Option<String>,
+    #[serde(default)]
+    pub acme: Option<acme::ListenerAcme>,
 }
 
 /// A route matches requests by host/path/headers and forwards to backends.
@@ -365,14 +386,213 @@ fn parse_backend_address(addr: &str) -> Result<(String, u16), String> {
     Ok((parts[1].to_string(), port))
 }
 
-/// Convert a `StandaloneConfig` into a `portus_types::CompiledConfig`.
-#[allow(deprecated)] // mirror_backend (field 21) must be explicitly None in the struct literal
-pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::CompiledConfig, String> {
-    let mut proto = portus_types::CompiledConfig {
-        schema_version: "1.0.0".to_string(),
-        version: 1,
-        ..Default::default()
+/// Addresses each backend hostname resolved to, from [`resolve_backend_hosts`].
+/// IP-literal backends are not in the table.
+pub type DnsTable = HashMap<String, Vec<IpAddr>>;
+
+/// A hostname lookup: the system resolver in production, a fixed table in tests.
+pub type Lookup = fn(&str) -> std::io::Result<Vec<IpAddr>>;
+
+/// Resolve `host` with the system resolver (`/etc/hosts`, then DNS).
+pub fn system_lookup(host: &str) -> std::io::Result<Vec<IpAddr>> {
+    use std::net::ToSocketAddrs;
+    Ok((host, 0).to_socket_addrs()?.map(|sa| sa.ip()).collect())
+}
+
+/// The IP of an IP-literal backend host (`10.0.0.1`, `[::1]`), else `None`.
+fn literal_ip(host: &str) -> Option<IpAddr> {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+        .parse()
+        .ok()
+}
+
+/// Every backend and mirror hostname in the config that needs a DNS lookup.
+fn backend_hostnames(config: &StandaloneConfig) -> BTreeSet<String> {
+    config
+        .listeners
+        .iter()
+        .flat_map(|l| &l.routes)
+        .flat_map(|r| r.backends.iter().map(|b| &b.address).chain(r.mirrors.iter().map(|m| &m.address)))
+        .filter_map(|addr| parse_backend_address(addr).ok())
+        .map(|(host, _)| host)
+        .filter(|host| literal_ip(host).is_none())
+        .collect()
+}
+
+/// Resolve every backend hostname in `config`. A lookup that fails or comes
+/// back empty keeps the addresses from `previous`, so a DNS blip never empties
+/// a pool; a hostname that has never resolved gets no endpoints (502 until it
+/// does) rather than failing the whole config.
+pub fn resolve_backend_hosts(config: &StandaloneConfig, previous: &DnsTable, lookup: Lookup) -> DnsTable {
+    backend_hostnames(config)
+        .into_iter()
+        .map(|host| {
+            let ips = match lookup(&host) {
+                Ok(mut ips) if !ips.is_empty() => {
+                    ips.sort_unstable();
+                    ips.dedup();
+                    ips
+                }
+                result => {
+                    let reason = result.err().map_or_else(|| "no addresses".to_string(), |e| e.to_string());
+                    match previous.get(&host) {
+                        Some(last) => {
+                            warn!("backend host '{host}' did not resolve ({reason}); keeping its last {} address(es)", last.len());
+                            last.clone()
+                        }
+                        None => {
+                            warn!("backend host '{host}' did not resolve ({reason}); its routes return 502 until it does");
+                            Vec::new()
+                        }
+                    }
+                }
+            };
+            (host, ips)
+        })
+        .collect()
+}
+
+/// The endpoints one backend address stands for: itself when it is an IP
+/// literal, else every address its hostname resolved to.
+fn backend_endpoints(address: &str, dns: &DnsTable) -> Result<(u16, Vec<portus_types::BackendEndpoint>), String> {
+    let (host, port) = parse_backend_address(address)?;
+    let ips = match literal_ip(&host) {
+        Some(ip) => vec![ip],
+        None => dns.get(&host).cloned().unwrap_or_default(),
     };
+    let endpoints = ips
+        .into_iter()
+        .map(|ip| portus_types::BackendEndpoint {
+            // Bracketed so `"{address}:{port}"` parses as a SocketAddr.
+            address: match ip {
+                IpAddr::V4(v4) => v4.to_string(),
+                IpAddr::V6(v6) => format!("[{v6}]"),
+            },
+            port: u32::from(port),
+        })
+        .collect();
+    Ok((port, endpoints))
+}
+
+/// Register a backend group for `backends` (once per distinct set) and return
+/// its service name and port.
+fn backend_group(
+    backends: &[YamlBackend],
+    dns: &DnsTable,
+    groups: &mut HashMap<String, portus_types::BackendGroup>,
+) -> Result<(String, u32), String> {
+    let service_name = synthetic_service_name(backends);
+    let mut port = None;
+    let mut endpoints = Vec::new();
+    for backend in backends {
+        let (p, eps) = backend_endpoints(&backend.address, dns)?;
+        port.get_or_insert(u32::from(p));
+        endpoints.extend(eps);
+    }
+    let port = port.unwrap_or_default();
+    groups.entry(service_name.clone()).or_insert_with(|| portus_types::BackendGroup {
+        service_name: service_name.clone(),
+        port,
+        endpoints,
+        health_check: None,
+        backend_tls: None,
+    });
+    Ok((service_name, port))
+}
+
+/// What the reloader needs besides the proto: the ACME work the config asks
+/// for and the files whose changes should trigger a reload.
+pub struct Compiled {
+    pub config: portus_types::CompiledConfig,
+    pub acme: Option<acme::AcmePlan>,
+    /// Certificate and key files the config read, with [`content_hash`] of
+    /// the bytes read (the YAML itself is the reloader's own business).
+    pub read_files: Vec<(PathBuf, u64)>,
+}
+
+/// Hash of a file's contents, to tell a real change from an unrelated event.
+pub fn content_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn read_file(path: &str, what: &str, out: &mut Compiled) -> Result<String, String> {
+    let contents = std::fs::read_to_string(path).map_err(|e| format!("failed to read TLS {what} '{path}': {e}"))?;
+    out.read_files.push((PathBuf::from(path), content_hash(contents.as_bytes())));
+    Ok(contents)
+}
+
+/// One listener's TLS: the certificate for the listener itself plus, for an
+/// ACME listener with several domains, one extra (route-less) listener per
+/// further domain so each domain's certificate is selected by SNI.
+fn listener_tls(
+    listener: &YamlListener,
+    config: &StandaloneConfig,
+    listener_name: &str,
+    out: &mut Compiled,
+) -> Result<(Option<portus_types::TlsCertRef>, Vec<portus_types::Listener>), String> {
+    let Some(tls) = &listener.tls else { return Ok((None, Vec::new())) };
+    match (&tls.cert_file, &tls.key_file, &tls.acme) {
+        (Some(cert_file), Some(key_file), None) => {
+            let cert_pem = read_file(cert_file, "cert", out)?;
+            let key_pem = read_file(key_file, "key", out)?;
+            Ok((Some(portus_types::TlsCertRef { cert_pem, key_pem }), Vec::new()))
+        }
+        (None, None, Some(listener_acme)) => {
+            let domains = acme::listener_domains(listener, listener_acme)?;
+            let plan = out.acme.get_or_insert_with(|| acme::AcmePlan {
+                settings: config.acme.clone(),
+                domains: BTreeSet::new(),
+            });
+            plan.domains.extend(domains.iter().cloned());
+            // The listener's own entry carries its hostname's certificate (or
+            // the first domain's, as the default for a hostname-less listener).
+            let hostname = listener.hostname.as_deref().unwrap_or_default();
+            let main = domains.iter().find(|d| *d == hostname).unwrap_or(&domains[0]);
+            let cert_ref = |domain: &str| {
+                acme::current_cert(&config.acme, domain)
+                    .map(|(cert_pem, key_pem)| portus_types::TlsCertRef { cert_pem, key_pem })
+            };
+            let extras = domains
+                .iter()
+                .filter(|d| *d != main)
+                .map(|domain| {
+                    Ok(portus_types::Listener {
+                        name: format!("{listener_name}-acme-{domain}"),
+                        port: listener.port,
+                        protocol: listener.protocol.to_uppercase(),
+                        hostname: domain.clone(),
+                        tls_cert_ref: Some(cert_ref(domain)?),
+                        ..Default::default()
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok((Some(cert_ref(main)?), extras))
+        }
+        _ => Err(format!(
+            "listener on port {}: tls needs either cert_file and key_file, or acme",
+            listener.port
+        )),
+    }
+}
+
+/// Convert a `StandaloneConfig` into a `portus_types::CompiledConfig`, with
+/// backend hostnames taken from `dns`.
+#[allow(deprecated)] // mirror_backend (field 21) must be explicitly None in the struct literal
+pub fn to_compiled_config(config: &StandaloneConfig, dns: &DnsTable) -> Result<Compiled, String> {
+    let mut out = Compiled {
+        config: portus_types::CompiledConfig {
+            schema_version: "1.0.0".to_string(),
+            version: 1,
+            ..Default::default()
+        },
+        acme: None,
+        read_files: Vec::new(),
+    };
+    let mut proto = std::mem::take(&mut out.config);
 
     // Track backend groups by service name to avoid duplicates.
     let mut backend_groups: HashMap<String, portus_types::BackendGroup> = HashMap::new();
@@ -381,15 +601,7 @@ pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::Com
         // Build proto Listener
         let listener_name = format!("standalone-{}-{}", listener.protocol.to_lowercase(), listener.port);
 
-        let tls_cert_ref = if let Some(ref tls) = listener.tls {
-            let cert_pem = std::fs::read_to_string(&tls.cert_file)
-                .map_err(|e| format!("failed to read TLS cert '{}': {}", tls.cert_file, e))?;
-            let key_pem = std::fs::read_to_string(&tls.key_file)
-                .map_err(|e| format!("failed to read TLS key '{}': {}", tls.key_file, e))?;
-            Some(portus_types::TlsCertRef { cert_pem, key_pem })
-        } else {
-            None
-        };
+        let (tls_cert_ref, acme_listeners) = listener_tls(listener, config, &listener_name, &mut out)?;
 
         proto.listeners.push(portus_types::Listener {
             name: listener_name.clone(),
@@ -403,6 +615,7 @@ pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::Com
             gateway_name: String::new(),
             client_validation: None,
         });
+        proto.listeners.extend(acme_listeners);
 
         // Build routes for this listener
         for route in &listener.routes {
@@ -428,51 +641,30 @@ pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::Com
                     .collect()
             };
 
-            // Build service name and backend group from backends
-            let service_name = if route.backends.is_empty() {
-                // Redirect-only routes have no backends
-                String::new()
-            } else {
-                let svc = synthetic_service_name(&route.backends);
-
-                // Parse the first backend to determine the port for the backend group
-                let first_addr = parse_backend_address(&route.backends[0].address)?;
-                let svc_port = first_addr.1;
-
-                if !backend_groups.contains_key(&svc) {
-                    let endpoints: Vec<portus_types::BackendEndpoint> = route
-                        .backends
-                        .iter()
-                        .map(|b| {
-                            let (host, port) = parse_backend_address(&b.address)?;
-                            Ok(portus_types::BackendEndpoint {
-                                address: host,
-                                port: port as u32,
-                            })
+            // Equal weights share one pool (per-endpoint health and outlier
+            // state); unequal weights get a pool per backend and a weighted
+            // split across them. Redirect-only routes have no backends.
+            let unequal_weights = route.backends.windows(2).any(|w| w[0].weight != w[1].weight);
+            let (service_name, route_port, weighted_backends) = if route.backends.is_empty() {
+                (String::new(), 0, Vec::new())
+            } else if unequal_weights {
+                let weighted = route
+                    .backends
+                    .iter()
+                    .map(|b| {
+                        let (service_name, port) = backend_group(std::slice::from_ref(b), dns, &mut backend_groups)?;
+                        Ok(portus_types::WeightedBackend {
+                            service_name,
+                            port,
+                            weight: b.weight,
+                            request_headers: None,
                         })
-                        .collect::<Result<Vec<_>, String>>()?;
-
-                    backend_groups.insert(
-                        svc.clone(),
-                        portus_types::BackendGroup {
-                            service_name: svc.clone(),
-                            port: svc_port as u32,
-                            endpoints,
-                            health_check: None,
-                            backend_tls: None,
-                        },
-                    );
-                }
-
-                svc
-            };
-
-            // Determine the port for the RouteConfig (first backend's port, or 0 for redirects)
-            let route_port = if route.backends.is_empty() {
-                0
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                (weighted[0].service_name.clone(), weighted[0].port, weighted)
             } else {
-                let (_, port) = parse_backend_address(&route.backends[0].address)?;
-                port as u32
+                let (service_name, port) = backend_group(&route.backends, dns, &mut backend_groups)?;
+                (service_name, port, Vec::new())
             };
 
             // Build header matches
@@ -563,30 +755,28 @@ pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::Com
                 .mirrors
                 .iter()
                 .filter_map(|m| {
-                    let (host, port) = match parse_backend_address(&m.address) {
+                    let (port, endpoints) = match backend_endpoints(&m.address, dns) {
                         Ok(v) => v,
                         Err(e) => {
                             warn!("invalid mirror address '{}': {}, skipping", m.address, e);
                             return None;
                         }
                     };
-                    let mirror_svc = format!("standalone-mirror-{}-{}", host, port);
+                    let host = parse_backend_address(&m.address).map(|(h, _)| h).unwrap_or_default();
+                    let mirror_svc = format!("standalone-mirror-{host}-{port}");
                     // Register a backend group for the mirror
                     backend_groups.entry(mirror_svc.clone()).or_insert_with(|| {
                         portus_types::BackendGroup {
                             service_name: mirror_svc.clone(),
-                            port: port as u32,
-                            endpoints: vec![portus_types::BackendEndpoint {
-                                address: host,
-                                port: port as u32,
-                            }],
+                            port: u32::from(port),
+                            endpoints,
                             health_check: None,
                             backend_tls: None,
                         }
                     });
                     Some(portus_types::MirrorBackend {
                         service_name: mirror_svc,
-                        port: port as u32,
+                        port: u32::from(port),
                         percent: m.percent,
                     })
                 })
@@ -647,7 +837,7 @@ pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::Com
                     upstream_tls: None,
                     grpc_match: None,
                     mirror_backend: None,
-                    weighted_backends: Vec::new(),
+                    weighted_backends: weighted_backends.clone(),
                                     gateway_namespace: String::new(),
                     gateway_name: String::new(),
                     ai_dialect: String::new(),
@@ -664,8 +854,10 @@ pub fn to_compiled_config(config: &StandaloneConfig) -> Result<portus_types::Com
     }
 
     proto.backends = backend_groups.into_values().collect();
-
-    Ok(proto)
+    proto.backends.sort_by(|a, b| a.service_name.cmp(&b.service_name));
+    acme::check_challenge_reachable(config, out.acme.as_ref())?;
+    out.config = proto;
+    Ok(out)
 }
 
 fn build_auth_config(auth: &Option<YamlAuth>) -> Option<portus_types::AuthConfig> {
@@ -713,125 +905,12 @@ fn build_header_mutation(mutation: &Option<YamlHeaderMutation>) -> Option<portus
 }
 
 // ---------------------------------------------------------------------------
-// Public API: load, apply, and watch
-// ---------------------------------------------------------------------------
-
-/// Parse a YAML config file, convert to `CompiledConfig`, validate, and apply.
-pub fn load_and_apply(path: &str, state: &ProxyState) -> Result<(), String> {
-    let yaml_str = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read config file '{}': {}", path, e))?;
-
-    let config: StandaloneConfig = serde_yaml_ng::from_str(&yaml_str)
-        .map_err(|e| format!("failed to parse YAML config '{}': {}", path, e))?;
-
-    let compiled = to_compiled_config(&config)?;
-
-    let warnings = validate_config(&compiled)?;
-    for w in &warnings {
-        warn!("config validation warning: {}", w);
-    }
-
-    apply_config(compiled, state);
-
-    info!(
-        "standalone config applied from '{}': {} listeners, {} routes",
-        path,
-        config.listeners.len(),
-        config.listeners.iter().map(|l| l.routes.len()).sum::<usize>(),
-    );
-
-    Ok(())
-}
-
-/// Watch a config file for changes and hot-reload on modification.
-///
-/// Uses the `notify` crate to watch the parent directory (handles atomic
-/// renames). Debounces events by 500ms to avoid rapid reloads.
-pub fn watch_config_file(path: &str, state: std::sync::Arc<ProxyState>) {
-    use notify::{RecursiveMode, Watcher};
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    let (tx, rx) = mpsc::channel();
-
-    let mut watcher = match notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-        match res {
-            Ok(event) => {
-                // Only reload on content-modifying events
-                use notify::EventKind;
-                match event.kind {
-                    EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
-                        let _ = tx.send(());
-                    }
-                    _ => {}
-                }
-            }
-            Err(e) => warn!("file watcher error: {}", e),
-        }
-    }) {
-        Ok(w) => w,
-        Err(e) => {
-            warn!("failed to create file watcher: {}, hot-reload disabled", e);
-            return;
-        }
-    };
-
-    // Watch the parent directory for atomic rename handling
-    let watch_path = std::path::Path::new(path);
-    let watch_dir = watch_path.parent().unwrap_or(std::path::Path::new("."));
-    if let Err(e) = watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
-        warn!(
-            "failed to watch directory '{}': {}, hot-reload disabled",
-            watch_dir.display(),
-            e
-        );
-        return;
-    }
-
-    info!("watching config file '{}' for changes", path);
-
-    let debounce = Duration::from_millis(500);
-    let mut last_reload = Instant::now() - debounce;
-
-    loop {
-        match rx.recv() {
-            Ok(()) => {
-                // Debounce: skip if last reload was too recent
-                if last_reload.elapsed() < debounce {
-                    // Drain any pending events
-                    while rx.try_recv().is_ok() {}
-                    continue;
-                }
-                // Small delay to let atomic writes complete
-                std::thread::sleep(Duration::from_millis(100));
-                // Drain any accumulated events
-                while rx.try_recv().is_ok() {}
-
-                info!("config file change detected, reloading '{}'", path);
-                match load_and_apply(path, &state) {
-                    Ok(()) => {
-                        last_reload = Instant::now();
-                        info!("config hot-reload successful");
-                    }
-                    Err(e) => {
-                        warn!("config hot-reload failed: {}, keeping previous config", e);
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("file watcher channel closed: {}, hot-reload disabled", e);
-                return;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::compile;
     use super::*;
 
     #[test]
@@ -1015,7 +1094,7 @@ listeners:
           - address: "10.0.0.1:8080"
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         assert_eq!(compiled.schema_version, "1.0.0");
         assert_eq!(compiled.version, 1);
@@ -1048,7 +1127,7 @@ listeners:
           - address: "10.0.0.1:8080"
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         // One RouteConfig per host
         assert_eq!(compiled.routes.len(), 2);
@@ -1068,7 +1147,7 @@ listeners:
           - address: "10.0.0.1:8080"
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
         assert_eq!(compiled.routes[0].host, "*");
     }
 
@@ -1082,7 +1161,7 @@ listeners:
           - address: "10.0.0.1:8080"
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
         assert_eq!(compiled.routes[0].host, "*");
         assert_eq!(compiled.routes[0].paths[0].path, "/");
         assert_eq!(compiled.routes[0].paths[0].match_type, "Prefix");
@@ -1151,7 +1230,7 @@ listeners:
           status_code: 301
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         assert_eq!(compiled.routes.len(), 1);
         assert!(compiled.routes[0].service_name.is_empty());
@@ -1174,7 +1253,7 @@ listeners:
           per_client: true
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let rl = compiled.routes[0].rate_limit.as_ref().unwrap();
         assert_eq!(rl.requests_per_second, 50);
@@ -1195,7 +1274,7 @@ listeners:
           timeout_secs: 60
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let cb = compiled.routes[0].circuit_breaker.as_ref().unwrap();
         assert_eq!(cb.failure_threshold, 10);
@@ -1218,7 +1297,7 @@ listeners:
               admin: "$2b$10$hash"
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let auth = compiled.routes[0].auth.as_ref().unwrap();
         match &auth.auth_type {
@@ -1245,7 +1324,7 @@ listeners:
             keys: ["key1", "key2"]
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let auth = compiled.routes[0].auth.as_ref().unwrap();
         match &auth.auth_type {
@@ -1273,7 +1352,7 @@ listeners:
           max_age: 3600
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let cors = compiled.routes[0].cors.as_ref().unwrap();
         assert_eq!(cors.allow_origins, vec!["https://app.example.com"]);
@@ -1295,7 +1374,7 @@ listeners:
           deny: ["10.0.0.99/32"]
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let ip = compiled.routes[0].ip_allowlist.as_ref().unwrap();
         assert_eq!(ip.allow_cidrs, vec!["10.0.0.0/8"]);
@@ -1316,7 +1395,7 @@ listeners:
           connect_ms: 5000
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let route = &compiled.routes[0];
         assert_eq!(route.request_timeout_ms, 30000);
@@ -1339,7 +1418,7 @@ listeners:
           codes: [502, 503]
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         assert_eq!(compiled.routes[0].max_retries, 3);
         assert_eq!(compiled.routes[0].retry_on, vec!["connect-failure", "5xx"]);
@@ -1363,7 +1442,7 @@ listeners:
             X-Served-By: portus
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let req = compiled.routes[0].request_headers.as_ref().unwrap();
         assert_eq!(req.add.get("X-Forwarded-By").unwrap(), "portus");
@@ -1386,7 +1465,7 @@ listeners:
             percent: 10
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         assert_eq!(compiled.routes[0].mirror_backends.len(), 1);
         assert_eq!(compiled.routes[0].mirror_backends[0].percent, 10);
@@ -1429,7 +1508,7 @@ listeners:
         );
 
         let config: StandaloneConfig = serde_yaml_ng::from_str(&yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let listener = &compiled.listeners[0];
         assert_eq!(listener.protocol, "HTTPS");
@@ -1458,7 +1537,7 @@ listeners:
           - address: "no-port-here"
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let result = to_compiled_config(&config);
+        let result = compile(&config);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("expected host:port"));
     }
@@ -1467,7 +1546,7 @@ listeners:
     fn test_empty_listeners() {
         let yaml = "listeners: []";
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
         assert!(compiled.routes.is_empty());
         assert!(compiled.backends.is_empty());
         assert!(compiled.listeners.is_empty());
@@ -1489,7 +1568,7 @@ listeners:
           - address: "10.0.0.2:9090"
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         assert_eq!(compiled.listeners.len(), 2);
         assert_eq!(compiled.routes.len(), 2);
@@ -1514,7 +1593,7 @@ listeners:
           hostname: internal.example.com
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let rw = compiled.routes[0].url_rewrite.as_ref().unwrap();
         assert_eq!(rw.path, "/v2");
@@ -1543,7 +1622,7 @@ listeners:
             value: json
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         let route = &compiled.routes[0];
         assert_eq!(route.method_match, "POST");
@@ -1606,10 +1685,244 @@ listeners:
           - address: "10.0.0.2:8080"
 "#;
         let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        let compiled = to_compiled_config(&config).unwrap();
+        let compiled = compile(&config).unwrap();
 
         // Both routes should share the same service name and backend group
         assert_eq!(compiled.routes[0].service_name, compiled.routes[1].service_name);
         assert_eq!(compiled.backends.len(), 1);
     }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use crate::config_receiver::{ProxyState, TlsCertSlot};
+    use crate::l4_proxy::L4Config;
+    use arc_swap::ArcSwap;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
+
+    pub(crate) fn proxy_state() -> Arc<ProxyState> {
+        let tls_cert: TlsCertSlot = Arc::new(ArcSwap::from_pointee(None));
+        Arc::new(ProxyState {
+            snapshot: Arc::new(ArcSwap::from_pointee(crate::router::ProxySnapshot::default())),
+            lbs: Arc::new(ArcSwap::from_pointee(Default::default())),
+            l4_config: Arc::new(ArcSwap::from_pointee(L4Config::default())),
+            tls_cert,
+            tls_cert_notify: Arc::new(tokio::sync::Notify::new()),
+            health_check_min_interval: Arc::new(AtomicU32::new(10)),
+        })
+    }
+
+    /// Compile with no DNS table (IP-literal backends only).
+    pub(crate) fn compile(config: &super::StandaloneConfig) -> Result<portus_types::CompiledConfig, String> {
+        super::to_compiled_config(config, &super::DnsTable::new()).map(|c| c.config)
+    }
+}
+
+/// Regression tests for standalone bugs found in the 2026-10-01 survey: each
+/// drives the YAML through `apply_config` and checks what the router sees.
+#[cfg(test)]
+mod pipeline_tests {
+    use super::test_support::{compile, proxy_state};
+    use super::*;
+    use crate::config_receiver::{apply_config, ProxyState};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn has_host(state: &ProxyState, port: u16, host: &str) -> bool {
+        state
+            .snapshot
+            .load()
+            .listeners_by_port
+            .get(&port)
+            .is_some_and(|buckets| buckets.iter().any(|b| b.exact.contains_key(host)))
+    }
+
+    /// Poll `cond` for up to `within`; file watchers deliver asynchronously.
+    fn eventually(within: Duration, cond: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        cond()
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("portus-standalone-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn route_yaml(host: &str) -> String {
+        format!(
+            "listeners:\n  - port: 80\n    routes:\n      - hosts: [\"{host}\"]\n        backends:\n          - address: \"127.0.0.1:9\"\n"
+        )
+    }
+
+    /// Bug: a backend named by DNS (`app:8080`, the docker-compose case) was
+    /// passed through as the endpoint address, failed `SocketAddr` parsing in
+    /// `build_lb_map_from_proto` and was dropped without a word: the route had
+    /// no pool.
+    #[test]
+    fn dns_named_backend_gets_a_pool() {
+        let state = proxy_state();
+        let config: StandaloneConfig = serde_yaml_ng::from_str(
+            "listeners:\n  - port: 80\n    routes:\n      - hosts: [\"app.example.com\"]\n        backends:\n          - address: \"localhost:8080\"\n",
+        )
+        .unwrap();
+        let dns = resolve_backend_hosts(&config, &DnsTable::new(), system_lookup);
+        let compiled = to_compiled_config(&config, &dns).unwrap().config;
+        let service = compiled.routes[0].service_name.clone();
+        apply_config(compiled, &state);
+
+        let snap = state.snapshot.load();
+        let pool = snap.lbs.get(&(Arc::from(service.as_str()), 8080)).expect("route has a pool");
+        assert!(pool
+            .endpoints()
+            .iter()
+            .all(|ep| ep.addr.ip().is_loopback() && ep.addr.port() == 8080));
+        assert!(!pool.is_empty());
+    }
+
+    /// Bug: `weight` was parsed and ignored; every backend shared one
+    /// round-robin pool, so `weight: 3` / `weight: 1` split traffic 50/50.
+    #[test]
+    fn backend_weights_reach_the_router() {
+        let state = proxy_state();
+        let config: StandaloneConfig = serde_yaml_ng::from_str(
+            "listeners:\n  - port: 80\n    routes:\n      - hosts: [\"api.example.com\"]\n        backends:\n          - address: \"10.0.1.1:8080\"\n            weight: 3\n          - address: \"10.0.1.2:8080\"\n            weight: 1\n",
+        )
+        .unwrap();
+        apply_config(compile(&config).unwrap(), &state);
+
+        let snap = state.snapshot.load();
+        let bucket = &snap.listeners_by_port[&80][0];
+        let route = bucket.exact["api.example.com"].catch_all.as_ref().or_else(|| bucket.exact["api.example.com"].rules.first()).unwrap();
+        let mut weights: Vec<u32> = route.weighted_backends.iter().map(|wb| wb.weight).collect();
+        weights.sort_unstable();
+        assert_eq!(weights, vec![1, 3]);
+        // Each weighted backend has its own pool holding exactly its address.
+        for wb in &route.weighted_backends {
+            let pool = &snap.lbs[&(Arc::clone(&wb.service_name), wb.port)];
+            assert_eq!(pool.endpoints().len(), 1);
+        }
+    }
+
+    /// Equal weights keep one shared pool (health and outlier state per
+    /// endpoint, no weighted split).
+    #[test]
+    fn equal_weights_keep_one_pool() {
+        let config: StandaloneConfig = serde_yaml_ng::from_str(
+            "listeners:\n  - port: 80\n    routes:\n      - backends:\n          - address: \"10.0.1.1:8080\"\n          - address: \"10.0.1.2:8080\"\n",
+        )
+        .unwrap();
+        let compiled = compile(&config).unwrap();
+        assert!(compiled.routes[0].weighted_backends.is_empty());
+        assert_eq!(compiled.backends.len(), 1);
+        assert_eq!(compiled.backends[0].endpoints.len(), 2);
+    }
+
+    /// Bug: an edit landing within 500 ms of the previous reload was drained
+    /// and never applied, so the proxy kept serving the older file until the
+    /// next unrelated edit.
+    #[test]
+    fn second_edit_right_after_a_reload_is_applied() {
+        let dir = temp_dir("debounce");
+        let path = dir.join("portus.yaml");
+        std::fs::write(&path, route_yaml("v1.example.com")).unwrap();
+        let state = proxy_state();
+        reload::start_with_lookup(path.to_str().unwrap(), state.clone(), system_lookup).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        std::fs::write(&path, route_yaml("v2.example.com")).unwrap();
+        assert!(eventually(Duration::from_secs(5), || has_host(&state, 80, "v2.example.com")));
+        std::fs::write(&path, route_yaml("v3.example.com")).unwrap();
+        assert!(
+            eventually(Duration::from_secs(5), || has_host(&state, 80, "v3.example.com")),
+            "the edit made right after a reload was lost"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bug: only the YAML's directory was watched, so a certificate renewed
+    /// in its own directory (certbot's `live/<domain>/`) was not served until
+    /// the YAML itself changed.
+    #[test]
+    fn renewed_cert_in_another_directory_is_reloaded() {
+        let dir = temp_dir("certwatch");
+        let conf_dir = dir.join("conf");
+        let cert_dir = dir.join("certs");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        std::fs::create_dir_all(&cert_dir).unwrap();
+        let (cert1, key1) = crate::tls::generate_self_signed_cert().unwrap();
+        std::fs::write(cert_dir.join("cert.pem"), &cert1).unwrap();
+        std::fs::write(cert_dir.join("key.pem"), &key1).unwrap();
+        let path = conf_dir.join("portus.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "listeners:\n  - port: 443\n    protocol: HTTPS\n    tls:\n      cert_file: {}\n      key_file: {}\n    routes:\n      - backends:\n          - address: \"127.0.0.1:9\"\n",
+                cert_dir.join("cert.pem").display(),
+                cert_dir.join("key.pem").display()
+            ),
+        )
+        .unwrap();
+        let state = proxy_state();
+        reload::start_with_lookup(path.to_str().unwrap(), state.clone(), system_lookup).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (cert2, key2) = crate::tls::generate_self_signed_cert().unwrap();
+        std::fs::write(cert_dir.join("key.pem"), &key2).unwrap();
+        std::fs::write(cert_dir.join("cert.pem"), &cert2).unwrap();
+        let served = |pem: &str| {
+            state.tls_cert.load().as_ref().as_ref().is_some_and(|d| d.entries.iter().any(|e| e.cert_pem == pem))
+        };
+        assert!(
+            eventually(Duration::from_secs(5), || served(&cert2)),
+            "renewed certificate was not picked up"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Found by the Pebble e2e run: a log file written next to the YAML
+    /// raised directory events, every reload logged, and the reloader
+    /// reapplied the config every 200 ms forever. Unrelated files changing in
+    /// the directory must not reapply an unchanged config.
+    #[test]
+    fn an_unchanged_config_is_not_reapplied() {
+        let dir = temp_dir("noloop");
+        let path = dir.join("portus.yaml");
+        std::fs::write(&path, route_yaml("still.example.com")).unwrap();
+        let state = proxy_state();
+        reload::start_with_lookup(path.to_str().unwrap(), state.clone(), system_lookup).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let applied = state.snapshot.load_full();
+        let log = dir.join("portus.log");
+        for i in 0..15 {
+            std::fs::write(&log, format!("line {i}\n")).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(Arc::ptr_eq(&applied, &state.snapshot.load_full()), "config was reapplied with no change");
+        // ...and a real edit still lands.
+        std::fs::write(&path, route_yaml("moved.example.com")).unwrap();
+        assert!(eventually(Duration::from_secs(5), || has_host(&state, 80, "moved.example.com")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
+    /// The example shipped in the repo must keep compiling as the schema grows.
+    #[test]
+    fn the_shipped_example_compiles() {
+        let yaml = include_str!("../../../../examples/standalone.yaml");
+        let config: StandaloneConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let compiled = compile(&config).unwrap();
+        crate::config_receiver::validate_config(&compiled).unwrap();
+        assert!(compiled.routes.iter().any(|r| r.host == "api.example.com" && r.weighted_backends.len() == 2));
+    }
+
 }

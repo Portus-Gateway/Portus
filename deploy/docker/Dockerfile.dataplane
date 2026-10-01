@@ -26,6 +26,8 @@ FROM scratch
 
 COPY --from=builder /out/portus-dataplane /dataplane
 COPY --from=builder --chown=1000:1000 /tmp /tmp
+# Trust roots for standalone ACME's connection to the CA (Let's Encrypt).
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 USER 1000
 

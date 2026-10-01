@@ -1,6 +1,6 @@
 [package]
 name = "portus-dataplane-core"
-version = "0.2.11"
+version = "0.2.12"
 edition = "2024"
 rust-version.workspace = true
 description = "Network-stack-independent core of the Portus data plane: config stream, route matching, policies, TLS material, L4/UDP proxies"
@@ -42,3 +42,4 @@ rcgen = "0.14"
 rand = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
+instant-acme = "0.8.5"

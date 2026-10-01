@@ -4,6 +4,24 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.2.12] - 2026-10-01
+
+Standalone mode (`PORTUS_CONFIG_FILE`) as a plain reverse proxy: [`docs/standalone.md`](docs/standalone.md).
+
+### Added
+
+- **ACME certificates in standalone mode.** `tls: { acme: { domains } }` on an HTTPS listener plus a top-level `acme: { email, directory, cache_dir, challenge, ca_file }` (Let's Encrypt by default). One certificate per domain, selected by SNI, proven over `http-01` (answered on every plain HTTP listener before routing) or `tls-alpn-01` (answered in the HTTPS handshake). A self-signed placeholder serves until the first issuance; renewal at two thirds of the lifetime; failed orders back off from 5 minutes to 4 hours. Account and certificates are cached on disk, so restarts order nothing. Kubernetes mode is unchanged: cert-manager's HTTP-01 solver still routes as an HTTPRoute, and HTTPS listeners do not offer `acme-tls/1`.
+- **Backends by DNS name** (`address: "app:8080"`). Every resolved address joins the pool, re-resolved every `dns_refresh_secs` (default 30). A failed lookup keeps the last addresses.
+- `tests/standalone/acme-pebble-e2e.sh`: the ACME flow against Pebble on both network stacks.
+- Crate versions follow the chart (0.2.12).
+
+### Fixed
+
+- A backend named by hostname was dropped without a warning: it produced no pool and its route returned 502. Unparseable endpoint addresses are now also logged in Kubernetes mode.
+- Backend `weight` was ignored, so `weight: 3` and `weight: 1` split traffic 50/50. Unequal weights now split traffic in that ratio.
+- Hot reload lost an edit made within 500 ms of the previous reload, and missed in-place writes on macOS (kqueue). The YAML is now watched by file and directory, with a trailing-edge debounce.
+- A renewed certificate in its own directory (certbot's `live/<domain>/`) was not served until the YAML changed. Every `cert_file` and `key_file` is now watched.
+
 ## [0.2.11] - 2026-09-25
 
 The first fleet's second list.

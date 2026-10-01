@@ -3030,6 +3030,7 @@ dependencies = [
  "log",
  "rustls 0.23.43",
  "rustls-native-certs 0.8.4",
+ "rustls-platform-verifier",
  "tokio",
  "tokio-rustls 0.26.5",
  "tower-service",
@@ -3244,6 +3245,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "instant-acme"
+version = "0.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f05ad37c421b962354c358d347d4a6130151df9407978372d3ad7f0c8f71a64"
+dependencies = [
+ "async-trait",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "bytes",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "http-body-util",
+ "httpdate",
+ "hyper 1.11.1",
+ "hyper-rustls 0.27.9",
+ "hyper-util",
+ "rcgen",
+ "rustls 0.23.43",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]
@@ -5098,7 +5125,7 @@ dependencies = [
 
 [[package]]
 name = "portus-controller"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "criterion 0.5.1",
  "dashmap 6.2.1",
@@ -5126,7 +5153,7 @@ dependencies = [
 
 [[package]]
 name = "portus-dataplane"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "arrayvec",
  "async-trait",
@@ -5158,7 +5185,7 @@ dependencies = [
 
 [[package]]
 name = "portus-dataplane-core"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -5168,6 +5195,7 @@ dependencies = [
  "dashmap 6.2.1",
  "hashbrown 0.17.1",
  "http 1.5.0",
+ "instant-acme",
  "ipnet",
  "jsonwebtoken",
  "log",
@@ -5196,7 +5224,7 @@ dependencies = [
 
 [[package]]
 name = "portus-ledger"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "axum",
  "env_logger",
@@ -5218,7 +5246,7 @@ dependencies = [
 
 [[package]]
 name = "portus-types"
-version = "0.2.11"
+version = "0.2.12"
 dependencies = [
  "prost",
  "prost-types",
@@ -6423,6 +6451,7 @@ version = "0.14.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
 dependencies = [
+ "aws-lc-rs",
  "pem 4.0.0",
  "ring",
  "rustls-pki-types",
@@ -8605,6 +8634,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
 dependencies = [
  "asn1-rs 0.7.2",
+ "aws-lc-rs",
  "data-encoding",
  "der-parser 10.0.0",
  "lazy_static",
