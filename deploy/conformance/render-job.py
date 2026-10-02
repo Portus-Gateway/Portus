@@ -4,6 +4,6 @@ import os
 import sys
 
 text = open(os.path.join(os.path.dirname(__file__), "job.yaml"), encoding="utf-8").read()
-for key in ("CONFORMANCE_IMAGE", "CONFORMANCE_RUN", "CONFORMANCE_TIMEOUT"):
+for key in ("CONFORMANCE_IMAGE", "CONFORMANCE_RUN", "CONFORMANCE_TIMEOUT", "CONFORMANCE_IMPL_VERSION"):
     text = text.replace("${%s}" % key, os.environ.get(key, ""))
 sys.stdout.write(text)
