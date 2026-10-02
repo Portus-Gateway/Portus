@@ -1,0 +1,1043 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Portus · API &amp; AI Gateway</title>
+<meta name="description" content="A fully conformant Kubernetes gateway, built in Rust for speed. It carries your HTTP, LLM and MCP traffic on one data plane.">
+<link rel="canonical" href="https://portus-gateway.dev/">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<meta name="theme-color" content="#07090d">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://portus-gateway.dev/">
+<meta property="og:title" content="Portus · API &amp; AI Gateway">
+<meta property="og:description" content="A fully conformant Kubernetes gateway, built in Rust for speed. It carries your HTTP, LLM and MCP traffic on one data plane.">
+<meta property="og:image" content="https://portus-gateway.dev/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Geist+Mono:wght@400;500;600&display=swap">
+<style>
+/* Layout: one dark harbour at night. A wide traffic band under the hero, then alternating
+   full-width chapters on a 1180px measure; one accent (the harbour light) used only for Portus. */
+:root {
+  --bg: #07090d;
+  --bg-2: #0b0f15;
+  --surface: #10151d;
+  --surface-2: #151b25;
+  --line: #1c2330;
+  --fg: #eef1f6;
+  --muted: #8b94a5;
+  --faint: #5b6474;
+  --beam: #ffb547;
+  --beam-2: #ffd89a;
+  --beam-ink: #1b1305;
+  --sea: #5cc8ff;
+  --rose: #ff7ab6;
+  --rival: #3f4858;
+  --good: #5ee0a0;
+  --glow: rgba(255, 181, 71, .18);
+  --nav: rgba(7, 9, 13, .72);
+  --display: "Geist", ui-sans-serif, -apple-system, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+  --body: "Geist", ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f6f7f9; --bg-2: #eef0f4; --surface: #ffffff; --surface-2: #f1f3f6; --line: #dfe3ea;
+    --fg: #0b0e14; --muted: #586072; --faint: #8b92a0;
+    --beam: #c96b00; --beam-2: #e8920f; --beam-ink: #ffffff;
+    --sea: #0a7fc0; --rose: #d1377f; --rival: #c3c9d3; --good: #12875a;
+    --glow: rgba(201, 107, 0, .12); --nav: rgba(246, 247, 249, .78);
+    color-scheme: light;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #f6f7f9; --bg-2: #eef0f4; --surface: #ffffff; --surface-2: #f1f3f6; --line: #dfe3ea;
+  --fg: #0b0e14; --muted: #586072; --faint: #8b92a0;
+  --beam: #c96b00; --beam-2: #e8920f; --beam-ink: #ffffff;
+  --sea: #0a7fc0; --rose: #d1377f; --rival: #c3c9d3; --good: #12875a;
+  --glow: rgba(201, 107, 0, .12); --nav: rgba(246, 247, 249, .78);
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; }
+img { max-width: 100%; }
+[hidden] { display: none !important; }
+html { scroll-behavior: smooth; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 400 17px/1.6 var(--body);
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+  overflow-x: hidden;
+}
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--beam); outline-offset: 3px; border-radius: 6px; }
+.wrap { max-width: 1180px; margin-inline: auto; padding-inline: max(16px, 4vw); }
+h1, h2, h3 { font-family: var(--display); text-wrap: balance; margin: 0; }
+p { margin: 0; }
+.eyebrow {
+  font: 500 12.5px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--beam);
+}
+.lit {
+  background: linear-gradient(100deg, var(--beam) 10%, var(--beam-2) 60%, var(--fg) 120%);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.num { font-variant-numeric: tabular-nums; }
+
+/* ---------- nav ---------- */
+.nav {
+  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20;
+  background: var(--nav); backdrop-filter: saturate(1.6) blur(18px); -webkit-backdrop-filter: saturate(1.6) blur(18px);
+  border-bottom: 1px solid var(--line);
+}
+.nav .wrap { display: flex; align-items: center; gap: 28px; height: 56px; }
+.brand { display: flex; align-items: center; gap: 10px; text-decoration: none; font: 650 17px/1 var(--display); letter-spacing: -.02em; }
+.brand svg { width: 22px; height: 22px; }
+.nav-links { display: flex; gap: 24px; margin-left: auto; font-size: 14px; color: var(--muted); }
+.nav-links a { text-decoration: none; transition: color .2s; }
+.nav-links a:hover { color: var(--fg); }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px; height: 40px; padding-inline: 18px;
+  border-radius: 999px; font: 550 14.5px/1 var(--body); text-decoration: none; cursor: pointer;
+  border: 1px solid var(--line); background: var(--surface); color: var(--fg);
+  transition: transform .2s, background .2s, border-color .2s;
+}
+.btn:hover { transform: translateY(-1px); border-color: var(--faint); }
+.btn.primary { background: var(--beam); border-color: var(--beam); color: var(--beam-ink); }
+.btn.primary:hover { background: var(--beam-2); border-color: var(--beam-2); }
+.btn.sm { height: 32px; padding-inline: 14px; font-size: 13.5px; }
+.btn svg { width: 16px; height: 16px; }
+@media (max-width: 760px) { .nav-links { display: none; } .nav .btn { margin-left: auto; } }
+
+/* ---------- hero ---------- */
+.hero { padding-block: clamp(56px, 9vw, 112px) 0; position: relative; }
+.hero::before {
+  content: ""; position: absolute; inset: -10% 0 auto; height: 620px; pointer-events: none;
+  background: radial-gradient(60% 55% at 70% 30%, var(--glow), transparent 70%);
+}
+.hero .wrap { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 28px; }
+.release {
+  justify-self: start; display: inline-flex; align-items: center; gap: 10px; text-decoration: none;
+  padding: 6px 14px 6px 6px; border-radius: 999px; border: 1px solid var(--line); background: var(--surface);
+  font-size: 13.5px; color: var(--muted); transition: border-color .2s;
+}
+.release:hover { border-color: var(--faint); }
+.release b { font: 600 11.5px/1 var(--mono); color: var(--beam-ink); background: var(--beam); padding: 5px 8px; border-radius: 999px; letter-spacing: .02em; }
+.hero h1 {
+  font-size: clamp(46px, 8.4vw, 112px); font-weight: 700; line-height: .94; letter-spacing: -.05em;
+  max-width: 12ch;
+}
+.lead { font-size: clamp(18px, 1.9vw, 22px); line-height: 1.5; color: var(--muted); max-width: 40ch; letter-spacing: -.01em; }
+.lead strong { color: var(--fg); font-weight: 550; }
+.hero-cta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.cmd {
+  display: flex; align-items: center; gap: 12px; min-width: 0; max-width: 100%;
+  height: 48px; padding-inline: 18px 6px; border-radius: 14px; background: var(--surface); border: 1px solid var(--line);
+  font: 450 14px/1 var(--mono);
+}
+.cmd code { overflow-x: auto; white-space: nowrap; scrollbar-width: none; min-width: 0; }
+.cmd code::-webkit-scrollbar { display: none; }
+.cmd .p { color: var(--beam); user-select: none; }
+.copy {
+  flex: none; height: 36px; padding-inline: 12px; border-radius: 10px; border: 0; cursor: pointer;
+  background: var(--surface-2); color: var(--muted); font: 500 12.5px/1 var(--mono); transition: color .2s, background .2s;
+}
+.copy:hover { color: var(--fg); }
+.copy.done { color: var(--good); }
+
+.band { position: relative; margin-top: clamp(28px, 4vw, 48px); }
+.band canvas { display: block; width: 100%; height: clamp(260px, 30vw, 380px); }
+.band-meta {
+  position: absolute; inset: auto 0 14px; pointer-events: none;
+}
+.band-meta .wrap { display: flex; justify-content: space-between; align-items: end; gap: 16px; flex-wrap: wrap; }
+.legend { display: flex; gap: 18px; font: 500 12px/1 var(--mono); color: var(--muted); letter-spacing: .04em; }
+.legend span { display: inline-flex; align-items: center; gap: 7px; }
+.legend i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
+.readout { font: 500 12px/1.4 var(--mono); color: var(--faint); text-align: right; }
+.readout b { color: var(--fg); font-weight: 500; }
+.lane-labels { position: absolute; inset: 14px 0 auto; pointer-events: none; }
+.lane-labels .wrap { display: grid; grid-template-columns: 1fr auto 1fr; font: 500 11px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--faint); }
+.lane-labels .wrap span:nth-child(2) { color: var(--beam); }
+.lane-labels .wrap span:last-child { text-align: right; }
+
+/* ---------- stats ---------- */
+.stats { border-block: 1px solid var(--line); background: var(--bg-2); }
+.stats .wrap { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.stat { padding: 34px 24px 30px 0; display: grid; gap: 6px; }
+.stat + .stat { padding-left: 24px; border-left: 1px solid var(--line); }
+.stat .v { font: 700 clamp(34px, 4.2vw, 52px)/1 var(--display); letter-spacing: -.045em; font-variant-numeric: tabular-nums; }
+.stat .v small { font-size: .5em; letter-spacing: -.02em; color: var(--muted); font-weight: 600; margin-left: 3px; }
+.stat .k { font-size: 14.5px; color: var(--muted); line-height: 1.4; }
+.stats .wrap.stats-note { display: block; font: 400 12px/1.4 var(--mono); color: var(--faint); padding-bottom: 18px; }
+@media (max-width: 860px) {
+  .stats .wrap { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat:nth-child(3) { border-left: 0; padding-left: 0; }
+  .stat:nth-child(n+3) { border-top: 1px solid var(--line); }
+}
+
+/* ---------- chapters ---------- */
+section.chapter { padding-block: clamp(80px, 11vw, 148px); }
+.head { display: grid; gap: 18px; max-width: 760px; margin-bottom: clamp(36px, 5vw, 64px); }
+.head h2 { font-size: clamp(36px, 5.4vw, 68px); font-weight: 700; line-height: 1; letter-spacing: -.045em; }
+.head p { font-size: clamp(17px, 1.6vw, 20px); color: var(--muted); max-width: 58ch; line-height: 1.55; }
+.head p code, .prose code { font: 450 .88em var(--mono); color: var(--fg); background: var(--surface-2); padding: 1px 6px; border-radius: 6px; }
+.textlink { color: var(--beam); text-decoration: none; font-weight: 550; white-space: nowrap; }
+.textlink:hover { text-decoration: underline; text-underline-offset: 4px; }
+
+/* conformance wall */
+.wall { display: grid; gap: 0; border-top: 1px solid var(--line); }
+.row { display: grid; grid-template-columns: 120px minmax(0, 1fr) 150px; gap: 24px; align-items: center; padding-block: 22px; border-bottom: 1px solid var(--line); }
+.row .name { font: 650 22px/1 var(--display); letter-spacing: -.03em; }
+.row .name small { display: block; margin-top: 6px; font: 500 11.5px/1 var(--mono); letter-spacing: .1em; color: var(--faint); text-transform: uppercase; }
+.dots { display: flex; flex-wrap: wrap; gap: 5px; }
+.dots i { width: 11px; height: 11px; border-radius: 3px; background: var(--beam); display: block; }
+.dots i.ext { background: transparent; box-shadow: inset 0 0 0 1.5px var(--beam); }
+.dots i.gap { width: 10px; background: transparent; box-shadow: none; }
+.wall.sweep .dots i:not(.gap) { animation: blink .9s ease both; animation-delay: calc(var(--i) * 4ms); }
+@keyframes blink { 0% { opacity: 1; transform: scale(1); } 30% { opacity: .15; transform: scale(.6); } 100% { opacity: 1; transform: scale(1); } }
+.row .score { text-align: right; font: 600 15px/1.5 var(--mono); font-variant-numeric: tabular-nums; }
+.row .score span { display: block; color: var(--faint); font-weight: 400; font-size: 12.5px; }
+.wall-key { display: flex; flex-wrap: wrap; gap: 22px; margin-top: 18px; font: 500 12.5px/1 var(--mono); color: var(--muted); align-items: center; }
+.wall-key i { width: 11px; height: 11px; border-radius: 3px; background: var(--beam); display: inline-block; vertical-align: -1px; margin-right: 8px; }
+.wall-key i.ext { background: transparent; box-shadow: inset 0 0 0 1.5px var(--beam); }
+.wall-key a { margin-left: auto; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 40px; }
+.chips span { font-size: 13.5px; padding: 7px 13px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); color: var(--muted); }
+@media (max-width: 760px) {
+  .row { grid-template-columns: minmax(0, 1fr) auto; gap: 14px 16px; }
+  .row .dots { grid-column: 1 / -1; grid-row: 2; }
+  .row .score { grid-row: 1; grid-column: 2; }
+  .dots i { width: 9px; height: 9px; }
+  .wall-key a { margin-left: 0; }
+}
+
+/* performance */
+.perf { background: var(--bg-2); border-block: 1px solid var(--line); }
+.perf-grid { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(0, 1fr); gap: 20px; }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: 22px; padding: clamp(20px, 3vw, 32px); min-width: 0; }
+.seg { display: inline-flex; padding: 3px; border-radius: 999px; background: var(--surface-2); border: 1px solid var(--line); gap: 2px; flex-wrap: wrap; }
+.seg button {
+  border: 0; background: transparent; color: var(--muted); font: 550 13.5px/1 var(--body); height: 32px; padding-inline: 14px;
+  border-radius: 999px; cursor: pointer; transition: background .25s, color .25s;
+}
+.seg button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+.controls { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; align-items: center; margin-bottom: 26px; }
+.bars { display: grid; gap: 22px; }
+.bar-row { display: grid; grid-template-columns: 92px minmax(0, 1fr) 64px; gap: 14px; align-items: center; }
+.bar-row .lbl { font: 500 13px/1.3 var(--mono); color: var(--muted); }
+.track { display: grid; gap: 6px; }
+.bar { position: relative; height: 26px; border-radius: 7px; background: var(--rival); width: 0; transition: width .9s cubic-bezier(.2, .8, .2, 1); min-width: 2px; }
+.bar.us { background: linear-gradient(90deg, var(--beam), var(--beam-2)); }
+.bar span { position: absolute; left: calc(100% + 10px); top: 50%; transform: translateY(-50%); font: 500 12.5px/1 var(--mono); white-space: nowrap; color: var(--muted); font-variant-numeric: tabular-nums; }
+.bar.us span { color: var(--fg); font-weight: 600; }
+.track { padding-right: 76px; }
+.delta { justify-self: end; font: 600 12.5px/1 var(--mono); padding: 6px 8px; border-radius: 8px; background: var(--glow); color: var(--beam); font-variant-numeric: tabular-nums; }
+.delta.neg { background: var(--surface-2); color: var(--muted); }
+.chart-foot { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line); font: 500 12.5px/1 var(--mono); color: var(--muted); }
+.chart-foot i { width: 10px; height: 10px; border-radius: 3px; display: inline-block; margin-right: 8px; vertical-align: -1px; background: var(--rival); }
+.chart-foot i.us { background: var(--beam); }
+.side { display: grid; gap: 20px; min-width: 0; }
+.mini h3 { font: 600 13px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 18px; }
+.mini .pair { display: grid; gap: 12px; }
+.mini .line { display: grid; grid-template-columns: 100px minmax(0, 1fr); align-items: baseline; gap: 12px; }
+.mini .who { font-size: 14px; color: var(--muted); }
+.mini .val { font: 700 30px/1 var(--display); letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
+.mini .val.us { color: var(--beam); }
+.mini .val.them { color: var(--muted); font-weight: 600; font-size: 22px; }
+.mini .val small { font-size: .55em; font-weight: 600; margin-left: 3px; letter-spacing: -.01em; }
+.method { margin-top: 28px; font-size: 14px; color: var(--faint); max-width: 90ch; line-height: 1.6; }
+.method a { color: var(--muted); }
+@media (max-width: 960px) { .perf-grid { grid-template-columns: minmax(0, 1fr); } .side { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); } }
+@media (max-width: 560px) { .bar-row { grid-template-columns: 64px minmax(0, 1fr) 56px; gap: 10px; } .track { padding-right: 64px; } .bar span { font-size: 11px; } }
+
+/* gateways */
+.tabs { display: flex; gap: 6px; margin-bottom: 28px; flex-wrap: wrap; }
+.tab {
+  border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer;
+  font: 600 15px/1 var(--display); letter-spacing: -.01em; height: 44px; padding-inline: 20px; border-radius: 999px;
+  display: inline-flex; align-items: center; gap: 10px; transition: all .25s;
+}
+.tab i { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.tab[aria-selected="true"] { background: var(--surface); color: var(--fg); border-color: var(--faint); }
+.gw { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr); gap: clamp(24px, 4vw, 56px); align-items: start; }
+.gw h3 { font-size: clamp(26px, 3vw, 36px); font-weight: 700; letter-spacing: -.035em; line-height: 1.1; margin-bottom: 22px; }
+.points { list-style: none; padding: 0; margin: 0; display: grid; gap: 18px; }
+.points li { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 12px; color: var(--muted); font-size: 16px; line-height: 1.55; }
+.points li::before { content: ""; width: 6px; height: 6px; border-radius: 50%; margin-top: 10px; background: var(--dot, var(--beam)); }
+.points b { color: var(--fg); font-weight: 600; }
+.points code { font: 450 .86em var(--mono); color: var(--fg); }
+.oneliner { margin-top: 28px; }
+.oneliner .lbl { font: 500 12px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--faint); margin-bottom: 10px; }
+@media (max-width: 900px) { .gw { grid-template-columns: minmax(0, 1fr); } }
+
+.code {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; min-width: 0;
+  box-shadow: 0 30px 80px -40px rgba(0, 0, 0, .55);
+}
+.code-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 10px 10px 18px; border-bottom: 1px solid var(--line); font: 500 12.5px/1 var(--mono); color: var(--muted); }
+.code pre { margin: 0; padding: 18px 20px 22px; overflow-x: auto; font: 450 13.5px/1.65 var(--mono); tab-size: 2; }
+.code pre code { font: inherit; }
+.y-k { color: var(--sea); }
+.y-c { color: var(--faint); font-style: italic; }
+.y-s { color: var(--beam-2); }
+.y-n { color: var(--rose); }
+.y-p { color: var(--faint); }
+
+/* principles */
+.rules { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; }
+.rule { padding: 30px 28px 32px; border-radius: 22px; background: var(--surface); border: 1px solid var(--line); display: grid; gap: 14px; align-content: start; }
+.rule svg { width: 44px; height: 44px; }
+.rule h3 { font-size: 23px; letter-spacing: -.03em; line-height: 1.15; font-weight: 650; }
+.rule p { color: var(--muted); font-size: 15.5px; line-height: 1.6; }
+.rule code { font: 450 .88em var(--mono); color: var(--fg); }
+@media (max-width: 900px) { .rules { grid-template-columns: minmax(0, 1fr); } }
+
+/* architecture */
+.arch { background: var(--bg-2); border-block: 1px solid var(--line); }
+.diagram { overflow-x: auto; border-radius: 22px; background: var(--surface); border: 1px solid var(--line); padding: clamp(14px, 3vw, 36px); }
+.diagram svg { display: block; width: 100%; min-width: 680px; height: auto; }
+.d-box { fill: var(--surface-2); stroke: var(--line); stroke-width: 1.2; }
+.d-box.hot { stroke: var(--beam); fill: var(--surface); }
+.d-t { fill: var(--fg); font: 650 16px var(--display); letter-spacing: -.01em; }
+.d-s { fill: var(--muted); font: 450 12px var(--mono); }
+.d-l { fill: var(--faint); font: 500 11px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+.d-wire { fill: none; stroke: var(--faint); stroke-width: 1.4; }
+.d-flow { fill: none; stroke: var(--beam); stroke-width: 1.8; stroke-dasharray: 3 9; stroke-linecap: round; animation: dash 1.2s linear infinite; }
+.d-flow.sea { stroke: var(--sea); animation-duration: 1.8s; }
+@keyframes dash { to { stroke-dashoffset: -24; } }
+.arch-notes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px; margin-top: 36px; }
+.arch-notes div { display: grid; gap: 8px; }
+.arch-notes h3 { font-size: 17px; letter-spacing: -.02em; font-weight: 650; }
+.arch-notes p { color: var(--muted); font-size: 15px; line-height: 1.6; }
+@media (max-width: 900px) { .arch-notes { grid-template-columns: minmax(0, 1fr); } }
+
+/* stacks + standalone */
+.duo { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
+.stack { padding: 32px; border-radius: 22px; border: 1px solid var(--line); background: var(--surface); display: grid; gap: 14px; align-content: start; }
+.stack.on { border-color: var(--beam); background: linear-gradient(160deg, var(--glow), transparent 55%), var(--surface); }
+.stack .tag { justify-self: start; font: 600 11.5px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; padding: 6px 9px; border-radius: 999px; background: var(--surface-2); color: var(--muted); }
+.stack.on .tag { background: var(--beam); color: var(--beam-ink); }
+.stack h3 { font-size: 30px; letter-spacing: -.04em; font-weight: 700; }
+.stack p { color: var(--muted); font-size: 15.5px; }
+.stack .figs { display: flex; gap: 28px; flex-wrap: wrap; margin-top: 6px; }
+.stack .figs b { display: block; font: 700 28px/1 var(--display); letter-spacing: -.04em; color: var(--fg); }
+.stack .figs span { font-size: 13px; color: var(--muted); }
+.stack code { font: 450 .88em var(--mono); color: var(--fg); }
+@media (max-width: 800px) { .duo { grid-template-columns: minmax(0, 1fr); } }
+
+.solo { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: clamp(24px, 5vw, 64px); align-items: center; }
+@media (max-width: 900px) { .solo { grid-template-columns: minmax(0, 1fr); } }
+
+/* final */
+.final { text-align: left; padding-block: clamp(90px, 12vw, 160px); position: relative; overflow: hidden; }
+.final::before { content: ""; position: absolute; inset: auto -10% -40% 30%; height: 600px; background: radial-gradient(50% 50% at 50% 50%, var(--glow), transparent 70%); pointer-events: none; }
+.final .wrap { position: relative; display: grid; gap: 30px; }
+.final h2 { font-size: clamp(42px, 7vw, 96px); font-weight: 700; letter-spacing: -.05em; line-height: .96; max-width: 14ch; }
+.final .code { max-width: 860px; }
+.final .row-btns { display: flex; gap: 12px; flex-wrap: wrap; }
+footer { border-top: 1px solid var(--line); padding-block: 28px 40px; color: var(--faint); font-size: 13.5px; }
+footer .wrap { display: flex; gap: 16px 28px; flex-wrap: wrap; align-items: center; }
+footer a { text-decoration: none; color: var(--muted); }
+footer a:hover { color: var(--fg); }
+footer .sp { margin-left: auto; font-family: var(--mono); font-size: 12.5px; }
+
+/* entrance */
+.rise { animation: rise .9s cubic-bezier(.2, .8, .2, 1) both; }
+.rise.d1 { animation-delay: .08s; } .rise.d2 { animation-delay: .16s; } .rise.d3 { animation-delay: .24s; }
+@keyframes rise { from { transform: translateY(14px); opacity: .001; } to { transform: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .rise, .wall.sweep .dots i, .d-flow { animation: none !important; }
+  .bar { transition: none; }
+  html { scroll-behavior: auto; }
+}
+</style>
+</head>
+<body>
+
+<nav class="nav" aria-label="Main">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="Portus home">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M4 21V9.5a8 8 0 0 1 16 0V21" stroke="var(--fg)" stroke-width="2.2" stroke-linecap="round"/>
+        <path d="M9 21v-9a3 3 0 0 1 6 0v9" stroke="var(--beam)" stroke-width="2.2" stroke-linecap="round"/>
+      </svg>
+      Portus
+    </a>
+    <div class="nav-links">
+      <a href="#conformance">Conformance</a>
+      <a href="#performance">Performance</a>
+      <a href="#gateways">Gateways</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#standalone">Standalone</a>
+    </div>
+    <a class="btn sm" href="https://github.com/Portus-Gateway/Portus">
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      GitHub
+    </a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <a class="release rise" href="https://github.com/Portus-Gateway/Portus/blob/main/CHANGELOG.md"><b>0.2.12</b> Standalone mode with ACME certificates</a>
+    <h1 class="rise d1">Portus <span class="lit">API &amp; AI Gateway</span></h1>
+    <p class="lead rise d2">A fully conformant Kubernetes gateway, built in Rust for speed. It carries your <strong>HTTP, LLM and MCP traffic</strong> on one data plane.</p>
+    <div class="hero-cta rise d3">
+      <div class="cmd"><span class="p">$</span><code id="cmd-hero">helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway</code><button class="copy" data-copy="cmd-hero" type="button">Copy</button></div>
+      <a class="btn" href="https://github.com/Portus-Gateway/Portus#quick-start">Quick start →</a>
+    </div>
+  </div>
+  <div class="band" aria-label="Animation: requests of three kinds pass through one Portus gateway to backend services">
+    <canvas id="harbour"></canvas>
+    <div class="lane-labels"><div class="wrap"><span>Clients</span><span>Portus</span><span>Your Services</span></div></div>
+    <div class="band-meta"><div class="wrap">
+      <div class="legend"><span><i style="background:var(--beam)"></i>HTTP · gRPC · TLS</span><span><i style="background:var(--sea)"></i>LLM</span><span><i style="background:var(--rose)"></i>MCP</span></div>
+      <div class="readout">measured <b>126,070 req/s</b> · p99 <b>0.35 ms</b> at 30k req/s</div>
+    </div></div>
+  </div>
+</header>
+
+<div class="stats">
+  <div class="wrap">
+    <div class="stat"><div class="v">130<small>/130</small></div><div class="k">Gateway API v1.6.2 conformance tests. No skips.</div></div>
+    <div class="stat"><div class="v">126k</div><div class="k">Requests per second through 3 proxy pods at 256 connections</div></div>
+    <div class="stat"><div class="v">0.35<small>ms</small></div><div class="k">p99 latency at a fixed 30,000 requests per second</div></div>
+    <div class="stat"><div class="v">131<small>Mi</small></div><div class="k">Peak proxy memory across the payload benchmarks</div></div>
+  </div>
+  <div class="wrap stats-note">Portus 0.2.3 on a 10-vCPU Linux VM on an Apple M4, medians of three interleaved rounds.</div>
+</div>
+
+<section class="chapter" id="conformance">
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">Conformance</span>
+      <h2>Every test. Every profile. No skips.</h2>
+      <p>Gateway API v1.6.2, experimental channel. The upstream suite runs in-cluster against a real per-Gateway deployment. Each square below is one passing result.</p>
+    </div>
+    <div class="wall" id="wall"></div>
+    <div class="wall-key">
+      <span><i></i>Core</span><span><i class="ext"></i>Extended</span>
+      <a class="textlink" href="https://github.com/Portus-Gateway/Portus#gateway-api">Conformance details →</a>
+    </div>
+    <div class="chips" aria-label="Extended features covered">
+      <span>Request mirroring</span><span>Path &amp; host rewrite</span><span>Header modification</span><span>H2C &amp; WebSocket backends</span><span>Method &amp; query matching</span><span>Request &amp; backend timeouts</span><span>HTTPRoute retry</span><span>CORS</span><span>ListenerSet</span><span>Listener isolation</span><span>BackendTLSPolicy with SAN validation</span><span>TLS terminate, passthrough &amp; mixed</span><span>Client certificate validation</span><span>TCPRoute</span><span>UDPRoute</span>
+    </div>
+  </div>
+</section>
+
+<section class="chapter perf" id="performance">
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">Performance</span>
+      <h2>Fast under load. Light on memory.</h2>
+      <p>Measured with the open <a class="textlink" href="https://github.com/howardjohn/gateway-api-bench">gateway-api-bench</a> method: three interleaved rounds on one machine, against the same backend pods as the top-ranked gateway in that benchmark. Every number and every round is published.</p>
+    </div>
+    <div class="perf-grid">
+      <div class="panel">
+        <div class="controls">
+          <div class="seg" role="group" aria-label="Benchmark">
+            <button type="button" id="v-traffic" aria-pressed="true" data-view="traffic">Throughput</button>
+            <button type="button" id="v-payload" aria-pressed="false" data-view="payload">Payloads</button>
+          </div>
+          <div class="seg" role="group" aria-label="Payload mode" id="modes" hidden>
+            <button type="button" id="m-dl" aria-pressed="true" data-mode="dl">Download</button>
+            <button type="button" id="m-ul" aria-pressed="false" data-mode="ul">Upload</button>
+            <button type="button" id="m-https" aria-pressed="false" data-mode="https">HTTPS</button>
+            <button type="button" id="m-h2" aria-pressed="false" data-mode="h2">HTTP/2</button>
+          </div>
+        </div>
+        <div class="bars" id="bars"></div>
+        <div class="chart-foot"><span><i class="us"></i>Portus 0.2.3</span><span><i></i>agentgateway v1.5.0</span><span id="chart-unit">requests per second, bare GET /</span></div>
+      </div>
+      <div class="side">
+        <div class="panel mini">
+          <h3>p99 at 30,000 req/s</h3>
+          <div class="pair">
+            <div class="line"><span class="who">Portus</span><span class="val us">0.35<small>ms</small></span></div>
+            <div class="line"><span class="who">agentgateway</span><span class="val them">0.82 ms</span></div>
+          </div>
+        </div>
+        <div class="panel mini">
+          <h3>Errors when 1 of 4 backends goes dark</h3>
+          <div class="pair">
+            <div class="line"><span class="who">Portus</span><span class="val us">0.025<small>%</small></span></div>
+            <div class="line"><span class="who">agentgateway</span><span class="val them">2.0 %</span></div>
+          </div>
+        </div>
+        <div class="panel mini">
+          <h3>Peak proxy memory</h3>
+          <div class="pair">
+            <div class="line"><span class="who">Portus</span><span class="val us">131<small>Mi</small></span></div>
+            <div class="line"><span class="who">agentgateway</span><span class="val them">383–456 Mi</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="method">Method: the howardjohn/gateway-api-bench approach on a 10-vCPU Linux VM on an Apple M4 (k3s, pods at MTU 65485), three interleaved rounds per gateway, fortio in-cluster with one pod per rung, 3 proxy pods each. Medians shown. Numbers from one machine are only comparable with each other. Failover figures come from the gateway-api-bench suite on Docker Desktop with no retry policy; with a <code>RetryPolicy</code> Portus returns 0 errors. <a href="https://github.com/Portus-Gateway/Portus/tree/main/benchmarks">Every round, including the tests agentgateway wins →</a></p>
+  </div>
+</section>
+
+<section class="chapter" id="gateways">
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">One data plane</span>
+      <h2>Three gateways. One install.</h2>
+      <p>Kubernetes routes, LLM providers and MCP tool servers sit behind the same Gateway, under the same policies, in the same Rust process.</p>
+    </div>
+    <div class="tabs" role="tablist" aria-label="Gateways">
+      <button class="tab" role="tab" id="t-api" aria-selected="true" aria-controls="p-api"><i style="background:var(--beam)"></i>Gateway API</button>
+      <button class="tab" role="tab" id="t-ai" aria-selected="false" aria-controls="p-ai"><i style="background:var(--sea)"></i>AI gateway</button>
+      <button class="tab" role="tab" id="t-mcp" aria-selected="false" aria-controls="p-mcp"><i style="background:var(--rose)"></i>MCP gateway</button>
+    </div>
+
+    <div class="gw" role="tabpanel" id="p-api" aria-labelledby="t-api">
+      <div>
+        <h3>The whole Gateway API, compiled straight to protobuf.</h3>
+        <ul class="points">
+          <li><span><b>Every route kind.</b> HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute, ListenerSet and BackendTLSPolicy.</span></li>
+          <li><span><b>A data plane per Gateway.</b> Each Gateway gets its own Deployment, Service and PodDisruptionBudget, with its address in <code>status.addresses</code>.</span></li>
+          <li><span><b>Twelve policy CRDs.</b> Timeouts, retries, rate limits, circuit breakers, health checks, CORS, IP allow lists, body limits, Basic and API-key auth.</span></li>
+          <li><span><b>No intermediate config language.</b> The controller compiles your CRDs into one protobuf message and streams each Gateway its slice.</span></li>
+        </ul>
+      </div>
+      <div class="code">
+        <div class="code-bar"><span>gateway.yaml</span><button class="copy" type="button" data-copy="y-api">Copy</button></div>
+        <pre><code data-lang="yaml" id="y-api">apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+spec:
+  gatewayClassName: portus-gateway
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-route
+spec:
+  parentRefs:
+  - name: my-gateway
+  hostnames: ["app.example.com"]
+  rules:
+  - backendRefs:
+    - name: my-service
+      port: 8080</code></pre>
+      </div>
+    </div>
+
+    <div class="gw" role="tabpanel" id="p-ai" aria-labelledby="t-ai" hidden style="--dot: var(--sea)">
+      <div>
+        <h3>Put every LLM call behind your own keys and budgets.</h3>
+        <ul class="points">
+          <li><span><b>Routes on the request body.</b> A streaming JSON scanner reads <code>model</code> and <code>stream</code> as bytes arrive, then replays them to the provider unchanged.</span></li>
+          <li><span><b>Your keys, not theirs.</b> The ledger issues <code>portus_sk_…</code> keys and stores only hashes. The provider's key never leaves the cluster.</span></li>
+          <li><span><b>Token budgets that hold.</b> Per key, user, tenant or route, reserved before the call and settled after. Every response carries <code>x-portus-tokens-remaining</code>.</span></li>
+          <li><span><b>Anthropic and OpenAI dialects.</b> Tokens are metered from JSON and streamed responses, and refusals come back in the provider's own error shape.</span></li>
+        </ul>
+        <div class="oneliner">
+          <div class="lbl">Claude Code works unchanged</div>
+          <div class="cmd"><span class="p">$</span><code id="cmd-cc">ANTHROPIC_BASE_URL=https://llm.example.com ANTHROPIC_API_KEY=portus_sk_… claude</code><button class="copy" data-copy="cmd-cc" type="button">Copy</button></div>
+        </div>
+      </div>
+      <div class="code">
+        <div class="code-bar"><span>ai-gateway.yaml</span><button class="copy" type="button" data-copy="y-ai">Copy</button></div>
+        <pre><code data-lang="yaml" id="y-ai">apiVersion: portus-gateway.dev/v1alpha1
+kind: AIProvider
+metadata: {name: anthropic}
+spec:
+  kind: anthropic
+  url: https://api.anthropic.com
+  credential: {secretRef: {name: anthropic-key}}
+---
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIRoute
+metadata: {name: claude}
+spec:
+  parentRefs: [{name: gateway}]
+  hostnames: [llm.example.com]
+  requireApiKey: true
+  rules:
+  - matches:
+    - model: {type: Prefix, value: claude-}
+    providerRefs: [{name: anthropic}]
+---
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIUsagePolicy
+metadata: {name: daily-cap}
+spec:
+  targetRef: {group: portus-gateway.dev, kind: AIRoute, name: claude}
+  budget: {tokens: 1000000, window: Daily, per: Key}</code></pre>
+      </div>
+    </div>
+
+    <div class="gw" role="tabpanel" id="p-mcp" aria-labelledby="t-mcp" hidden style="--dot: var(--rose)">
+      <div>
+        <h3>One endpoint for every tool server your agents use.</h3>
+        <ul class="points">
+          <li><span><b>Routes on the tool.</b> Match the JSON-RPC <code>method</code> and the tool a <code>tools/call</code> names, so <code>github.*</code> lives on one server and the rest elsewhere.</span></li>
+          <li><span><b>Federation.</b> Several servers appear as one, with tools named <code>&lt;server&gt;.&lt;tool&gt;</code>. No gateway pod holds session state.</span></li>
+          <li><span><b>OAuth from your issuer.</b> Bearer tokens from dex or any OIDC issuer are verified locally. Groups become tenants and scopes can gate tools.</span></li>
+          <li><span><b>Allow lists and call budgets per key.</b> Refusals arrive as JSON-RPC errors, so clients keep their session.</span></li>
+        </ul>
+        <div class="oneliner">
+          <div class="lbl">Add it to Claude Code</div>
+          <div class="cmd"><span class="p">$</span><code id="cmd-mcp">claude mcp add --transport http github https://mcp.example.com/mcp</code><button class="copy" data-copy="cmd-mcp" type="button">Copy</button></div>
+        </div>
+      </div>
+      <div class="code">
+        <div class="code-bar"><span>mcp-gateway.yaml</span><button class="copy" type="button" data-copy="y-mcp">Copy</button></div>
+        <pre><code data-lang="yaml" id="y-mcp">apiVersion: portus-gateway.dev/v1alpha1
+kind: AIProvider
+metadata: {name: github-mcp}
+spec:
+  kind: mcp
+  url: http://github-mcp.tools.svc.cluster.local:3001
+---
+apiVersion: portus-gateway.dev/v1alpha1
+kind: AIRoute
+metadata: {name: mcp}
+spec:
+  parentRefs: [{name: gateway}]
+  hostnames: [mcp.example.com]
+  requireApiKey: true
+  auth:
+    jwt: {issuer: https://dex.example.com, audience: portus}
+  rules:
+  - matches:
+    - method: {type: Exact, value: tools/call}
+      tool: {type: Prefix, value: github.}
+    providerRefs: [{name: github-mcp}]</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="chapter" style="padding-top:0">
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">Design</span>
+      <h2>Built so the hot path stays hot.</h2>
+    </div>
+    <div class="rules">
+      <div class="rule">
+        <svg viewBox="0 0 44 44" fill="none" aria-hidden="true"><rect x="1" y="1" width="42" height="42" rx="12" stroke="var(--line)" stroke-width="1.5"/><path d="M10 22h24" stroke="var(--beam)" stroke-width="2.4" stroke-linecap="round"/><path d="M28 16l6 6-6 6" stroke="var(--beam)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/><circle cx="16" cy="13" r="2.4" fill="var(--faint)"/><circle cx="22" cy="31" r="2.4" fill="var(--faint)"/></svg>
+        <h3>Nothing on the request path.</h3>
+        <p>Keys, budgets and token checks are local lookups against state the ledger pushes in. A request never waits on another service.</p>
+      </div>
+      <div class="rule">
+        <svg viewBox="0 0 44 44" fill="none" aria-hidden="true"><rect x="1" y="1" width="42" height="42" rx="12" stroke="var(--line)" stroke-width="1.5"/><path d="M30 15a10 10 0 1 0 2.5 9" stroke="var(--beam)" stroke-width="2.4" stroke-linecap="round"/><path d="M31 9v6.5h-6.5" stroke="var(--beam)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <h3>Reloads never drop a connection.</h3>
+        <p>Config arrives over mTLS gRPC and swaps atomically. Each data plane acknowledges the fingerprint it applied, and that drives the Gateway's <code>Programmed</code> condition.</p>
+      </div>
+      <div class="rule">
+        <svg viewBox="0 0 44 44" fill="none" aria-hidden="true"><rect x="1" y="1" width="42" height="42" rx="12" stroke="var(--line)" stroke-width="1.5"/><rect x="11" y="11" width="22" height="9" rx="3" stroke="var(--beam)" stroke-width="2.2"/><rect x="11" y="24" width="10" height="9" rx="3" stroke="var(--faint)" stroke-width="2"/><rect x="23" y="24" width="10" height="9" rx="3" stroke="var(--faint)" stroke-width="2"/></svg>
+        <h3>The network stack is a plug-in.</h3>
+        <p>Routing, policies, TLS and the AI logic live in a stack-independent core. That let us measure two engines side by side and ship the faster one.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="chapter arch" id="architecture">
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">Architecture</span>
+      <h2>From CRD to wire in one compile.</h2>
+      <p>Reconcilers feed a shared store, the store compiles to a <code>CompiledConfig</code> protobuf, and each data plane receives only its own Gateway's slice.</p>
+    </div>
+    <div class="diagram">
+      <svg viewBox="0 0 960 470" role="img" aria-label="Kubernetes API is watched by portus-controller, which streams config over mTLS gRPC to three data planes; portus-ledger syncs keys and budgets with the data planes; data planes forward to your Services.">
+        <rect class="d-box" x="290" y="14" width="380" height="96" rx="16"/>
+        <text class="d-l" x="312" y="42">Kubernetes API</text>
+        <text class="d-s" x="312" y="70">Gateway · HTTPRoute · GRPCRoute · TLSRoute</text>
+        <text class="d-s" x="312" y="90">TCPRoute · UDPRoute · AIRoute · AIProvider</text>
+
+        <path class="d-wire" d="M480 110V160"/>
+        <path class="d-flow" d="M480 110V160"/>
+        <text class="d-l" x="492" y="140">watch</text>
+
+        <rect class="d-box hot" x="290" y="160" width="380" height="92" rx="16"/>
+        <text class="d-t" x="312" y="196">portus-controller</text>
+        <text class="d-s" x="312" y="224">reconcilers → ConfigStore → CompiledConfig</text>
+
+        <rect class="d-box" x="730" y="160" width="210" height="92" rx="16"/>
+        <text class="d-t" x="752" y="196">portus-ledger</text>
+        <text class="d-s" x="752" y="224">keys · budgets · usage</text>
+
+        <path class="d-wire" d="M480 252V296H190V340M480 296V340M480 296H770V340"/>
+        <path class="d-flow" d="M480 252V296H190V340M480 296V340M480 296H770V340"/>
+        <text class="d-l" x="492" y="285">gRPC stream · mTLS</text>
+
+        <path class="d-wire" d="M900 252V380H870"/>
+        <path class="d-flow sea" d="M900 252V380H870"/>
+        <text class="d-l" x="912" y="320" transform="rotate(90 912 320)" text-anchor="middle">snapshots · usage</text>
+
+        <rect class="d-box hot" x="90" y="340" width="200" height="80" rx="16"/>
+        <text class="d-t" x="112" y="374">dataplane</text>
+        <text class="d-s" x="112" y="400">Gateway A · rama</text>
+        <rect class="d-box hot" x="380" y="340" width="200" height="80" rx="16"/>
+        <text class="d-t" x="402" y="374">dataplane</text>
+        <text class="d-s" x="402" y="400">Gateway B · rama</text>
+        <rect class="d-box hot" x="670" y="340" width="200" height="80" rx="16"/>
+        <text class="d-t" x="692" y="374">dataplane</text>
+        <text class="d-s" x="692" y="400">Gateway C · pingora</text>
+
+        <path class="d-wire" d="M190 420V452M480 420V452M770 420V452"/>
+        <text class="d-l" x="200" y="450">your services</text>
+        <text class="d-l" x="490" y="450">your services</text>
+        <text class="d-l" x="780" y="450">your services</text>
+      </svg>
+    </div>
+    <div class="arch-notes">
+      <div><h3>Controller</h3><p>Watches Gateway API and Portus CRDs with kube-rs, provisions a data plane per Gateway, and recompiles on any change. Reconcilers publish events to each other instead of polling.</p></div>
+      <div><h3>Data plane</h3><p>Builds route maps keyed by port and hostname with full Gateway API precedence. Failing endpoints are ejected passively and readmitted with back-off. SIGTERM drains in-flight requests.</p></div>
+      <div><h3>Ledger</h3><p>Opt-in with the AI gateway. Issues keys, keeps budgets as a shared counter synced every second, stores usage, and fetches OAuth issuers' signing keys. It never sits on the request path.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="chapter" id="stacks">
+  <div class="wrap">
+    <div class="head">
+      <span class="eyebrow">Network stack</span>
+      <h2>We tested two engines. Rama won.</h2>
+      <p>Everything Portus decides lives in a core that knows nothing about the proxy framework underneath. So we ran the same gateway on Rama and on Pingora, on the same machine, and measured. Rama was faster on every payload rung and used 2–2.6× less memory, so it became the default in 0.2.4.</p>
+    </div>
+    <div class="duo">
+      <div class="stack on">
+        <span class="tag">Default since 0.2.4</span>
+        <h3>Rama 0.4</h3>
+        <p>Used unpatched, with Portus's own upstream connection pool. 130/130 conformance, and the AI and MCP gateways run on it.</p>
+        <div class="figs"><div><b>+3–31 %</b><span>throughput vs Pingora, every rung</span></div><div><b>2–2.6×</b><span>less memory</span></div></div>
+      </div>
+      <div class="stack">
+        <span class="tag">Default until 0.2.3</span>
+        <h3>Pingora 0.9</h3>
+        <p>Cloudflare's proxy framework carried Portus through its first releases and the benchmarks above. Rama measured faster than it on every payload rung.</p>
+      </div>
+    </div>
+    <p class="method">Rama against Pingora: a single round on the same machine, 2026-09-15. A three-round comparison ships with the next release's numbers.</p>
+  </div>
+</section>
+
+<section class="chapter arch" id="standalone">
+  <div class="wrap solo">
+    <div class="head" style="margin-bottom:0">
+      <span class="eyebrow">Standalone</span>
+      <h2>No cluster? Still Portus.</h2>
+      <p>Point the data plane at one YAML file and it runs as a plain reverse proxy, with the same routing, policies and TLS it runs in Kubernetes.</p>
+      <ul class="points">
+        <li><span><b>ACME built in.</b> Let's Encrypt certificates over <code>http-01</code> or <code>tls-alpn-01</code>, renewed at two thirds of their lifetime.</span></li>
+        <li><span><b>Hot reload.</b> Edit the YAML or renew a certificate and the change applies without a restart or a dropped connection.</span></li>
+        <li><span><b>Backends by name.</b> Docker Compose services and VM hostnames, re-resolved every 30 seconds.</span></li>
+      </ul>
+    </div>
+    <div class="code">
+      <div class="code-bar"><span>PORTUS_CONFIG_FILE=portus.yaml portus-dataplane</span><button class="copy" type="button" data-copy="y-solo">Copy</button></div>
+      <pre><code data-lang="yaml" id="y-solo">acme:
+  email: ops@example.com
+  cache_dir: /var/lib/portus/acme
+  challenge: http-01
+
+listeners:
+  - port: 80
+    protocol: HTTP
+    routes:
+      - hosts: ["secure.example.com"]
+        redirect: {scheme: https, status_code: 301}
+
+  - port: 443
+    protocol: HTTPS
+    tls:
+      acme:
+        domains: ["secure.example.com"]
+    routes:
+      - hosts: ["secure.example.com"]
+        backends:
+          - address: "web:8080"   # compose service
+            weight: 3
+          - address: "10.0.1.2:8080"
+            weight: 1</code></pre>
+    </div>
+  </div>
+</section>
+
+<section class="final">
+  <div class="wrap">
+    <span class="eyebrow">Get started</span>
+    <h2>Two commands to a <span class="lit">conformant gateway.</span></h2>
+    <div class="code">
+      <div class="code-bar"><span>Kubernetes 1.32+ · Helm 3.8+ · amd64 &amp; arm64</span><button class="copy" type="button" data-copy="sh-install">Copy</button></div>
+      <pre><code data-lang="sh" id="sh-install"># Gateway API CRDs, experimental channel
+kubectl apply --server-side --force-conflicts \
+  -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
+
+# Portus: controller, GatewayClass, policy CRDs, mTLS material
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.12 \
+  --namespace portus --create-namespace</code></pre>
+    </div>
+    <div class="row-btns">
+      <a class="btn primary" href="https://github.com/Portus-Gateway/Portus">Star on GitHub</a>
+      <a class="btn" href="https://github.com/Portus-Gateway/Portus/tree/main/docs">Read the docs</a>
+      <a class="btn" href="https://github.com/Portus-Gateway/Portus/blob/main/docs/ai-gateway.md">AI gateway guide</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>Portus · Apache-2.0 · Rust 1.98+</span>
+    <a href="https://github.com/Portus-Gateway/Portus/blob/main/CHANGELOG.md">Changelog</a>
+    <a href="https://github.com/Portus-Gateway/Portus/blob/main/SECURITY.md">Security</a>
+    <a href="https://github.com/Portus-Gateway/Portus/tree/main/benchmarks">Benchmarks</a>
+    <a href="https://github.com/Portus-Gateway/Portus/blob/main/CONTRIBUTING.md">Contributing</a>
+    <span class="sp">portus-gateway.dev</span>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  /* ---------- syntax colouring ---------- */
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const val = (s) => esc(s)
+    .replace(/(&quot;|")([^"]*)\1/g, '<span class="y-s">"$2"</span>')
+    .replace(/\b(\d+)\b(?![^<]*<\/span>)/g, '<span class="y-n">$1</span>')
+    .replace(/([{}\[\],])/g, '<span class="y-p">$1</span>');
+  const yamlLine = (line) => {
+    let comment = '';
+    const ci = line.search(/(^|\s)#/);
+    if (ci >= 0) { comment = '<span class="y-c">' + esc(line.slice(ci)) + '</span>'; line = line.slice(0, ci); }
+    if (/^---\s*$/.test(line)) return '<span class="y-p">---</span>' + comment;
+    const m = line.match(/^(\s*(?:- )?)([A-Za-z_][\w.-]*)(:)(.*)$/);
+    if (!m) return val(line) + comment;
+    const rest = m[4].replace(/([{,]\s*)([A-Za-z_][\w]*)(:)/g, '$1\u0001$2\u0002$3');
+    return esc(m[1]) + '<span class="y-k">' + m[2] + '</span>' + m[3] +
+      val(rest).replace(/\u0001/g, '<span class="y-k">').replace(/\u0002/g, '</span>') + comment;
+  };
+  const shLine = (line) => {
+    if (/^\s*#/.test(line)) return '<span class="y-c">' + esc(line) + '</span>';
+    return esc(line).replace(/^(\s*)(kubectl|helm)\b/, '$1<span class="y-k">$2</span>')
+      .replace(/(\s)(--?[\w-]+)/g, '$1<span class="y-n">$2</span>');
+  };
+  document.querySelectorAll('code[data-lang]').forEach((el) => {
+    const fn = el.dataset.lang === 'yaml' ? yamlLine : shLine;
+    el.dataset.raw = el.textContent;
+    el.innerHTML = el.textContent.split('\n').map(fn).join('\n');
+  });
+
+  /* ---------- copy buttons ---------- */
+  document.querySelectorAll('.copy').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const el = document.getElementById(btn.dataset.copy);
+      const text = el.dataset.raw || el.textContent;
+      const done = () => { btn.textContent = 'Copied'; btn.classList.add('done'); setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('done'); }, 1600); };
+      const select = () => { const r = document.createRange(); r.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(r); btn.textContent = 'Press ⌘C'; };
+      try { navigator.clipboard.writeText(text).then(done, select); } catch (e) { select(); }
+    });
+  });
+
+  /* ---------- conformance wall ---------- */
+  const profiles = [
+    ['HTTP', 37, 56], ['GRPC', 15, 9], ['TLS', 20, 14], ['TCP', 19, 9], ['UDP', 20, 9],
+  ];
+  const wall = document.getElementById('wall');
+  let idx = 0;
+  wall.innerHTML = profiles.map(([name, core, ext]) => {
+    let dots = '';
+    for (let i = 0; i < core; i++) dots += `<i style="--i:${idx++}"></i>`;
+    dots += '<i class="gap"></i>';
+    for (let i = 0; i < ext; i++) dots += `<i class="ext" style="--i:${idx++}"></i>`;
+    return `<div class="row"><div class="name">${name}<small>profile</small></div><div class="dots" aria-label="${core} core and ${ext} extended tests passing">${dots}</div><div class="score">${core + ext}/${core + ext}<span>${core} core · ${ext} ext</span></div></div>`;
+  }).join('');
+  if (!reduce && 'IntersectionObserver' in window) {
+    new IntersectionObserver((es, o) => es.forEach((e) => { if (e.isIntersecting) { wall.classList.add('sweep'); o.disconnect(); } }), { threshold: .35 }).observe(wall);
+  }
+
+  /* ---------- benchmark chart ---------- */
+  const data = {
+    traffic: { unit: 'requests per second, bare GET /', rows: [['64 conns', 116429, 96003], ['128 conns', 123105, 101067], ['256 conns', 126070, 89827]] },
+    dl:    { unit: 'requests per second, 64 connections', rows: [['1 KB', 87722, 67598], ['16 KB', 59257, 51562], ['128 KB', 29954, 27136], ['1 MiB', 5206, 5633]] },
+    ul:    { unit: 'requests per second, POST echoed, 64 connections', rows: [['1 KB', 66089, 58495], ['16 KB', 29578, 27940], ['128 KB', 8160, 7922], ['1 MiB', 4380, 4249]] },
+    https: { unit: 'requests per second, TLS, 64 connections', rows: [['1 KB', 76997, 60088], ['16 KB', 56831, 48295], ['128 KB', 25357, 22294], ['1 MiB', 4200, 4110]] },
+    h2:    { unit: 'requests per second, HTTP/2, 64 connections', rows: [['1 KB', 64172, 49453], ['16 KB', 49448, 40279], ['128 KB', 22431, 19641], ['1 MiB', 4173, 3538]] },
+  };
+  const bars = document.getElementById('bars');
+  const unit = document.getElementById('chart-unit');
+  const fmt = (n) => n.toLocaleString('en-US');
+  let view = 'traffic', mode = 'dl';
+  const render = () => {
+    const d = data[view === 'traffic' ? 'traffic' : mode];
+    unit.textContent = d.unit;
+    // payload rungs span 20x, so each row scales to its own pair; throughput shares one axis
+    const shared = view === 'traffic' ? Math.max(...d.rows.flatMap((r) => [r[1], r[2]])) : 0;
+    const html = d.rows.map(([lbl, us, them]) => {
+      const max = shared || Math.max(us, them);
+      const pct = Math.round((us / them - 1) * 100);
+      const sign = pct > 0 ? '+' : pct < 0 ? '−' : '±';
+      return `<div class="bar-row"><div class="lbl">${lbl}</div><div class="track">
+        <div class="bar us" data-w="${(us / max) * 100}"><span>${fmt(us)}</span></div>
+        <div class="bar" data-w="${(them / max) * 100}"><span>${fmt(them)}</span></div>
+      </div><div class="delta ${pct < 0 ? 'neg' : ''}">${sign}${Math.abs(pct)} %</div></div>`;
+    }).join('');
+    bars.innerHTML = html;
+    const apply = () => bars.querySelectorAll('.bar').forEach((b) => { b.style.width = b.dataset.w + '%'; });
+    if (reduce) apply(); else requestAnimationFrame(() => requestAnimationFrame(apply));
+  };
+  const setPressed = (sel, attr, v) => document.querySelectorAll(sel).forEach((b) => b.setAttribute('aria-pressed', String(b.dataset[attr] === v)));
+  document.querySelectorAll('[data-view]').forEach((b) => b.addEventListener('click', () => {
+    view = b.dataset.view; setPressed('[data-view]', 'view', view);
+    document.getElementById('modes').hidden = view !== 'payload'; render();
+  }));
+  document.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => {
+    mode = b.dataset.mode; setPressed('[data-mode]', 'mode', mode); render();
+  }));
+  render();
+  // first paint shows bars at full width for thumbnails; the transition only plays on switches
+  bars.querySelectorAll('.bar').forEach((b) => { b.style.transition = 'none'; b.style.width = b.dataset.w + '%'; });
+
+  /* ---------- gateway tabs ---------- */
+  const tabs = [...document.querySelectorAll('.tab')];
+  const select = (t) => tabs.forEach((x) => {
+    const on = x === t; x.setAttribute('aria-selected', String(on)); x.tabIndex = on ? 0 : -1;
+    document.getElementById(x.getAttribute('aria-controls')).hidden = !on;
+  });
+  tabs.forEach((t, i) => {
+    t.addEventListener('click', () => select(t));
+    t.addEventListener('keydown', (e) => {
+      const d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+      if (d) { const n = tabs[(i + d + tabs.length) % tabs.length]; select(n); n.focus(); }
+    });
+  });
+  if (location.hash === '#ai' || location.hash === '#mcp') select(document.getElementById('t-' + location.hash.slice(1)));
+
+  /* ---------- harbour canvas ---------- */
+  const cv = document.getElementById('harbour');
+  const ctx = cv.getContext('2d');
+  let W = 0, H = 0, dpr = 1, parts = [], nodes = [], running = false, visible = true, last = 0;
+  let col = {};
+  const readColors = () => {
+    col = { beam: css('--beam'), sea: css('--sea'), rose: css('--rose'), faint: css('--faint'), line: css('--line'), fg: css('--fg'), bg: css('--bg') };
+    const c = col.bg.replace('#', '');
+    const lum = parseInt(c.slice(0, 2), 16) * .3 + parseInt(c.slice(2, 4), 16) * .59 + parseInt(c.slice(4, 6), 16) * .11;
+    col.dark = lum < 90;
+  };
+  const N_NODES = 7;
+  const geo = () => {
+    const gx = W * (W < 640 ? .5 : .52), gy = H * .5, bx = W - Math.max(28, W * .05);
+    return { gx, gy, bx, gap: Math.max(12, H * .05) };
+  };
+  const spawn = (t0 = 0) => {
+    const r = Math.random();
+    return {
+      y0: H * (.08 + Math.random() * .84),
+      b: Math.floor(Math.random() * N_NODES),
+      t: t0, v: .0028 + Math.random() * .0034,
+      kind: r < .72 ? 'beam' : r < .88 ? 'sea' : 'rose',
+      j: (Math.random() - .5),
+    };
+  };
+  const pos = (p, t) => {
+    const { gx, gy, bx, gap } = geo();
+    const gyj = gy + p.j * gap * 1.3;
+    if (t < .5) {
+      const u = t / .5, a = 1 - u;
+      const x0 = -12, y0 = p.y0, x1 = gx * .55, y1 = p.y0;
+      return [a * a * x0 + 2 * a * u * x1 + u * u * gx, a * a * y0 + 2 * a * u * y1 + u * u * gyj];
+    }
+    const u = (t - .5) / .5, a = 1 - u;
+    const by = nodes[p.b].y, x1 = gx + (bx - gx) * .45;
+    return [a * a * gx + 2 * a * u * x1 + u * u * (bx - 8), a * a * gyj + 2 * a * u * by + u * u * by];
+  };
+  const resize = () => {
+    const r = cv.getBoundingClientRect();
+    dpr = Math.min(2, window.devicePixelRatio || 1);
+    W = r.width; H = r.height;
+    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    nodes = Array.from({ length: N_NODES }, (_, i) => ({ y: H * (.16 + (.68 * i) / (N_NODES - 1)), pulse: 0 }));
+    readColors();
+    if (!running) frame(performance.now(), true);
+  };
+  const cap = () => (W < 640 ? 110 : 240);
+  const draw = () => {
+    ctx.clearRect(0, 0, W, H);
+    const { gx, gy, bx, gap } = geo();
+    // gate glow
+    const g = ctx.createRadialGradient(gx, gy, 0, gx, gy, H * .55);
+    g.addColorStop(0, col.dark ? 'rgba(255,181,71,.16)' : 'rgba(201,107,0,.10)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g; ctx.fillRect(gx - H, 0, H * 2, H);
+    // backend nodes
+    nodes.forEach((n) => {
+      ctx.beginPath(); ctx.arc(bx, n.y, 5 + n.pulse * 4, 0, Math.PI * 2);
+      ctx.strokeStyle = col.faint; ctx.globalAlpha = .5 + n.pulse * .5; ctx.lineWidth = 1.2; ctx.stroke();
+      ctx.beginPath(); ctx.arc(bx, n.y, 2.4, 0, Math.PI * 2); ctx.fillStyle = col.fg; ctx.globalAlpha = .35 + n.pulse * .65; ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+    // particles
+    ctx.globalCompositeOperation = col.dark ? 'lighter' : 'source-over';
+    ctx.lineCap = 'round';
+    for (const p of parts) {
+      const [x, y] = pos(p, p.t), [x2, y2] = pos(p, Math.max(0, p.t - .045));
+      const c = col[p.kind];
+      ctx.strokeStyle = c; ctx.globalAlpha = .55; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x2, y2); ctx.lineTo(x, y); ctx.stroke();
+      ctx.globalAlpha = 1; ctx.fillStyle = c;
+      ctx.beginPath(); ctx.arc(x, y, 1.6, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+    // gate pillars
+    const ph = Math.min(H * (W < 640 ? .2 : .32), 120);
+    const pill = (y1, y2) => {
+      const lg = ctx.createLinearGradient(0, y1, 0, y2);
+      lg.addColorStop(0, col.beam); lg.addColorStop(1, col.beam);
+      ctx.fillStyle = lg;
+      ctx.beginPath(); ctx.roundRect ? ctx.roundRect(gx - 4, y1, 8, y2 - y1, 4) : ctx.rect(gx - 4, y1, 8, y2 - y1); ctx.fill();
+    };
+    ctx.shadowColor = col.beam; ctx.shadowBlur = col.dark ? 22 : 10;
+    pill(gy - gap * 1.4 - ph, gy - gap * 1.4);
+    pill(gy + gap * 1.4, gy + gap * 1.4 + ph);
+    ctx.shadowBlur = 0;
+  };
+  const step = (k) => {
+    for (const p of parts) {
+      p.t += p.v * k;
+      if (p.t >= 1) { nodes[p.b].pulse = 1; Object.assign(p, spawn(0)); }
+    }
+    while (parts.length < cap() && Math.random() < .5) parts.push(spawn(0));
+    for (const n of nodes) n.pulse = Math.max(0, n.pulse - .035 * k);
+  };
+  const frame = (now, once) => {
+    const k = last ? Math.min(3, (now - last) / 16.7) : 1; last = now;
+    step(k); draw();
+    if (!once && running) requestAnimationFrame(frame);
+  };
+  const start = () => { if (running || reduce || !visible || document.hidden) return; running = true; last = 0; requestAnimationFrame(frame); };
+  const stop = () => { running = false; };
+  // seed a full, settled frame so the band is complete at rest
+  const seed = () => { parts = Array.from({ length: cap() }, () => spawn(Math.random())); };
+  resize(); seed(); draw();
+  new ResizeObserver(() => { resize(); if (reduce) { seed(); draw(); } }).observe(cv);
+  if ('IntersectionObserver' in window) new IntersectionObserver((es) => { visible = es[0].isIntersecting; visible ? start() : stop(); }).observe(cv);
+  document.addEventListener('visibilitychange', () => (document.hidden ? stop() : start()));
+  const mq = matchMedia('(prefers-color-scheme: dark)');
+  const recolor = () => { readColors(); if (!running) draw(); };
+  mq.addEventListener ? mq.addEventListener('change', recolor) : mq.addListener(recolor);
+  new MutationObserver(recolor).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  start();
+})();
+</script>
+</body>
+</html>
