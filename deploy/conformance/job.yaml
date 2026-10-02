@@ -49,6 +49,8 @@ spec:
               value: "${CONFORMANCE_RUN}"
             - name: CONFORMANCE_TIMEOUT
               value: "${CONFORMANCE_TIMEOUT}"
+            - name: CONFORMANCE_IMPL_VERSION
+              value: "${CONFORMANCE_IMPL_VERSION}"
           resources:
             requests:
               cpu: 250m

@@ -450,6 +450,8 @@ CONFORMANCE_TAG   ?= dev
 CONFORMANCE_IMAGE := portus/conformance:$(CONFORMANCE_TAG)
 CONFORMANCE_RUN   ?= TestConformance
 CONFORMANCE_TIMEOUT ?= 40m
+# The report's implementation.version: the release tag the chart is cut from.
+CONFORMANCE_IMPL_VERSION ?= v$(shell awk '/^version:/ {print $$2}' deploy/helm/Chart.yaml)
 
 conformance-image: disk-check
 	$(DOCKER) build -t $(CONFORMANCE_IMAGE) -f deploy/conformance/Dockerfile.runner .
@@ -460,7 +462,7 @@ conformance-run:
 	@# A previous run's cleanup may still be terminating the suite namespaces; a new run cannot create into them.
 	@for ns in gateway-conformance-infra gateway-conformance-app-backend gateway-conformance-web-backend gateway-conformance-mesh; do \
 		$(MISE) kubectl wait --for=delete ns/$$ns --timeout=180s >/dev/null 2>&1 || true; done
-	CONFORMANCE_IMAGE=$(CONFORMANCE_IMAGE) CONFORMANCE_RUN='$(CONFORMANCE_RUN)' CONFORMANCE_TIMEOUT=$(CONFORMANCE_TIMEOUT) \
+	CONFORMANCE_IMAGE=$(CONFORMANCE_IMAGE) CONFORMANCE_RUN='$(CONFORMANCE_RUN)' CONFORMANCE_TIMEOUT=$(CONFORMANCE_TIMEOUT) CONFORMANCE_IMPL_VERSION=$(CONFORMANCE_IMPL_VERSION) \
 		python3 deploy/conformance/render-job.py | $(MISE) kubectl apply -f -
 	@echo "==> waiting for the conformance pod"
 	@for i in $$(seq 1 60); do \

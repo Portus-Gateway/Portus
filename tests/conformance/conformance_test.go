@@ -108,13 +108,19 @@ func TestConformance(t *testing.T) {
 	}
 
 
-	// Implementation metadata (required for report generation)
+	// Implementation metadata for the report. Upstream requires a snapshot
+	// (tag or commit) as the version: `make conformance-run` passes the chart's
+	// release tag; ad-hoc runs report "dev".
+	version := os.Getenv("CONFORMANCE_IMPL_VERSION")
+	if version == "" {
+		version = "dev"
+	}
 	opts.Implementation = confv1.Implementation{
 		Organization: "Portus-Gateway",
-		Project:      "portus-gateway",
-		URL:          "https://github.com/Portus-Gateway/Portus",
-		Version:      "0.2.0",
-		Contact:      []string{"@Portus-Gateway"},
+		Project:      "Portus",
+		URL:          "https://portus-gateway.dev",
+		Version:      version,
+		Contact:      []string{"@Nodstuff"},
 	}
 
 	// Test isolation: give the controller time to process deletions between
