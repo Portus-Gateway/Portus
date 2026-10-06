@@ -17,7 +17,7 @@ use http::{HeaderMap, HeaderName, HeaderValue};
 
 use crate::auth::{validate_api_key, validate_basic_auth};
 use crate::circuit_breaker::{CircuitBreaker, ConnectionLimiter};
-use crate::metrics::ProxyMetrics;
+use crate::metrics::{ProxyMetrics, RouteMetrics};
 use crate::pool::Pool;
 use crate::rate_limiter::RateLimiterMode;
 use crate::ai::scan::{FieldScanner, Scalar};
@@ -263,20 +263,15 @@ pub struct Forward {
     pub circuit_breaker: Option<Arc<CircuitBreaker>>,
     /// Acquired connection-limit slot; the stack must release it when done.
     pub connection_limiter: Option<Arc<ConnectionLimiter>>,
-    /// Pre-resolved latency histogram for this route's labels.
-    pub duration_histogram: prometheus::Histogram,
+    /// Request counter and latency histogram for this service and protocol,
+    /// resolved once per endpoint pool.
+    pub metrics: Arc<RouteMetrics>,
     /// The AI provider behind the route, when there is one: the adapter
     /// reads token usage from the response and records the request.
     pub ai: Option<crate::router::AiBackend>,
 }
 
-impl Forward {
-    /// Label for the protocol dimension of the request metrics.
-    pub fn protocol_label(&self) -> &'static str {
-        protocol_label(self.protocol)
-    }
-}
-
+/// Label for the protocol dimension of the request metrics.
 pub fn protocol_label(protocol: BackendProtocol) -> &'static str {
     match protocol {
         BackendProtocol::Http => "http",
@@ -505,9 +500,10 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
     let backend_tls = snap.backend_tls.get(&key).cloned();
     let client_identity = snap.backend_client_cert.clone();
 
-    let duration_histogram = metrics
-        .request_duration
-        .with_label_values(&[service_name.as_ref(), protocol_label(pr.protocol)]);
+    let route_metrics = match &pool {
+        Some(p) => p.route_metrics(metrics, &service_name, pr.protocol),
+        None => Arc::new(RouteMetrics::new(metrics, &service_name, protocol_label(pr.protocol))),
+    };
 
     // Timeouts: `backendRequest` tightens the read timeout; `request` is the
     // overall deadline and also bounds the read timeout when it is tighter.
@@ -600,7 +596,7 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
         cors,
         circuit_breaker,
         connection_limiter,
-        duration_histogram,
+        metrics: route_metrics,
         ai: pr.ai.clone(),
     }))
 }

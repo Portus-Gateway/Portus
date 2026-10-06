@@ -258,9 +258,9 @@ impl ProxyService {
             }
             tls_key = (1u64 << 63) | (fxhash(member.sni.as_bytes()) >> 1);
         }
-        ext.insert(UpstreamTarget { addr: backend, tls: member.tls, tls_key, h2: false });
+        let target = UpstreamTarget { addr: backend, tls: member.tls, tls_key, h2: false };
         let _ = Protocol::HTTP;
-        let resp = self.attempt(req, deadline).await.map_err(|e| format!("{e:?}"))?;
+        let resp = self.attempt(req, target, deadline).await.map_err(|e| format!("{e:?}"))?;
         Ok((resp, backend))
     }
 }

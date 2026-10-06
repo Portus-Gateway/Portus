@@ -20,9 +20,14 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use log::{info, warn};
+
+use crate::metrics::{ProxyMetrics, RouteMetrics};
+use crate::plan::protocol_label;
+use crate::types::BackendProtocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Active HTTP health check for every endpoint of a [`Pool`].
@@ -111,6 +116,9 @@ pub struct Pool {
     endpoints: Vec<Endpoint>,
     next: AtomicUsize,
     health_check: Option<HealthCheck>,
+    /// Request metrics of the requests sent here, one per backend protocol,
+    /// resolved by the first request.
+    metrics: [OnceLock<Arc<RouteMetrics>>; 4],
 }
 
 impl Pool {
@@ -123,7 +131,19 @@ impl Pool {
             endpoints: addrs.into_iter().map(Endpoint::new).collect(),
             next: AtomicUsize::new(0),
             health_check,
+            metrics: Default::default(),
         }
+    }
+
+    /// The request metrics for `service` over `protocol`, resolved once per pool.
+    pub fn route_metrics(&self, metrics: &ProxyMetrics, service: &Arc<str>, protocol: BackendProtocol) -> Arc<RouteMetrics> {
+        let slot = match protocol {
+            BackendProtocol::Http => 0,
+            BackendProtocol::Grpc => 1,
+            BackendProtocol::H2c => 2,
+            BackendProtocol::WebSocket => 3,
+        };
+        Arc::clone(self.metrics[slot].get_or_init(|| Arc::new(RouteMetrics::new(metrics, service, protocol_label(protocol)))))
     }
 
     pub fn endpoints(&self) -> &[Endpoint] {

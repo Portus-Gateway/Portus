@@ -1,27 +1,27 @@
 //! The upstream HTTP client: our own connector over Rama's TCP and TLS
 //! connectors and its HTTP/1 and HTTP/2 client connections.
 //!
-//! One request does exactly this: read the [`UpstreamTarget`] the proxy put
-//! on it, take an idle connection for that target from the target's shard
+//! One request does exactly this: take the [`UpstreamTarget`] the proxy
+//! resolved, take an idle connection for that target from the target's shard
 //! (or dial and handshake one), send, and return the connection when the
 //! response body has been consumed. There is no adapter chain, no
-//! per-request extension cloning and no global pool lock. A connection
+//! per-request extension and no global pool lock. A connection
 //! verified under one BackendTLSPolicy never serves another because the TLS
 //! fingerprint is part of the shard key, and the HTTP version is pinned per
 //! target (TLS ALPN included) so an HTTP/1 route never lands on an h2
 //! connection.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use log::debug;
-use prometheus::{IntCounterVec, Opts};
+use prometheus::{IntCounter, IntCounterVec, Opts};
 use rama::error::BoxError;
-use rama::extensions::{Extension, ExtensionsRef};
+use rama::extensions::ExtensionsRef;
 use rama::http::body::GuardedBody;
 use rama::http::core::client::conn::{http1, http2};
 use rama::http::io::upgrade::OnUpgrade;
@@ -37,7 +37,6 @@ use rama::tcp::client::TcpStreamConnector;
 use rama::tcp::TcpStream;
 use rama::tls::client::TlsClientConfig;
 use rama::tls::rustls::client::TlsConnector;
-use rama::Service;
 
 use portus_dataplane_core::h2::{UPSTREAM_H2_CONNECTION_WINDOW, UPSTREAM_H2_STREAM_WINDOW};
 
@@ -51,6 +50,9 @@ const MAX_IDLE_PER_TARGET: usize = 256;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 /// hyper grows the HTTP/1 read buffer to 400 KiB per connection; 64 KiB is
 /// plenty for a response head and keeps 256 idle connections at 16 MiB.
+/// 128 and 256 KiB were measured 2026-10-06: +3 % and +6 % on 1 MiB bodies
+/// for about +95 and +200 MiB per pod, because an idle connection keeps the
+/// buffer it grew while carrying a large body.
 const H1_CLIENT_MAX_BUF: usize = 64 * 1024;
 /// Streams a gRPC or h2c backend may have in flight on one connection.
 const H2_MAX_CONCURRENT_STREAMS: u32 = 200;
@@ -64,7 +66,7 @@ const H2_CONNS_PER_TARGET: usize = 32;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Where a request goes and under what identity, set by the proxy service.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Extension)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UpstreamTarget {
     pub addr: SocketAddr,
     pub tls: bool,
@@ -133,6 +135,10 @@ struct Pool {
     /// `proxy_upstream_pool_events_total{event}`: every decision the pool
     /// takes, so connection churn is visible on :9090 instead of in `ss`.
     events: IntCounterVec,
+    /// The per-request events, resolved once.
+    reuse: IntCounter,
+    returned: IntCounter,
+    h2_reuse: IntCounter,
 }
 
 impl Pool {
@@ -145,7 +151,14 @@ impl Pool {
         // A second Upstream in one process (tests) shares the registry; the
         // counters still work unregistered.
         let _ = prometheus::register(Box::new(events.clone()));
-        Self { shards: DashMap::new(), idle_total: AtomicUsize::new(0), events }
+        Self {
+            shards: DashMap::new(),
+            idle_total: AtomicUsize::new(0),
+            reuse: events.with_label_values(&["reuse"]),
+            returned: events.with_label_values(&["returned"]),
+            h2_reuse: events.with_label_values(&["h2_reuse"]),
+            events,
+        }
     }
 
     fn event(&self, name: &str) {
@@ -165,7 +178,7 @@ impl Pool {
             } else if idle.conn.broken() {
                 self.event("idle_broken");
             } else {
-                self.event("reuse");
+                self.reuse.inc();
                 return Some(idle.conn);
             }
         }
@@ -229,7 +242,7 @@ impl Pool {
         }
         shard.push_back(Idle { conn, since: Instant::now() });
         self.idle_total.fetch_add(1, Ordering::Relaxed);
-        self.event("returned");
+        self.returned.inc();
     }
 }
 
@@ -260,8 +273,9 @@ pub struct Upstream {
     dialer: Dialer,
     exec: Executor,
     pool: Arc<Pool>,
-    /// Multiplexed HTTP/2 connections per target, used round-robin.
-    h2: Mutex<HashMap<UpstreamTarget, Vec<Arc<Conn>>>>,
+    /// Multiplexed HTTP/2 connections per target, used round-robin. A full
+    /// set is only read; it is written when it fills or loses a connection.
+    h2: DashMap<UpstreamTarget, Vec<Arc<Conn>>>,
     h2_next: AtomicUsize,
 }
 
@@ -278,7 +292,7 @@ impl Upstream {
                 sweeper.evict_idle_older_than(IDLE_TIMEOUT);
             }
         });
-        Self { dialer, exec, pool, h2: Mutex::new(HashMap::new()), h2_next: AtomicUsize::new(0) }
+        Self { dialer, exec, pool, h2: DashMap::new(), h2_next: AtomicUsize::new(0) }
     }
 
     /// Dial `target` and complete the handshake for the target's protocol.
@@ -341,38 +355,45 @@ impl Upstream {
         }
     }
 
-    fn poisoned<T>(_: T) -> BoxError {
-        BoxError::from("upstream h2 connection map poisoned")
+    /// The next connection of `target`'s full HTTP/2 set. None while the set
+    /// is filling, or when the pick was broken: the set drops its broken
+    /// connections and the caller dials a replacement.
+    fn h2_pick(&self, target: &UpstreamTarget) -> Option<Arc<Conn>> {
+        let conn = {
+            let conns = self.h2.get(target)?;
+            if conns.len() < H2_CONNS_PER_TARGET {
+                return None;
+            }
+            Arc::clone(&conns[self.h2_next.fetch_add(1, Ordering::Relaxed) % conns.len()])
+        };
+        if conn.broken() {
+            if let Some(mut conns) = self.h2.get_mut(target) {
+                conns.retain(|c| !c.broken());
+            }
+            return None;
+        }
+        Some(conn)
+    }
+
+    fn h2_add(&self, target: UpstreamTarget, conn: &Arc<Conn>) {
+        let mut conns = self.h2.entry(target).or_default();
+        if conns.len() < H2_CONNS_PER_TARGET {
+            conns.push(Arc::clone(conn));
+        }
     }
 
     async fn lease(&self, req: &Request, target: UpstreamTarget) -> Result<Lease, BoxError> {
         let pool = Arc::clone(&self.pool);
         if target.h2 {
-            // Fill the target's set first, then rotate through it. Broken
-            // connections leave the set when they are next seen.
-            let existing = {
-                let mut map = self.h2.lock().map_err(Self::poisoned)?;
-                let conns = map.entry(target).or_default();
-                conns.retain(|c| !c.broken());
-                if conns.len() >= H2_CONNS_PER_TARGET {
-                    let i = self.h2_next.fetch_add(1, Ordering::Relaxed) % conns.len();
-                    Some(Arc::clone(&conns[i]))
-                } else {
-                    None
-                }
-            };
-            let conn = match existing {
+            // Fill the target's set first, then rotate through it.
+            let conn = match self.h2_pick(&target) {
                 Some(c) => {
-                    self.pool.event("h2_reuse");
+                    self.pool.h2_reuse.inc();
                     c
                 }
                 None => {
                     let c = self.connect(req, target).await?;
-                    let mut map = self.h2.lock().map_err(Self::poisoned)?;
-                    let conns = map.entry(target).or_default();
-                    if conns.len() < H2_CONNS_PER_TARGET {
-                        conns.push(Arc::clone(&c));
-                    }
+                    self.h2_add(target, &c);
                     c
                 }
             };
@@ -387,15 +408,10 @@ impl Upstream {
     }
 }
 
-impl Service<Request> for Upstream {
-    type Output = Response;
-    type Error = BoxError;
-
-    async fn serve(&self, mut req: Request) -> Result<Response, BoxError> {
-        let target = *req
-            .extensions()
-            .get_ref::<UpstreamTarget>()
-            .ok_or_else(|| BoxError::from("upstream request without a target"))?;
+impl Upstream {
+    /// Send `req` to `target` and return its response; the connection goes
+    /// back to the pool once the response body has been consumed.
+    pub async fn send(&self, mut req: Request, target: UpstreamTarget) -> Result<Response, BoxError> {
         let lease = self.lease(&req, target).await?;
         let conn = &lease.conn;
         adapt_request_version(&mut req, conn.version)?;
@@ -611,9 +627,11 @@ mod tests {
     }
 
     fn get(addr: SocketAddr) -> Request {
-        let req = Request::builder().uri(format!("http://{addr}/")).body(Body::empty()).unwrap();
-        req.extensions().insert(UpstreamTarget { addr, tls: false, tls_key: 0, h2: false });
-        req
+        Request::builder().uri(format!("http://{addr}/")).body(Body::empty()).unwrap()
+    }
+
+    fn plain(addr: SocketAddr) -> UpstreamTarget {
+        UpstreamTarget { addr, tls: false, tls_key: 0, h2: false }
     }
 
     #[tokio::test]
@@ -622,7 +640,7 @@ mod tests {
         let (addr, accepted) = echo_server().await;
         let upstream = Upstream::new(Executor::default());
         for _ in 0..5 {
-            let resp = upstream.serve(get(addr)).await.unwrap();
+            let resp = upstream.send(get(addr), plain(addr)).await.unwrap();
             assert_eq!(resp.status(), 200);
             let body = resp.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(body.len(), 1024);
@@ -639,6 +657,7 @@ mod tests {
         use rama::http::server::HttpServer;
         use rama::rt::Executor;
         use rama::service::service_fn;
+        use rama::Service;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let (addr, accepted) = echo_server().await;
@@ -648,8 +667,7 @@ mod tests {
             service_fn(move |req: Request| {
                 let upstream = Arc::clone(&upstream);
                 async move {
-                    req.extensions().insert(UpstreamTarget { addr, tls: false, tls_key: 0, h2: false });
-                    Ok::<_, std::convert::Infallible>(match upstream.serve(req).await {
+                    Ok::<_, std::convert::Infallible>(match upstream.send(req, plain(addr)).await {
                         Ok(resp) => resp,
                         Err(e) => Response::builder().status(502).body(Body::from(e.to_string())).unwrap(),
                     })
@@ -688,9 +706,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_without_a_target_is_refused() {
+    async fn a_full_h2_set_rotates_and_replaces_a_broken_connection() {
         let upstream = Upstream::new(Executor::default());
-        let err = upstream.serve(Request::new(Body::empty())).await.expect_err("refused");
-        assert!(err.to_string().contains("without a target"), "{err}");
+        let t = target(8443, 0, true);
+        let mut conns = Vec::new();
+        for _ in 0..H2_CONNS_PER_TARGET {
+            assert!(upstream.h2_pick(&t).is_none(), "a filling set asks for a dial");
+            let c = conn().await;
+            upstream.h2_add(t, &c);
+            conns.push(c);
+        }
+        let first = upstream.h2_pick(&t).expect("a full set serves");
+        let second = upstream.h2_pick(&t).expect("a full set serves");
+        assert!(!Arc::ptr_eq(&first, &second), "round-robin, not one hot connection");
+        conns[3].mark_broken();
+        // Within one rotation the broken connection comes up, is not handed
+        // out, and leaves the set.
+        for _ in 0..H2_CONNS_PER_TARGET {
+            match upstream.h2_pick(&t) {
+                Some(c) => assert!(!Arc::ptr_eq(&c, &conns[3]), "the broken connection is never handed out"),
+                None => break,
+            }
+        }
+        assert_eq!(upstream.h2.get(&t).unwrap().len(), H2_CONNS_PER_TARGET - 1, "the broken connection left the set");
+        assert!(upstream.h2_pick(&t).is_none(), "a short set dials until it is full again");
+        upstream.h2_add(t, &conn().await);
+        assert!(upstream.h2_pick(&t).is_some());
+        assert_eq!(upstream.h2.get(&t).unwrap().len(), H2_CONNS_PER_TARGET);
+    }
+
+    #[tokio::test]
+    async fn the_cached_pool_counters_are_the_labelled_series() {
+        let pool = Pool::new();
+        let a = target(8080, 0, false);
+        let (reuse, returned) = (pool.events.with_label_values(&["reuse"]).get(), pool.events.with_label_values(&["returned"]).get());
+        pool.put(a, conn().await);
+        assert!(pool.take(&a).is_some());
+        assert_eq!(pool.events.with_label_values(&["returned"]).get(), returned + 1);
+        assert_eq!(pool.events.with_label_values(&["reuse"]).get(), reuse + 1);
     }
 }

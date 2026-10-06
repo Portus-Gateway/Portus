@@ -12,7 +12,7 @@ use pingora_core::Result;
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
 
 use portus_dataplane_core::h2::{UPSTREAM_H2_CONNECTION_WINDOW, UPSTREAM_H2_STREAM_WINDOW};
-use portus_dataplane_core::metrics::ProxyMetrics;
+use portus_dataplane_core::metrics::{status_label, ProxyMetrics};
 use portus_dataplane_core::outlier::Outliers;
 use portus_dataplane_core::plan::{
     apply_cors_response_headers, plan_request, should_retry_connect, Forward, HeaderSink, Plan,
@@ -447,18 +447,16 @@ impl ProxyHttp for Router {
     async fn logging(&self, session: &mut Session, _e: Option<&pingora_core::Error>, ctx: &mut Self::CTX) {
         let duration = ctx.request_start.elapsed().as_secs_f64();
         let status_u16 = session.response_written().map_or(0u16, |resp| resp.status.as_u16());
-        let mut status_buf = arrayvec::ArrayString::<4>::new();
-        let _ = std::fmt::Write::write_fmt(&mut status_buf, format_args!("{}", status_u16));
-        let status = status_buf.as_str();
-
-        let (host, proto) = match ctx.plan.as_ref() {
-            Some(plan) => (plan.service_name.as_ref(), plan.protocol_label()),
-            None => ("no_route", "http"),
-        };
-        self.metrics.request_total.with_label_values(&[host, status, proto]).inc();
+        let host = ctx.plan.as_ref().map_or("no_route", |plan| plan.service_name.as_ref());
         match ctx.plan.as_ref() {
-            Some(plan) => plan.duration_histogram.observe(duration),
-            None => self.metrics.request_duration.with_label_values(&[host, proto]).observe(duration),
+            Some(plan) => {
+                plan.metrics.count(status_u16);
+                plan.metrics.duration.observe(duration);
+            }
+            None => {
+                self.metrics.request_total.with_label_values(&["no_route", status_label(status_u16).as_str(), "http"]).inc();
+                self.metrics.request_duration.with_label_values(&["no_route", "http"]).observe(duration);
+            }
         }
 
         if let Some(plan) = ctx.plan.as_ref() {
@@ -489,7 +487,7 @@ impl ProxyHttp for Router {
             info!(
                 target: "portus_dataplane::access",
                 "{} {} {} {} {} {:.3}s",
-                client, method, path, host, status, duration
+                client, method, path, host, status_u16, duration
             );
         }
     }

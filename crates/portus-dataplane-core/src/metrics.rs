@@ -1,6 +1,9 @@
+use std::sync::Arc;
+
 use prometheus::{
     register_gauge, register_histogram_vec, register_int_counter_vec, register_int_gauge,
-    register_int_gauge_vec, Gauge, HistogramVec, IntCounterVec, IntGauge, IntGaugeVec,
+    register_int_gauge_vec, Gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
+    IntGaugeVec,
 };
 
 pub struct ProxyMetrics {
@@ -109,6 +112,52 @@ impl ProxyMetrics {
         }
     }
 }
+/// The request metrics of one (service, protocol), resolved once instead of
+/// per request: `with_label_values` hashes its labels under a lock, a
+/// resolved handle is one atomic add.
+pub struct RouteMetrics {
+    pub duration: Histogram,
+    /// `proxy_requests_total` for 200, the status nearly every request ends with.
+    ok: IntCounter,
+    total: IntCounterVec,
+    service: Arc<str>,
+    protocol: &'static str,
+}
+
+impl RouteMetrics {
+    pub fn new(metrics: &ProxyMetrics, service: &Arc<str>, protocol: &'static str) -> Self {
+        Self {
+            duration: metrics.request_duration.with_label_values(&[service.as_ref(), protocol]),
+            ok: metrics.request_total.with_label_values(&[service.as_ref(), "200", protocol]),
+            total: metrics.request_total.clone(),
+            service: Arc::clone(service),
+            protocol,
+        }
+    }
+
+    /// Count one request that ended with `status`.
+    pub fn count(&self, status: u16) {
+        if status == 200 {
+            self.ok.inc();
+        } else {
+            self.total.with_label_values(&[self.service.as_ref(), status_label(status).as_str(), self.protocol]).inc();
+        }
+    }
+}
+
+impl std::fmt::Debug for RouteMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RouteMetrics").field("service", &self.service).field("protocol", &self.protocol).finish()
+    }
+}
+
+/// Status code as a metrics label without a heap allocation.
+pub fn status_label(status: u16) -> arrayvec::ArrayString<4> {
+    let mut buf = arrayvec::ArrayString::<4>::new();
+    let _ = std::fmt::Write::write_fmt(&mut buf, format_args!("{status}"));
+    buf
+}
+
 /// The one `ProxyMetrics` a test binary may register: Prometheus refuses a
 /// second registration of the same names in one process.
 #[cfg(test)]
@@ -120,6 +169,23 @@ pub(crate) fn shared_metrics() -> &'static ProxyMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_metrics_count_into_the_same_series_as_the_label_lookup() {
+        let m = shared_metrics();
+        let svc: Arc<str> = Arc::from("route-metrics-svc");
+        let rm = RouteMetrics::new(m, &svc, "h2c");
+        let get = |status: &str| m.request_total.with_label_values(&["route-metrics-svc", status, "h2c"]).get();
+        let (ok, err) = (get("200"), get("503"));
+        rm.count(200);
+        rm.count(200);
+        rm.count(503);
+        assert_eq!(get("200"), ok + 2, "the cached 200 handle is the 200 series");
+        assert_eq!(get("503"), err + 1, "other statuses still land under their own label");
+        assert_eq!(get("404"), 0, "and nowhere else");
+        rm.duration.observe(0.002);
+        assert_eq!(m.request_duration.with_label_values(&["route-metrics-svc", "h2c"]).get_sample_count(), 1);
+    }
 
     #[test]
     fn test_metrics_registration() {

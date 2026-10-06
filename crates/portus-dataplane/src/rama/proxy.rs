@@ -16,6 +16,10 @@ use rama::error::BoxError;
 use rama::extensions::ExtensionsRef;
 use rama::http::body::util::{BodyExt, Full};
 use rama::http::io::upgrade::handle_upgrade;
+use rama::http::header::{
+    ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE,
+    X_FORWARDED_FOR, X_REAL_IP,
+};
 use rama::http::{Body, HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, StreamingBody, Version};
 use rama::net::address::{Authority, Host};
 use rama::net::Protocol;
@@ -27,7 +31,7 @@ use rama::tls::rustls::client::RustlsServerCertVerifier;
 use rama::tls::SecureTransport;
 use rama::Service;
 
-use portus_dataplane_core::metrics::ProxyMetrics;
+use portus_dataplane_core::metrics::{status_label, ProxyMetrics};
 use portus_dataplane_core::outlier::Outliers;
 use portus_dataplane_core::plan::{
     apply_cors_response_headers, plan_request, should_retry_connect, Forward, HeaderSink, Plan, Reply,
@@ -65,6 +69,11 @@ const RETRY_BUFFER_MAX: u64 = 64 * 1024;
 /// Every AI response carries the gateway's request id in this header; a
 /// client may send its own id in it and finds it on the ledger row.
 const REQUEST_ID_HEADER: &str = "x-portus-request-id";
+
+/// Header names the request path touches, parsed once: a string key is
+/// re-parsed on every lookup.
+const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+const MCP_SESSION_ID: HeaderName = HeaderName::from_static("mcp-session-id");
 
 fn request_id_value(id: u64) -> http::HeaderValue {
     http::HeaderValue::from_str(&format!("{id:016x}")).unwrap_or_else(|_| http::HeaderValue::from_static(""))
@@ -152,7 +161,7 @@ impl Service<Request> for ProxyService {
 struct Incoming {
     method: Method,
     version: Version,
-    /// The downstream URI; each attempt takes it with the backend as authority.
+    /// The downstream URI; each attempt sends it with the backend as authority.
     uri: Uri,
 }
 
@@ -183,14 +192,15 @@ impl ProxyService {
             .map(|d| d.as_str().to_string());
         let socket_is_tls = req.extensions().contains::<SecureTransport>();
 
-        let raw_host: String = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .or_else(|| req.uri().host().map(|h| h.to_string()))
-            .unwrap_or_default();
-        let host = raw_host.split(':').next().unwrap_or(&raw_host);
+        // The Host value is a cheap handle on the request's own bytes; only an
+        // HTTP/2 request without one copies the URI's host.
+        let host_header: Option<HeaderValue> = req.headers().get(HOST).filter(|v| v.to_str().is_ok()).cloned();
+        let uri_host: Option<String> = match host_header {
+            Some(_) => None,
+            None => req.uri().host().map(|h| h.to_string()),
+        };
+        let raw_host: &str = host_header.as_ref().and_then(|v| v.to_str().ok()).or(uri_host.as_deref()).unwrap_or("");
+        let host = raw_host.split(':').next().unwrap_or(raw_host);
 
         // Plan, scanning the body first when the host's routes match on
         // body fields. The borrows of `req` end with each pass so the body
@@ -255,7 +265,7 @@ impl ProxyService {
         };
         // HTTP/2 carries the authority in `:authority`, not a `Host` header;
         // the backend must still see the client's authority, not ours.
-        let authority = if req.headers().contains_key("host") {
+        let authority = if req.headers().contains_key(HOST) {
             None
         } else {
             req.uri().authority().map(|a| a.to_string())
@@ -263,7 +273,7 @@ impl ProxyService {
 
         let request_bytes: u64 = req
             .headers()
-            .get("content-length")
+            .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
@@ -283,7 +293,7 @@ impl ProxyService {
         // One id per request: the ledger row carries it and the client gets
         // it back in x-portus-request-id; the client's own id, if it sent
         // one in the same header, is recorded next to it.
-        let gateway_request_id: u64 = rand::random();
+        let gateway_request_id: u64 = if plan.ai.is_some() { rand::random() } else { 0 };
         let client_request_id: Option<String> = plan.ai.as_ref().and_then(|_| {
             req.headers().get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()).map(str::trim).filter(|v| !v.is_empty() && v.len() <= 64).map(str::to_string)
         });
@@ -356,7 +366,7 @@ impl ProxyService {
                     }
                     let reply = reply.with_header(http::header::HeaderName::from_static(REQUEST_ID_HEADER), request_id_value(gateway_request_id));
                     let status = reply.status;
-                    self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
+                    plan.metrics.count(status);
                     if let Some(ledger) = self.ledger.as_ref() {
                         // A model or tool refusal knows its subject; an authentication one does not.
                         // A trusted caller's refusal is the named user's refusal.
@@ -389,8 +399,8 @@ impl ProxyService {
                     return reply_response(reply);
                 }
             }
-            req.headers_mut().remove("x-api-key");
-            req.headers_mut().remove("authorization");
+            req.headers_mut().remove(X_API_KEY);
+            req.headers_mut().remove(AUTHORIZATION);
             // The user's name is for the ledger, never for the provider.
             if let Some(policy) = ai.on_behalf_of.as_ref()
                 && let Some(n) = rama_name_str(&policy.header)
@@ -451,7 +461,7 @@ impl ProxyService {
                 let reply = exhausted_reply(ai.dialect, budget.unit, retry, remaining, needed, request_id)
                     .with_header(http::header::HeaderName::from_static(REQUEST_ID_HEADER), request_id_value(gateway_request_id));
                 let status = reply.status;
-                self.metrics.request_total.with_label_values(&[plan.service_name.as_ref(), status_label(status).as_str(), plan.protocol_label()]).inc();
+                plan.metrics.count(status);
                 if let Some(ledger) = self.ledger.as_ref() {
                     let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: acting.as_deref(), on_behalf_of: on_behalf_of.as_deref(), request_id: gateway_request_id, client_request_id: client_request_id.as_deref(), rule: Some(budget.id.as_ref()), reservation: None };
                     record_refusal(status, RefusalKind::BudgetExhausted, side, &ledger.ring);
@@ -470,8 +480,8 @@ impl ProxyService {
                 Err(_) => return status_response(StatusCode::PAYLOAD_TOO_LARGE),
             };
             let Some(rewritten) = rewrite_model(&bytes, model) else { return status_response(StatusCode::BAD_REQUEST) };
-            parts.headers.insert("content-length", HeaderValue::from(rewritten.len()));
-            parts.headers.remove("transfer-encoding");
+            parts.headers.insert(CONTENT_LENGTH, HeaderValue::from(rewritten.len()));
+            parts.headers.remove(TRANSFER_ENCODING);
             req = Request::from_parts(parts, Body::new(Full::new(Bytes::from(rewritten))));
         }
         // A federated MCP route fans out to its members instead of forwarding.
@@ -507,17 +517,17 @@ impl ProxyService {
             // A provider that compressed anyway cannot be metered; say so once.
             let readable = response
                 .headers()
-                .get("content-encoding")
+                .get(CONTENT_ENCODING)
                 .and_then(|v| v.to_str().ok())
                 .is_none_or(|v| v.trim().eq_ignore_ascii_case("identity") || v.trim().is_empty());
             if !readable && !UNREADABLE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                warn!("provider {} answered with content-encoding {:?} despite accept-encoding: identity; its usage cannot be metered", ai.provider, response.headers().get("content-encoding"));
+                warn!("provider {} answered with content-encoding {:?} despite accept-encoding: identity; its usage cannot be metered", ai.provider, response.headers().get(CONTENT_ENCODING));
             }
             *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring), readable);
         }
         let host_label = plan.service_name.as_ref();
-        self.metrics.request_total.with_label_values(&[host_label, status_label(status).as_str(), plan.protocol_label()]).inc();
-        plan.duration_histogram.observe(start.elapsed().as_secs_f64());
+        plan.metrics.count(status);
+        plan.metrics.duration.observe(start.elapsed().as_secs_f64());
         if let Some(cb) = &plan.circuit_breaker {
             if status >= 500 {
                 cb.record_failure();
@@ -553,10 +563,10 @@ impl ProxyService {
         let is_upgrade = req.version() <= Version::HTTP_11
             && req
                 .headers()
-                .get("connection")
+                .get(CONNECTION)
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case("upgrade")))
-            && req.headers().contains_key("upgrade");
+            && req.headers().contains_key(UPGRADE);
         let downstream_upgrade = is_upgrade.then(|| handle_upgrade(&req));
 
         let (parts, body) = req.into_parts();
@@ -572,18 +582,18 @@ impl ProxyService {
         let uri = parts.uri;
         let mut headers = parts.headers;
         if let Some(authority) = authority
-            && !headers.contains_key("host")
+            && !headers.contains_key(HOST)
             && let Ok(v) = HeaderValue::from_str(&authority)
         {
-            headers.insert("host", v);
+            headers.insert(HOST, v);
         }
 
         // Headers the backend sees: forwarded-for, host rewrite and the
         // route's mutations, applied once; retries reuse the result.
         if let Some(ip) = peer_ip
-            && let Ok(ip_value) = HeaderValue::from_str(&ip.to_string())
+            && let Ok(ip_value) = HeaderValue::from_str(&ip_text(ip))
         {
-            let xff = match headers.get("x-forwarded-for") {
+            let xff = match headers.get(X_FORWARDED_FOR) {
                 Some(existing) => {
                     let mut merged = existing.as_bytes().to_vec();
                     merged.extend_from_slice(b", ");
@@ -592,20 +602,20 @@ impl ProxyService {
                 }
                 None => ip_value.clone(),
             };
-            headers.insert("x-forwarded-for", xff);
-            headers.insert("x-real-ip", ip_value);
+            headers.insert(X_FORWARDED_FOR, xff);
+            headers.insert(X_REAL_IP, ip_value);
         }
         if let Some(new_host) = &plan.rewrite_hostname
             && let Ok(v) = HeaderValue::from_str(new_host)
         {
-            headers.insert("host", v);
+            headers.insert(HOST, v);
         }
         plan.request_headers.apply(&mut HeadersMut(&mut headers));
         // The usage tracker reads the provider's response bytes, so the
         // provider must not compress them: SDKs ask for gzip and Anthropic
         // compresses SSE streams, which left streamed calls unmetered.
         if plan.ai.is_some() {
-            headers.insert("accept-encoding", HeaderValue::from_static("identity"));
+            headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
         }
 
         // Bodies are buffered for replay only when the route retries and the
@@ -623,7 +633,7 @@ impl ProxyService {
         }
         let retrying = buffered.is_some();
         let mut retries_left = if retrying { plan.max_retries } else { 0 };
-        let incoming = Incoming { method, version, uri };
+        let mut incoming = Incoming { method, version, uri };
         // An MCP session stays on the endpoint that created it: the session
         // id a client holds is the endpoint's tag in front of the server's own
         // id. The server sees only its id; the tag picks the endpoint.
@@ -631,7 +641,7 @@ impl ProxyService {
         let mut session_tag: Option<String> = None;
         let mut session_present = false;
         if pin_sessions
-            && let Some(value) = headers.get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string)
+            && let Some(value) = headers.get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()).map(str::to_string)
         {
             session_present = true;
             let (tag, server_id) = split_session(&value);
@@ -639,7 +649,7 @@ impl ProxyService {
             if tag.is_some()
                 && let Ok(v) = HeaderValue::from_str(server_id)
             {
-                headers.insert("mcp-session-id", v);
+                headers.insert(MCP_SESSION_ID, v);
             }
         }
 
@@ -659,14 +669,19 @@ impl ProxyService {
                 (None, Some(b)) => b,
                 (None, None) => return status_response(StatusCode::BAD_GATEWAY),
             };
-            // The single-attempt path moves the headers; only a retrying
-            // request pays for a clone.
-            let attempt_headers = if retrying { headers.clone() } else { std::mem::take(&mut headers) };
-            let upstream = self.upstream_request(&incoming, attempt_headers, plan, backend, body);
+            // The single-attempt path moves the headers and the URI (a shared
+            // URI would be copied when its authority is set); only a retrying
+            // request pays for clones.
+            let (attempt_headers, attempt_uri) = if retrying {
+                (headers.clone(), incoming.uri.clone())
+            } else {
+                (std::mem::take(&mut headers), std::mem::take(&mut incoming.uri))
+            };
+            let (upstream, target) = self.upstream_request(&incoming, attempt_uri, attempt_headers, plan, backend, body);
             // One deadline for the whole exchange: the route's request timeout,
             // else its backend-request (read) timeout, else the connect timeout.
             let deadline = plan.request_timeout.or(plan.read_timeout).or(plan.connect_timeout);
-            match self.attempt(upstream, deadline).await {
+            match self.attempt(upstream, target, deadline).await {
                 Ok(mut resp) => {
                     let status = resp.status().as_u16();
                     if pin_sessions {
@@ -681,11 +696,11 @@ impl ProxyService {
                         }
                         // A session the server created (or echoed) leaves
                         // tagged with the endpoint that holds it.
-                        if let Some(id) = resp.headers().get("mcp-session-id").and_then(|v| v.to_str().ok()).map(str::to_string)
+                        if let Some(id) = resp.headers().get(MCP_SESSION_ID).and_then(|v| v.to_str().ok()).map(str::to_string)
                             && split_session(&id).0.is_none()
                             && let Ok(v) = HeaderValue::from_str(&tag_session(&endpoint_tag(&backend), &id))
                         {
-                            resp.headers_mut().insert("mcp-session-id", v);
+                            resp.headers_mut().insert(MCP_SESSION_ID, v);
                         }
                     }
                     if let Some(out) = self.outliers.responded(pool, &backend, status) {
@@ -726,7 +741,7 @@ impl ProxyService {
                     let mut resp = status_response(StatusCode::PAYLOAD_TOO_LARGE);
                     // The unread remainder of the body would otherwise be
                     // parsed as the next request on this connection.
-                    resp.headers_mut().insert("connection", HeaderValue::from_static("close"));
+                    resp.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
                     break resp;
                 }
             }
@@ -780,8 +795,8 @@ impl ProxyService {
         ledger.budgets.check(budget, subject, cost, now_micros())
     }
 
-    pub(super) async fn attempt(&self, req: Request, deadline: Option<Duration>) -> Result<Response, AttemptError> {
-        let fut = self.client.serve(req);
+    pub(super) async fn attempt(&self, req: Request, target: UpstreamTarget, deadline: Option<Duration>) -> Result<Response, AttemptError> {
+        let fut = self.client.send(req, target);
         let result = match deadline {
             Some(d) => match tokio::time::timeout(d, fut).await {
                 Ok(r) => r,
@@ -792,24 +807,25 @@ impl ProxyService {
         result.map_err(|e| classify(&e))
     }
 
-    /// The request one attempt sends: same method and target, the backend as
-    /// the URI authority (Rama dials the URI), the prepared headers, and the
-    /// TLS and HTTP/2 parameters as request extensions.
+    /// The request one attempt sends and where it goes: same method and
+    /// target, the backend as the URI authority, the prepared headers, and
+    /// the TLS parameters as request extensions (read only when dialling).
     fn upstream_request(
         &self,
         incoming: &Incoming,
+        uri: Uri,
         headers: HeaderMap,
         plan: &Forward,
         backend: SocketAddr,
         body: Body,
-    ) -> Request {
+    ) -> (Request, UpstreamTarget) {
         let use_tls = plan.backend_tls.is_some() || plan.upstream_tls;
         // The downstream URI with the backend as authority: path and query
         // pass through untouched, no string round-trip. A URL rewrite is the
         // one case that re-parses.
         let mut uri = match &plan.rewrite_path {
-            Some(path) => format!("http://{backend}{path}").parse().unwrap_or_else(|_| incoming.uri.clone()),
-            None => incoming.uri.clone(),
+            Some(path) => format!("http://{backend}{path}").parse().unwrap_or(uri),
+            None => uri,
         };
         uri.set_scheme(if use_tls { Protocol::HTTPS } else { Protocol::HTTP });
         uri.set_authority(Authority::from(backend));
@@ -861,8 +877,7 @@ impl ProxyService {
             // Plaintext and TLS never share a key even when nothing else differs.
             tls_key |= 1 << 63;
         }
-        ext.insert(UpstreamTarget { addr: backend, tls: use_tls, tls_key, h2 });
-        req
+        (req, UpstreamTarget { addr: backend, tls: use_tls, tls_key, h2 })
     }
 
     fn note_ejection(&self, plan: &Forward, addr: &SocketAddr, out: Duration, why: &str) {
@@ -872,10 +887,11 @@ impl ProxyService {
     }
 }
 
-/// Status code as a metrics label without a heap allocation.
-fn status_label(status: u16) -> arrayvec::ArrayString<4> {
-    let mut buf = arrayvec::ArrayString::<4>::new();
-    let _ = std::fmt::Write::write_fmt(&mut buf, format_args!("{status}"));
+/// An IP address as text without a heap allocation (an IPv6 address is at
+/// most 39 characters).
+fn ip_text(ip: IpAddr) -> arrayvec::ArrayString<45> {
+    let mut buf = arrayvec::ArrayString::<45>::new();
+    let _ = std::fmt::Write::write_fmt(&mut buf, format_args!("{ip}"));
     buf
 }
 
@@ -926,7 +942,7 @@ pub(super) fn reply_response(reply: Reply) -> Response {
         }
     }
     if !reply.keepalive {
-        resp.headers_mut().insert("connection", HeaderValue::from_static("close"));
+        resp.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
     }
     resp
 }
@@ -934,7 +950,7 @@ pub(super) fn reply_response(reply: Reply) -> Response {
 pub(super) fn status_response(status: StatusCode) -> Response {
     let mut resp = Response::new(Body::empty());
     *resp.status_mut() = status;
-    resp.headers_mut().insert("content-length", HeaderValue::from_static("0"));
+    resp.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
     resp
 }
 
