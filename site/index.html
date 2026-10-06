@@ -398,7 +398,7 @@ footer .sp { margin-left: auto; font-family: var(--mono); font-size: 12.5px; }
     <div class="lane-labels"><div class="wrap"><span>Clients</span><span>Portus</span><span>Your Services</span></div></div>
     <div class="band-meta"><div class="wrap">
       <div class="legend"><span><i style="background:var(--beam)"></i>HTTP · gRPC · TLS</span><span><i style="background:var(--sea)"></i>LLM</span><span><i style="background:var(--rose)"></i>MCP</span></div>
-      <div class="readout">measured <b>126,070 req/s</b> · p99 <b>0.35 ms</b> at 30k req/s</div>
+      <div class="readout">measured <b>224,173 req/s</b> · p99 <b>2.98 ms</b> at 256 connections</div>
     </div></div>
   </div>
 </header>
@@ -406,11 +406,11 @@ footer .sp { margin-left: auto; font-family: var(--mono); font-size: 12.5px; }
 <div class="stats">
   <div class="wrap">
     <div class="stat"><div class="v">130<small>/130</small></div><div class="k">Gateway API v1.6.2 conformance tests. No skips.</div></div>
-    <div class="stat"><div class="v">126k</div><div class="k">Requests per second through 3 proxy pods at 256 connections</div></div>
-    <div class="stat"><div class="v">0.35<small>ms</small></div><div class="k">p99 latency at a fixed 30,000 requests per second</div></div>
-    <div class="stat"><div class="v">131<small>Mi</small></div><div class="k">Peak proxy memory across the payload benchmarks</div></div>
+    <div class="stat"><div class="v">224k</div><div class="k">Requests per second through 3 proxy pods at 256 connections</div></div>
+    <div class="stat"><div class="v">2.98<small>ms</small></div><div class="k">p99 latency at 224,000 requests per second</div></div>
+    <div class="stat"><div class="v">133k</div><div class="k">1 KB responses per second through 3 proxy pods</div></div>
   </div>
-  <div class="wrap stats-note">Portus 0.2.3 on a 10-vCPU Linux VM on an Apple M4, medians of three interleaved rounds.</div>
+  <div class="wrap stats-note">Portus 0.2.12 on an AWS c7a.8xlarge (32 vCPUs), medians of three interleaved rounds.</div>
 </div>
 
 <section class="chapter" id="conformance">
@@ -435,7 +435,7 @@ footer .sp { margin-left: auto; font-family: var(--mono); font-size: 12.5px; }
   <div class="wrap">
     <div class="head">
       <span class="eyebrow">Performance</span>
-      <h2>Fast under load. Light on memory.</h2>
+      <h2>Fast under load. Lean on CPU.</h2>
       <p>Measured with the open <a class="textlink" href="https://github.com/howardjohn/gateway-api-bench">gateway-api-bench</a> method: three interleaved rounds on one machine, against the same backend pods as the top-ranked gateway in that benchmark. Every number and every round is published.</p>
     </div>
     <div class="perf-grid">
@@ -453,14 +453,14 @@ footer .sp { margin-left: auto; font-family: var(--mono); font-size: 12.5px; }
           </div>
         </div>
         <div class="bars" id="bars"></div>
-        <div class="chart-foot"><span><i class="us"></i>Portus 0.2.3</span><span><i></i>agentgateway v1.5.0</span><span id="chart-unit">requests per second, bare GET /</span></div>
+        <div class="chart-foot"><span><i class="us"></i>Portus 0.2.12</span><span><i></i>agentgateway v1.5.0</span><span id="chart-unit">requests per second, bare GET /</span></div>
       </div>
       <div class="side">
         <div class="panel mini">
-          <h3>p99 at 30,000 req/s</h3>
+          <h3>p99 at 256 connections</h3>
           <div class="pair">
-            <div class="line"><span class="who">Portus</span><span class="val us">0.35<small>ms</small></span></div>
-            <div class="line"><span class="who">agentgateway</span><span class="val them">0.82 ms</span></div>
+            <div class="line"><span class="who">Portus</span><span class="val us">2.98<small>ms</small></span></div>
+            <div class="line"><span class="who">agentgateway</span><span class="val them">3.94 ms</span></div>
           </div>
         </div>
         <div class="panel mini">
@@ -471,15 +471,15 @@ footer .sp { margin-left: auto; font-family: var(--mono); font-size: 12.5px; }
           </div>
         </div>
         <div class="panel mini">
-          <h3>Peak proxy memory</h3>
+          <h3>Proxy CPU, download ladder</h3>
           <div class="pair">
-            <div class="line"><span class="who">Portus</span><span class="val us">131<small>Mi</small></span></div>
-            <div class="line"><span class="who">agentgateway</span><span class="val them">383–456 Mi</span></div>
+            <div class="line"><span class="who">Portus</span><span class="val us">4.1<small> cores</small></span></div>
+            <div class="line"><span class="who">agentgateway</span><span class="val them">5.7 cores</span></div>
           </div>
         </div>
       </div>
     </div>
-    <p class="method">Method: the howardjohn/gateway-api-bench approach on a 10-vCPU Linux VM on an Apple M4 (k3s, pods at MTU 65485), three interleaved rounds per gateway, fortio in-cluster with one pod per rung, 3 proxy pods each. Medians shown. Numbers from one machine are only comparable with each other. Failover figures come from the gateway-api-bench suite on Docker Desktop with no retry policy; with a <code>RetryPolicy</code> Portus returns 0 errors. <a href="https://github.com/Portus-Gateway/Portus/tree/main/benchmarks">Every round, including the tests agentgateway wins →</a></p>
+    <p class="method">Method: the howardjohn/gateway-api-bench approach on an AWS c7a.8xlarge (32 vCPUs, AMD EPYC 9R14; single-node k3s, pods at MTU 65000), three interleaved rounds per gateway, fortio in-cluster with one pod per rung, 3 proxy pods each. Medians shown. Numbers from one machine are only comparable with each other. agentgateway is ahead on 1 MiB plain-HTTP downloads and uses less memory per pod. Failover figures come from the gateway-api-bench suite on Docker Desktop with no retry policy; with a <code>RetryPolicy</code> Portus returns 0 errors. <a href="https://github.com/Portus-Gateway/Portus/tree/main/benchmarks">Every round, including the tests agentgateway wins →</a></p>
   </div>
 </section>
 
@@ -867,11 +867,11 @@ helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version
 
   /* ---------- benchmark chart ---------- */
   const data = {
-    traffic: { unit: 'requests per second, bare GET /', rows: [['64 conns', 116429, 96003], ['128 conns', 123105, 101067], ['256 conns', 126070, 89827]] },
-    dl:    { unit: 'requests per second, 64 connections', rows: [['1 KB', 87722, 67598], ['16 KB', 59257, 51562], ['128 KB', 29954, 27136], ['1 MiB', 5206, 5633]] },
-    ul:    { unit: 'requests per second, POST echoed, 64 connections', rows: [['1 KB', 66089, 58495], ['16 KB', 29578, 27940], ['128 KB', 8160, 7922], ['1 MiB', 4380, 4249]] },
-    https: { unit: 'requests per second, TLS, 64 connections', rows: [['1 KB', 76997, 60088], ['16 KB', 56831, 48295], ['128 KB', 25357, 22294], ['1 MiB', 4200, 4110]] },
-    h2:    { unit: 'requests per second, HTTP/2, 64 connections', rows: [['1 KB', 64172, 49453], ['16 KB', 49448, 40279], ['128 KB', 22431, 19641], ['1 MiB', 4173, 3538]] },
+    traffic: { unit: 'requests per second, bare GET /', rows: [['64 conns', 169317, 127988], ['128 conns', 196390, 150218], ['256 conns', 224173, 168099]] },
+    dl:    { unit: 'requests per second, 64 connections', rows: [['1 KB', 133077, 105345], ['16 KB', 107546, 87697], ['128 KiB', 59288, 55645], ['1 MiB', 12874, 13937]] },
+    ul:    { unit: 'requests per second, POST echoed, 64 connections', rows: [['1 KB', 123596, 98902], ['16 KB', 67989, 57557], ['128 KiB', 25830, 24791], ['1 MiB', 16228, 15999]] },
+    https: { unit: 'requests per second, TLS, 64 connections', rows: [['1 KB', 127918, 101157], ['16 KB', 101416, 82979], ['128 KiB', 50882, 45646], ['1 MiB', 11221, 11110]] },
+    h2:    { unit: 'requests per second, HTTP/2, 64 connections', rows: [['1 KB', 90857, 75676], ['16 KB', 74824, 64439], ['128 KiB', 32095, 30949], ['1 MiB', 6842, 6598]] },
   };
   const bars = document.getElementById('bars');
   const unit = document.getElementById('chart-unit');

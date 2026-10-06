@@ -244,35 +244,38 @@ Field reference for the three CRDs, the key API and the refusal shapes:
 
 ## Performance
 
-Measured with the [howardjohn/gateway-api-bench](https://github.com/howardjohn/gateway-api-bench) method on a
-10-vCPU Linux VM on an Apple M4 (apple/container machine, k3s, pods at MTU 65485; see
-[`deploy/machine/`](deploy/machine/README.md)): **Portus 0.2.3** and agentgateway v1.5.0, the fastest gateway in that
-benchmark's own ranking, three interleaved rounds each against the same backend pods, fortio in-cluster with one pod
-per rung, `kubectl top` sampled every 5 s. Medians of the three rounds; per-round values, spread and method are in
-[`benchmarks/`](benchmarks/README.md). Numbers from one machine are only comparable with each other.
+Measured with the [howardjohn/gateway-api-bench](https://github.com/howardjohn/gateway-api-bench) method on an
+AWS `c7a.8xlarge` (32 vCPUs, AMD EPYC 9R14, one thread per core; single-node k3s, pods at MTU 65000): **Portus 0.2.12**
+and agentgateway v1.5.0, the fastest gateway in that benchmark's own ranking, three interleaved rounds each against the
+same backend pods, fortio in-cluster with one pod per rung, `kubectl top` sampled every 5 s. Medians of the three
+rounds; per-round values, spread and method are in [`benchmarks/`](benchmarks/head-to-head-aws-2026-10-06.md). Numbers
+from one machine are only comparable with each other.
 
-**Traffic** (bare `GET /`; 3 proxy pods each, agentgateway unlimited):
+**Traffic** (bare `GET /`; 3 proxy pods each, Portus 2-CPU request, agentgateway unlimited):
 
-| Connections | Portus QPS | agentgateway QPS | |
-|---|---|---|---|
-| 64 | **116,429** | 96,003 | +21 % |
-| 128 | **123,105** | 101,067 | +22 % |
-| 256 | **126,070** | 89,827 | +40 % |
+| Connections | Portus QPS | agentgateway QPS | | p99, Portus / agentgateway |
+|---|---|---|---|---|
+| 1 | **14,218** | 9,103 | +56 % | 0.99 / 0.75 ms |
+| 64 | **169,317** | 127,988 | +32 % | 1.00 / 1.76 ms |
+| 128 | **196,390** | 150,218 | +31 % | 1.96 / 2.54 ms |
+| 256 | **224,173** | 168,099 | +33 % | 2.98 / 3.94 ms |
 
-p99 at a fixed 30,000 QPS (benchtool, same machine, same day): **Portus 0.35 ms**, agentgateway 0.82 ms.
+At a fixed 30,000 QPS both p99s sit inside fortio's 1 ms histogram bucket (0.99 ms each).
 
 **Payloads** (fortio echo backend, 64 connections, 10 s per rung, all requests `200`; QPS, Portus / agentgateway):
 
 | Response size | Download | Upload (POST, echoed) | HTTPS download | HTTP/2 download |
 |---|---|---|---|---|
-| 1 KB | **87,722** / 67,598 | **66,089** / 58,495 | **76,997** / 60,088 | **64,172** / 49,453 |
-| 16 KB | **59,257** / 51,562 | **29,578** / 27,940 | **56,831** / 48,295 | **49,448** / 40,279 |
-| 128 KB | **29,954** / 27,136 | 8,160 / 7,922 | **25,357** / 22,294 | **22,431** / 19,641 |
-| 1 MiB | 5,206 / 5,633 | 4,380 / 4,249 | 4,200 / 4,110 | **4,173** / 3,538 |
+| 1 KB | **133,077** / 105,345 | **123,596** / 98,902 | **127,918** / 101,157 | **90,857** / 75,676 |
+| 16 KB | **107,546** / 87,697 | **67,989** / 57,557 | **101,416** / 82,979 | **74,824** / 64,439 |
+| 128 KiB | **59,288** / 55,645 | **25,830** / 24,791 | **50,882** / 45,646 | **32,095** / 30,949 |
+| 1 MiB | 12,874 / **13,937** | 16,228 / 15,999 | 11,221 / 11,110 | 6,842 / 6,598 |
 
-Portus leads on 18 of 19 rungs, by 20–40 % on the request path and 13–30 % at 1 KB; the two are level at 1 MiB over
-plain HTTP and TLS, where the shared 10 vCPUs are the limit. Proxy CPU on the payload ladders: Portus 2.0–2.3 cores at
-131 Mi peak, agentgateway 2.3–2.6 cores at 383–456 Mi peak.
+Portus leads on 15 of 16 payload rungs, by 16–26 % at 1 KB and 16 KB; at 1 MiB the two are level over upload, TLS and
+HTTP/2, and agentgateway is 8 % ahead on plain-HTTP downloads. Proxy CPU (3 pods, mean per suite): Portus 3.2–7.7 cores,
+agentgateway 4.1–8.3, lower for Portus on every suite while it serves more requests. Peak memory per proxy pod: Portus
+155–181 Mi, agentgateway 51–145 Mi. The previous run, 0.2.3 on a 10-vCPU VM on an Apple M4, is in
+[`benchmarks/head-to-head-machine-2026-09-11.md`](benchmarks/head-to-head-machine-2026-09-11.md).
 
 **Control plane and availability** (gateway-api-bench suite, Portus 0.2.2 vs agentgateway on Docker Desktop, 2026-09-10;
 the bench catch-all route removed before the attached-routes and propagation tests):
@@ -285,10 +288,10 @@ the bench catch-all route removed before the attached-routes and propagation tes
 | Backend failover, 1 of 4 endpoints blackholed, no policy | **0.025 % errors** (passive outlier ejection) | 2.0 % errors |
 | Backend failover with a Gateway `RetryPolicy` | **0 errors** | not applicable |
 
-Details: [`benchmarks/head-to-head-machine-2026-09-11.md`](benchmarks/head-to-head-machine-2026-09-11.md) and
+Details: [`benchmarks/head-to-head-aws-2026-10-06.md`](benchmarks/head-to-head-aws-2026-10-06.md) and
 [`benchmarks/head-to-head-0.2.2-2026-09-10-k3d.md`](benchmarks/head-to-head-0.2.2-2026-09-10-k3d.md). Reproduce with
-`make bench-backend bench-portus bench-traffic-fortio bench-latency bench-download bench-upload bench-https bench-h2` and
-the `bench-*` control-plane targets.
+`make bench-backend bench-portus bench-traffic-fortio bench-latency-fortio bench-download bench-upload bench-https bench-h2`
+and the `bench-*` control-plane targets.
 
 
 ### Network stacks
@@ -301,7 +304,7 @@ the core for a plan and carries it out. The release image carries two:
 | Stack | Status | Select with |
 |---|---|---|
 | [Rama](https://github.com/plabayo/rama) 0.4 | Default since 0.2.4: conformance 130/130, the AI and MCP gateways run on it. Rama is used unpatched; the upstream connection pool is Portus's own | `dataplane.networkStack: rama` (default) |
-| [Pingora](https://github.com/cloudflare/pingora) 0.9 | The stack behind releases up to 0.2.3 and the numbers above; a small patch to `pingora-core` is vendored | `dataplane.networkStack: pingora` |
+| [Pingora](https://github.com/cloudflare/pingora) 0.9 | The stack behind releases up to 0.2.3; a small patch to `pingora-core` is vendored | `dataplane.networkStack: pingora` |
 
 On the same machine Rama measured 3–31 % more throughput than Pingora on every payload rung and used
 2–2.6× less memory in a single round

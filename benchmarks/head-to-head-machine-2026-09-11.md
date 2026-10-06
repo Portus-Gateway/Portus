@@ -1,6 +1,7 @@
 # Portus 0.2.3 vs agentgateway v1.5.0 on an apple/container machine (2026-09-11, three rounds)
 
-**Current README numbers.** Portus is the 0.2.3 build (0.2.2 plus: worker threads sized from the
+**Superseded** as the README numbers by `head-to-head-aws-2026-10-06.md` (0.2.12 on a 32-vCPU
+AWS box). Portus is the 0.2.3 build (0.2.2 plus: worker threads sized from the
 node instead of the CPU request, access log off, 1 MiB / 4 MiB h2 windows, constant keepalive pool
 cap), measured from a local build of the release commit minus the keepalive-pool-cap change, which
 landed after the run and only lowers how many idle upstream connections a pod keeps (the bench
