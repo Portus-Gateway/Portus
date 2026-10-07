@@ -1,6 +1,6 @@
 # Policies
 
-Portus policies are CRDs in the `portus-gateway.dev/v1alpha1` group that attach to a
+Portus policies are CRDs in the `portus-gateway.dev/v1beta1` group that attach to a
 Gateway API object with a `targetRef` (GEP-713 style). The controller compiles them into
 the route config; the data plane enforces them on the request path. The only call-out on
 the request path is the one an ExtAuthPolicy asks for.
@@ -40,7 +40,7 @@ printer columns.
 ## TimeoutPolicy
 
 ```yaml
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: TimeoutPolicy
 metadata: {name: slow-backend, namespace: apps}
 spec:

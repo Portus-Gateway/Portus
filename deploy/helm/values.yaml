@@ -83,6 +83,13 @@ grpcTls:
   secretName: ""
   # enabled: false sends everything in plaintext; local development only.
 
+# Portus's own CRDs (policies, AI gateway). The chart installs and upgrades
+# them; they are kept on `helm uninstall`, since deleting a CRD deletes every
+# object of its kind. false: manage them yourself (apply
+# deploy/helm/templates/crds/ with the guard lines removed).
+crds:
+  install: true
+
 serviceAccount:
   create: true
   name: ""

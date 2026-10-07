@@ -2,7 +2,7 @@
 # other message (initialize, tools/list, the GET event stream, DELETE) to the
 # same or another. Clients need a Portus key allowed to call the tools they
 # use; sessions stay on the server pod that created them.
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata:
   name: github-mcp
@@ -11,7 +11,7 @@ spec:
   kind: mcp
   url: http://github-mcp.tools.svc.cluster.local:3001
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIRoute
 metadata:
   name: mcp
@@ -34,7 +34,7 @@ spec:
 ---
 # 2,000 tool calls per key per day. A spent budget answers a JSON-RPC error
 # (-32003) with Retry-After; every response carries x-portus-calls-remaining.
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIUsagePolicy
 metadata:
   name: daily-calls

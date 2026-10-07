@@ -6,10 +6,9 @@ Clients keep speaking the provider's native API.
 
 1. Install with the ledger:
    `helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.12 -n portus --create-namespace --set aiGateway.enabled=true`.
-   A fresh install carries the AI CRDs. An existing install: apply
-   `deploy/helm/crds/aiprovider.yaml`, `airoute.yaml` and `aiusagepolicy.yaml`
-   by hand (Helm does not upgrade CRDs) and pass your values with `-f`, not
-   a reuse flag. Installs first created before 0.2.6 also delete the
+   The chart installs and upgrades the AI CRDs; an install from 0.2.12 or
+   earlier runs `deploy/helm/adopt-crds.sh <release> <namespace>` once first.
+   Pass your values with `-f`, not a reuse flag. Installs first created before 0.2.6 also delete the
    generated `portus-portus-gateway-grpc-tls` Secret once so it is
    regenerated with the ledger's names.
 2. Put your provider key in the Secret and apply `provider-and-route.yaml`,

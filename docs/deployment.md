@@ -34,9 +34,22 @@ The chart creates:
 - the **GatewayClass** `controller.gatewayClassName` (default `portus-gateway`);
 - the **ServiceAccount**, **ClusterRole** and **ClusterRoleBinding** for the controller, plus a Role for its leader-election Lease;
 - the mTLS **Secret** for the config stream (see below);
-- Portus's own policy **CRDs** from `crds/` (RateLimitPolicy, CircuitBreakerPolicy, ConnectionPolicy, BasicAuthPolicy, APIKeyAuthPolicy, JWTAuthPolicy, ExtAuthPolicy, RetryPolicy, IPAllowlistPolicy, RequestBodySizeLimitPolicy, HealthCheckPolicy, CORSPolicy, TimeoutPolicy). Helm installs these on first install only; after an upgrade re-apply them with `kubectl apply --server-side --force-conflicts -f deploy/helm/crds/` from the matching tag.
+- Portus's own **CRDs** (`portus-gateway.dev/v1beta1`): the policies (RateLimitPolicy, CircuitBreakerPolicy, ConnectionPolicy, BasicAuthPolicy, APIKeyAuthPolicy, JWTAuthPolicy, ExtAuthPolicy, RetryPolicy, IPAllowlistPolicy, RequestBodySizeLimitPolicy, HealthCheckPolicy, CORSPolicy, TimeoutPolicy) and the AI gateway's AIProvider, AIRoute and AIUsagePolicy. They are chart templates, so `helm upgrade` upgrades them, and they carry `helm.sh/resource-policy: keep`, so `helm uninstall` leaves them (deleting a CRD deletes every object of its kind). `crds.install: false` leaves them to you. See [Upgrading](#upgrading).
 
 Dataplanes are not chart objects. For every accepted Gateway the controller provisions a dataplane **Deployment** (`dataplane.replicasPerGateway` pods), a **Service** (`dataplane.service.type`, one port per listener) and a **PodDisruptionBudget** in the Gateway's namespace, all owned by the Gateway and garbage-collected with it. The `dataplane.*` values are the template for those objects. Generated objects are named `portus-<gateway>-<uid prefix>`, labelled `gateway.portus.dev/name` / `gateway.portus.dev/namespace` and `gateway.networking.k8s.io/gateway-name`, and carry the Gateway's `spec.infrastructure.labels` / `.annotations`. Each dataplane receives only its Gateway's config over the gRPC stream and has no Kubernetes API access. The Gateway's `status.addresses` is the Service's address (the LoadBalancer ingress once assigned, the ClusterIP otherwise), published once the controller can reach a ready dataplane through it.
+
+### Upgrading
+
+`helm upgrade` upgrades the controller, the chart's objects and Portus's CRDs; the controller then rolls every Gateway's dataplane. Pass your values with `-f` on every upgrade rather than `--reuse-values`, which ignores new chart defaults.
+
+**From 0.2.12 or earlier**, once: those charts installed the CRDs from `crds/`, which Helm never upgrades and does not own, so hand them to the release first or the upgrade fails with `invalid ownership metadata`:
+
+```bash
+deploy/helm/adopt-crds.sh portus portus   # <release> <namespace>, from the new tag
+helm upgrade portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version <new> -n portus -f my-values.yaml
+```
+
+**`v1alpha1` → `v1beta1`.** The CRDs moved to `v1beta1`. `v1alpha1` is still served, with the same schema and a deprecation warning, so existing objects and manifests keep working; `kubectl get` returns them as `v1beta1` once its discovery cache refreshes (up to 10 minutes; `kubectl api-resources` refreshes it now). Change `apiVersion: portus-gateway.dev/v1alpha1` to `v1beta1` in your manifests: a later release stops serving `v1alpha1`.
 
 ### mTLS on the config stream
 

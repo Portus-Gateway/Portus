@@ -129,7 +129,7 @@ pub async fn reconcile_circuit_breaker_policy(
         .unwrap_or_default();
 
     let desired_status = json!({
-        "apiVersion": "portus-gateway.dev/v1alpha1",
+        "apiVersion": "portus-gateway.dev/v1beta1",
         "kind": "CircuitBreakerPolicy",
         "metadata": { "name": name, "namespace": namespace },
         "status": { "conditions": desired_conditions.iter().map(|c| json!({

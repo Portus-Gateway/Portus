@@ -157,7 +157,7 @@ pub async fn reconcile_ai_usage_policy(policy: Arc<AIUsagePolicy>, ctx: Arc<Reco
     let namespace = policy.metadata.namespace.as_deref().unwrap_or_default();
     let current_conditions: Vec<Condition> = policy.status.as_ref().map(|s| s.conditions.clone()).unwrap_or_default();
     let desired_status = json!({
-        "apiVersion": "portus-gateway.dev/v1alpha1",
+        "apiVersion": "portus-gateway.dev/v1beta1",
         "kind": "AIUsagePolicy",
         "metadata": { "name": name, "namespace": namespace },
         "status": { "conditions": desired_conditions.iter().map(|c| json!({

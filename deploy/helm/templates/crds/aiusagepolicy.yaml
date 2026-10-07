@@ -1,15 +1,121 @@
+{{- if .Values.crds.install }}
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    # A CRD deletion deletes every object of its kind: uninstall keeps them.
+    helm.sh/resource-policy: keep
   name: aiusagepolicies.portus-gateway.dev
   labels:
     gateway.networking.k8s.io/policy: direct
 spec:
   group: portus-gateway.dev
   versions:
-    - name: v1alpha1
+    - name: v1beta1
       served: true
       storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Target
+          type: string
+          jsonPath: .spec.targetRef.name
+        - name: Tokens
+          type: integer
+          jsonPath: .spec.budget.tokens
+        - name: Calls
+          type: integer
+          jsonPath: .spec.budget.calls
+        - name: Window
+          type: string
+          jsonPath: .spec.budget.window
+        - name: Per
+          type: string
+          jsonPath: .spec.budget.per
+        - name: Accepted
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Accepted")].status
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [targetRef, budget]
+              properties:
+                targetRef:
+                  type: object
+                  required: [group, kind, name]
+                  properties:
+                    group:
+                      type: string
+                    kind:
+                      type: string
+                      enum: [AIRoute]
+                    name:
+                      type: string
+                    sectionName:
+                      type: string
+                budget:
+                  type: object
+                  required: [window]
+                  properties:
+                    tokens:
+                      type: integer
+                      minimum: 1
+                      description: "Tokens per window: input + output + cache read + cache creation (LLM routes); exactly one of tokens and calls"
+                    calls:
+                      type: integer
+                      minimum: 1
+                      description: "Requests that reached the server per window (MCP routes); exactly one of tokens and calls"
+                    window:
+                      type: string
+                      enum: [Hourly, Daily, Monthly]
+                    per:
+                      type: string
+                      enum: [Key, Subject, Tenant, Route]
+                      description: "Whose counter the request spends from; default Key. Subject: the user behind the call (the auth.onBehalfOf name under its key, else the key or OAuth subject)"
+                onLedgerUnavailable:
+                  type: string
+                  enum: [Open, Closed]
+                  description: "With no allowance held and the ledger unreachable: Open lets requests through (default), Closed refuses them"
+                onExhausted:
+                  type: object
+                  required: [fallbackModel]
+                  description: "Token budgets only: a spent budget sends the request to fallbackModel (same provider) instead of a 429, spending from a separate overflow allowance per subject and window; when that is spent too, requests are refused. Responses carry x-portus-fallback-model; rows carry rule <policy>#fallback"
+                  properties:
+                    fallbackModel:
+                      type: string
+                    overflowTokens:
+                      type: integer
+                      minimum: 1
+                      description: "Tokens per window the fallback may spend; default a tenth of budget.tokens"
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+    - name: v1alpha1
+      served: true
+      storage: false
+      deprecated: true
+      deprecationWarning: "portus-gateway.dev/v1alpha1 is deprecated; use portus-gateway.dev/v1beta1"
       subresources:
         status: {}
       additionalPrinterColumns:
@@ -113,3 +219,4 @@ spec:
     singular: aiusagepolicy
     kind: AIUsagePolicy
     shortNames: [aiup]
+{{- end }}

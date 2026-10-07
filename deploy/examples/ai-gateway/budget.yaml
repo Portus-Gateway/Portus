@@ -2,7 +2,7 @@
 # are input + output + cache read + cache creation as Anthropic reports
 # them. Every response carries x-portus-tokens-remaining; a request that
 # does not fit is a 429 with Retry-After to midnight UTC.
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIUsagePolicy
 metadata:
   name: daily-cap

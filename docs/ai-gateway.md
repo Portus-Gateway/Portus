@@ -15,9 +15,9 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
   --namespace portus --create-namespace --set aiGateway.enabled=true
 ```
 
-A fresh install carries the AI CRDs. On an existing install, `helm upgrade` does not
-touch CRDs: apply `deploy/helm/crds/aiprovider.yaml`, `airoute.yaml` and
-`aiusagepolicy.yaml` by hand. Pass your values with `-f` on every upgrade rather than
+The chart installs and upgrades the AI CRDs. An install from 0.2.12 or earlier runs
+`deploy/helm/adopt-crds.sh <release> <namespace>` once before upgrading (see
+[Upgrading](deployment.md#upgrading)). Pass your values with `-f` on every upgrade rather than
 `--reuse-values` or `--reset-then-reuse-values`: the reuse flags ignore new chart defaults,
 and after a failed revision they can drop values you had set (an install came up without
 its ledger that way). An install first created before 0.2.6 must also delete the generated
@@ -281,7 +281,7 @@ Several MCP servers behind one endpoint, with namespaced tool names, is an `AIPr
 of kind `mcp-federation` whose members are other `mcp` providers in the same namespace:
 
 ```yaml
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata: {name: tools, namespace: agents}
 spec:

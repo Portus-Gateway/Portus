@@ -142,7 +142,7 @@ native API; the gateway routes on the body, swaps credentials, meters and enforc
 keys, budgets and usage so the data plane never calls out on the request path.
 
 ```yaml
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata: {name: anthropic, namespace: llm}
 spec:
@@ -150,7 +150,7 @@ spec:
   url: https://api.anthropic.com
   credential: {secretRef: {name: anthropic-key}}
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIRoute
 metadata: {name: claude, namespace: llm}
 spec:
@@ -162,7 +162,7 @@ spec:
     - model: {type: Prefix, value: claude-}
     providerRefs: [{name: anthropic}]
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIUsagePolicy
 metadata: {name: daily-cap, namespace: llm}
 spec:
@@ -201,14 +201,14 @@ spec:
 An MCP server is a provider of `kind: mcp`; the transport is Streamable HTTP.
 
 ```yaml
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata: {name: github-mcp, namespace: tools}
 spec:
   kind: mcp
   url: http://github-mcp.tools.svc.cluster.local:3001
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIRoute
 metadata: {name: mcp, namespace: tools}
 spec:

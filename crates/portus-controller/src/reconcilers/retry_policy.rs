@@ -186,7 +186,7 @@ pub async fn reconcile_retry_policy(
         .unwrap_or_default();
 
     let desired_status = json!({
-        "apiVersion": "portus-gateway.dev/v1alpha1",
+        "apiVersion": "portus-gateway.dev/v1beta1",
         "kind": "RetryPolicy",
         "metadata": { "name": name, "namespace": namespace },
         "status": { "conditions": desired_conditions.iter().map(|c| json!({

@@ -15,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **CRDs promoted to `portus-gateway.dev/v1beta1`.** `v1alpha1` is still served with the same schema and a deprecation warning; update manifests before a later release drops it.
+- **The chart upgrades Portus's CRDs.** They moved from `crds/` into the templates with `helm.sh/resource-policy: keep` (`crds.install`, default true). Installs from 0.2.12 or earlier run `deploy/helm/adopt-crds.sh <release> <namespace>` once before upgrading. See [`docs/deployment.md`](docs/deployment.md#upgrading).
 - Data plane: request metrics are resolved once per endpoint pool, request headers use typed names, and the HTTP/2 upstream connection set is lock-free (about 3 % less CPU per request at a fixed rate).
 
 ## [0.2.12] - 2026-10-01

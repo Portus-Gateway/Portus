@@ -14,7 +14,7 @@ use crate::policy_types::{PolicyStatus, PolicyTargetRef};
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "AIProvider",
     plural = "aiproviders",
     namespaced,
@@ -86,7 +86,7 @@ pub struct AISecretKeyRef {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "AIRoute",
     plural = "airoutes",
     namespaced,
@@ -229,7 +229,7 @@ pub struct AIProviderRef {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "AIUsagePolicy",
     plural = "aiusagepolicies",
     namespaced,

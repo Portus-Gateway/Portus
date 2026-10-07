@@ -44,7 +44,7 @@ pub struct SecretRef {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "RateLimitPolicy",
     plural = "ratelimitpolicies",
     namespaced,
@@ -71,7 +71,7 @@ pub struct RateLimitSpec {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "CircuitBreakerPolicy",
     plural = "circuitbreakerpolicies",
     namespaced,
@@ -100,7 +100,7 @@ pub struct CircuitBreakerSpec {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "ConnectionPolicy",
     plural = "connectionpolicies",
     namespaced,
@@ -119,7 +119,7 @@ pub struct ConnectionPolicySpec {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "BasicAuthPolicy",
     plural = "basicauthpolicies",
     namespaced,
@@ -146,7 +146,7 @@ pub struct BasicAuthSpec {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "APIKeyAuthPolicy",
     plural = "apikeyauthpolicies",
     namespaced,
@@ -178,7 +178,7 @@ pub struct ApiKeySpec {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "JWTAuthPolicy",
     plural = "jwtauthpolicies",
     namespaced,
@@ -223,7 +223,7 @@ pub struct ClaimToHeader {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "ExtAuthPolicy",
     plural = "extauthpolicies",
     namespaced,
@@ -276,7 +276,7 @@ fn default_api_key_header() -> Option<String> {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "RetryPolicy",
     plural = "retrypolicies",
     namespaced,
@@ -305,7 +305,7 @@ pub struct RetrySpec {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "IPAllowlistPolicy",
     plural = "ipallowlistpolicies",
     namespaced,
@@ -331,7 +331,7 @@ pub struct IPAllowlistPolicySpec {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "RequestBodySizeLimitPolicy",
     plural = "requestbodysizelimitpolicies",
     namespaced,
@@ -351,7 +351,7 @@ pub struct RequestBodySizeLimitPolicySpec {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "HealthCheckPolicy",
     plural = "healthcheckpolicies",
     namespaced,
@@ -394,7 +394,7 @@ fn default_hc_unhealthy() -> u32 { 3 }
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "CORSPolicy",
     plural = "corspolicies",
     namespaced,
@@ -428,7 +428,7 @@ pub struct CORSSpec {
 #[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "portus-gateway.dev",
-    version = "v1alpha1",
+    version = "v1beta1",
     kind = "TimeoutPolicy",
     plural = "timeoutpolicies",
     namespaced,
@@ -478,3 +478,60 @@ pub fn is_policy_winner(
     }
 }
 
+#[cfg(test)]
+mod crd_manifest_tests {
+    use super::*;
+    use crate::ai_types::{AIProvider, AIRoute, AIUsagePolicy};
+    use kube::Resource;
+
+    /// (kind, version) the controller watches, for every Portus CRD.
+    fn watched() -> Vec<(String, String)> {
+        macro_rules! of {
+            ($($t:ty),*) => { vec![$((<$t as Resource>::kind(&()).to_string(), <$t as Resource>::version(&()).to_string())),*] };
+        }
+        of!(RateLimitPolicy, CircuitBreakerPolicy, ConnectionPolicy, BasicAuthPolicy, APIKeyAuthPolicy, JWTAuthPolicy,
+            ExtAuthPolicy, RetryPolicy, IPAllowlistPolicy, RequestBodySizeLimitPolicy, HealthCheckPolicy, CORSPolicy,
+            TimeoutPolicy, AIProvider, AIRoute, AIUsagePolicy)
+    }
+
+    /// The chart's CRD manifests with the `crds.install` guard stripped.
+    fn manifests() -> Vec<(String, serde_json::Value)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/helm/templates/crds");
+        let mut out: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .map(|path| {
+                let text = std::fs::read_to_string(&path).unwrap();
+                let body: String = text.lines().filter(|l| !l.trim_start().starts_with("{{")).collect::<Vec<_>>().join("\n");
+                (path.file_name().unwrap().to_string_lossy().into_owned(), serde_yaml_ng::from_str(&body).unwrap())
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Every CRD stores the version the controller watches and still serves
+    /// the deprecated v1alpha1 with the same schema, so objects written
+    /// before the promotion keep working without a conversion webhook.
+    #[test]
+    fn chart_crds_store_the_watched_version_and_serve_v1alpha1_unchanged() {
+        let watched = watched();
+        let manifests = manifests();
+        assert_eq!(manifests.len(), watched.len(), "one manifest per CRD type");
+        for (file, crd) in &manifests {
+            let kind = crd["spec"]["names"]["kind"].as_str().unwrap();
+            let (_, version) = watched.iter().find(|(k, _)| k == kind).unwrap_or_else(|| panic!("{file}: no Rust type for {kind}"));
+            assert_eq!(crd["metadata"]["annotations"]["helm.sh/resource-policy"], "keep", "{file}");
+            let versions = crd["spec"]["versions"].as_array().unwrap();
+            let storage: Vec<_> = versions.iter().filter(|v| v["storage"] == true).collect();
+            assert_eq!(storage.len(), 1, "{file}");
+            assert_eq!(storage[0]["name"], version.as_str(), "{file}: stores what the controller watches");
+            assert_eq!(storage[0]["served"], true, "{file}");
+            let alpha = versions.iter().find(|v| v["name"] == "v1alpha1").unwrap_or_else(|| panic!("{file}: v1alpha1 dropped"));
+            assert_eq!(alpha["served"], true, "{file}");
+            assert_eq!(alpha["deprecated"], true, "{file}");
+            assert_eq!(alpha["schema"], storage[0]["schema"], "{file}: no conversion webhook, so the schemas must match");
+            assert_eq!(alpha["subresources"], storage[0]["subresources"], "{file}");
+        }
+    }
+}

@@ -1,7 +1,7 @@
 # Three MCP servers behind one endpoint with namespaced tool names. Clients
 # connect once to https://mcp.example.com/mcp and see github.*, wiki.* and
 # aws.* tools; each tools/call goes to the server its prefix names.
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata: {name: github-mcp, namespace: agents}
 spec:
@@ -9,17 +9,17 @@ spec:
   url: https://api.githubcopilot.com
   credential: {secretRef: {name: github-mcp-token}}
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata: {name: deepwiki, namespace: agents}
 spec: {kind: mcp, url: https://mcp.deepwiki.com}
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata: {name: aws-knowledge, namespace: agents}
 spec: {kind: mcp, url: https://knowledge-mcp.global.api.aws}
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata: {name: tools, namespace: agents}
 spec:
@@ -29,7 +29,7 @@ spec:
   - {name: wiki, provider: deepwiki}              # /mcp
   - {name: aws, provider: aws-knowledge, path: /}
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIRoute
 metadata: {name: tools, namespace: agents}
 spec:

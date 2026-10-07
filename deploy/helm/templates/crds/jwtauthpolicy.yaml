@@ -1,15 +1,116 @@
+{{- if .Values.crds.install }}
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
+  annotations:
+    # A CRD deletion deletes every object of its kind: uninstall keeps them.
+    helm.sh/resource-policy: keep
   name: jwtauthpolicies.portus-gateway.dev
   labels:
     gateway.networking.k8s.io/policy: direct
 spec:
   group: portus-gateway.dev
   versions:
-    - name: v1alpha1
+    - name: v1beta1
       served: true
       storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Target
+          type: string
+          jsonPath: .spec.targetRef.name
+        - name: Accepted
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Accepted")].status
+        - name: Keys
+          type: string
+          jsonPath: .status.conditions[?(@.type=="ResolvedRefs")].status
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [targetRef, jwt]
+              properties:
+                targetRef:
+                  type: object
+                  required: [group, kind, name]
+                  properties:
+                    group:
+                      type: string
+                    kind:
+                      type: string
+                      enum: [HTTPRoute, GRPCRoute, Gateway]
+                    name:
+                      type: string
+                    sectionName:
+                      type: string
+                jwt:
+                  type: object
+                  required: [providers]
+                  properties:
+                    providers:
+                      type: array
+                      minItems: 1
+                      maxItems: 8
+                      items:
+                        type: object
+                        required: [issuer]
+                        properties:
+                          issuer:
+                            type: string
+                            description: The iss claim tokens carry; an http(s) URL.
+                            pattern: '^https?://'
+                          audiences:
+                            type: array
+                            description: Accepted aud values (any one). Empty accepts any audience.
+                            items:
+                              type: string
+                          jwksUri:
+                            type: string
+                            description: Where the issuer publishes its keys. Found by OpenID discovery when unset.
+                            pattern: '^https?://'
+                          claimToHeaders:
+                            type: array
+                            description: Claims copied into request headers. Client-supplied copies of these headers are removed.
+                            items:
+                              type: object
+                              required: [claim, header]
+                              properties:
+                                claim:
+                                  type: string
+                                  minLength: 1
+                                header:
+                                  type: string
+                                  pattern: "^[A-Za-z0-9!#$%&'*+.^_`|~-]+$"
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+    - name: v1alpha1
+      served: true
+      storage: false
+      deprecated: true
+      deprecationWarning: "portus-gateway.dev/v1alpha1 is deprecated; use portus-gateway.dev/v1beta1"
       subresources:
         status: {}
       additionalPrinterColumns:
@@ -108,3 +209,4 @@ spec:
     singular: jwtauthpolicy
     kind: JWTAuthPolicy
     shortNames: [jwtp]
+{{- end }}

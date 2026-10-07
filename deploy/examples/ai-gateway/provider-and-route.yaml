@@ -2,8 +2,8 @@
 # API to llm.example.com with a Portus API key, the gateway swaps in the
 # provider credential and records usage in the ledger.
 #
-# Needs: dataplane.networkStack=rama, aiGateway.enabled=true, the CRDs in
-# deploy/helm/crds/ai*.yaml applied, and a Gateway named `gateway` in this
+# Needs: dataplane.networkStack=rama, aiGateway.enabled=true (the chart
+# installs the AI CRDs), and a Gateway named `gateway` in this
 # namespace with an HTTP or HTTPS listener.
 apiVersion: v1
 kind: Secret
@@ -13,7 +13,7 @@ metadata:
 stringData:
   api-key: sk-ant-REPLACE_ME
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata:
   name: anthropic
@@ -25,7 +25,7 @@ spec:
     secretRef:
       name: anthropic-key
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIRoute
 metadata:
   name: claude

@@ -161,6 +161,7 @@ gateway-api-crds:
 deploy: gateway-api-crds disk-check
 	$(call IMPORT_IMAGE,$(CONTROLLER_IMAGE))
 	$(call IMPORT_IMAGE,$(DATAPLANE_IMAGE))
+	KUBECTL="$(MISE) kubectl" deploy/helm/adopt-crds.sh $(HELM_RELEASE) $(NAMESPACE)
 	$(MISE) helm upgrade --install $(HELM_RELEASE) $(HELM_CHART) \
 		--namespace $(NAMESPACE) \
 		--create-namespace \

@@ -1,0 +1,440 @@
+{{- if .Values.crds.install }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    # A CRD deletion deletes every object of its kind: uninstall keeps them.
+    helm.sh/resource-policy: keep
+  name: airoutes.portus-gateway.dev
+spec:
+  group: portus-gateway.dev
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Hostnames
+          type: string
+          jsonPath: .spec.hostnames
+        - name: Accepted
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Accepted")].status
+        - name: Resolved
+          type: string
+          jsonPath: .status.conditions[?(@.type=="ResolvedRefs")].status
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [parentRefs, rules]
+              properties:
+                parentRefs:
+                  type: array
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      group:
+                        type: string
+                      kind:
+                        type: string
+                      namespace:
+                        type: string
+                      name:
+                        type: string
+                      sectionName:
+                        type: string
+                      port:
+                        type: integer
+                hostnames:
+                  type: array
+                  items:
+                    type: string
+                requireApiKey:
+                  type: boolean
+                  description: "Requests must present a Portus API key (x-api-key or Authorization: Bearer) issued by the ledger, or a token accepted by auth"
+                auth:
+                  type: object
+                  properties:
+                    jwt:
+                      type: object
+                      required: [issuer]
+                      description: "OAuth bearer tokens from one issuer are accepted in place of a Portus key; verified on the data plane against the issuer's JWKS (ledger: aiGateway.jwt.issuers)"
+                      properties:
+                        issuer:
+                          type: string
+                        audience:
+                          type: string
+                        tenantClaim:
+                          type: string
+                          description: "Claim naming the tenant; default groups"
+                        toolsClaim:
+                          type: string
+                          description: "Claim listing the MCP tools the subject may call; default scope"
+                        scopes:
+                          type: array
+                          items:
+                            type: string
+                          description: "Scopes MCP clients are told to request (metadata scopes_supported and the 401 challenge); default [openid, profile, email, groups]"
+                        groupsClaim:
+                          type: string
+                          description: "Claim listing the subject's groups; default groups"
+                        toolsByGroup:
+                          type: object
+                          additionalProperties:
+                            type: array
+                            items:
+                              type: string
+                          description: "MCP tools granted per group (exact or prefix.*). A subject may call the union of what its groups grant and what toolsClaim lists; with a map in force, a subject granted nothing may call no tool"
+                    onBehalfOf:
+                      type: object
+                      required: [trustedKeys]
+                      description: "A trusted caller (a hub holding one key for many users) names the user it acts for in a header; the gateway records that user as the subject, can budget per subject (AIUsagePolicy budget.per: Subject) and strips the header before forwarding. From any key not trusted the header is ignored. Entries: name, tenant/name, tenant/* (every key of the tenant, including ones issued later) or label:key=value (every key with that label)."
+                      properties:
+                        header:
+                          type: string
+                          description: "Header carrying the user's name; default x-portus-on-behalf-of"
+                        trustedKeys:
+                          type: array
+                          minItems: 1
+                          items:
+                            type: string
+                          description: "Keys whose header is believed, by name or tenant/name"
+                rules:
+                  type: array
+                  items:
+                    type: object
+                    required: [providerRefs]
+                    properties:
+                      matches:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            path:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, PathPrefix, RegularExpression]
+                                value:
+                                  type: string
+                            model:
+                              type: object
+                              required: [value]
+                              description: "Matches the request body's top-level model field"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
+                            stream:
+                              type: boolean
+                              description: "Matches the request body's top-level stream flag"
+                            method:
+                              type: object
+                              required: [value]
+                              description: "MCP: matches the JSON-RPC method (tools/call, tools/list, ...)"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
+                            tool:
+                              type: object
+                              required: [value]
+                              description: "MCP: matches params.name of a tools/call"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
+                            headers:
+                              type: array
+                              items:
+                                type: object
+                                required: [name, value]
+                                properties:
+                                  type:
+                                    type: string
+                                    enum: [Exact, RegularExpression]
+                                  name:
+                                    type: string
+                                  value:
+                                    type: string
+                      urlRewrite:
+                        type: object
+                        required: [path]
+                        description: "Rewrite the path before forwarding, as HTTPRoute's URLRewrite filter"
+                        properties:
+                          path:
+                            type: object
+                            required: [type]
+                            properties:
+                              type:
+                                type: string
+                                enum: [ReplaceFullPath, ReplacePrefixMatch]
+                              replaceFullPath:
+                                type: string
+                              replacePrefixMatch:
+                                type: string
+                      providerRefs:
+                        type: array
+                        minItems: 1
+                        maxItems: 1
+                        description: "The AIProvider (same namespace) this rule forwards to; one per rule"
+                        items:
+                          type: object
+                          required: [name]
+                          properties:
+                            name:
+                              type: string
+                            weight:
+                              type: integer
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+    - name: v1alpha1
+      served: true
+      storage: false
+      deprecated: true
+      deprecationWarning: "portus-gateway.dev/v1alpha1 is deprecated; use portus-gateway.dev/v1beta1"
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Hostnames
+          type: string
+          jsonPath: .spec.hostnames
+        - name: Accepted
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Accepted")].status
+        - name: Resolved
+          type: string
+          jsonPath: .status.conditions[?(@.type=="ResolvedRefs")].status
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [parentRefs, rules]
+              properties:
+                parentRefs:
+                  type: array
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      group:
+                        type: string
+                      kind:
+                        type: string
+                      namespace:
+                        type: string
+                      name:
+                        type: string
+                      sectionName:
+                        type: string
+                      port:
+                        type: integer
+                hostnames:
+                  type: array
+                  items:
+                    type: string
+                requireApiKey:
+                  type: boolean
+                  description: "Requests must present a Portus API key (x-api-key or Authorization: Bearer) issued by the ledger, or a token accepted by auth"
+                auth:
+                  type: object
+                  properties:
+                    jwt:
+                      type: object
+                      required: [issuer]
+                      description: "OAuth bearer tokens from one issuer are accepted in place of a Portus key; verified on the data plane against the issuer's JWKS (ledger: aiGateway.jwt.issuers)"
+                      properties:
+                        issuer:
+                          type: string
+                        audience:
+                          type: string
+                        tenantClaim:
+                          type: string
+                          description: "Claim naming the tenant; default groups"
+                        toolsClaim:
+                          type: string
+                          description: "Claim listing the MCP tools the subject may call; default scope"
+                        scopes:
+                          type: array
+                          items:
+                            type: string
+                          description: "Scopes MCP clients are told to request (metadata scopes_supported and the 401 challenge); default [openid, profile, email, groups]"
+                        groupsClaim:
+                          type: string
+                          description: "Claim listing the subject's groups; default groups"
+                        toolsByGroup:
+                          type: object
+                          additionalProperties:
+                            type: array
+                            items:
+                              type: string
+                          description: "MCP tools granted per group (exact or prefix.*). A subject may call the union of what its groups grant and what toolsClaim lists; with a map in force, a subject granted nothing may call no tool"
+                    onBehalfOf:
+                      type: object
+                      required: [trustedKeys]
+                      description: "A trusted caller (a hub holding one key for many users) names the user it acts for in a header; the gateway records that user as the subject, can budget per subject (AIUsagePolicy budget.per: Subject) and strips the header before forwarding. From any key not trusted the header is ignored. Entries: name, tenant/name, tenant/* (every key of the tenant, including ones issued later) or label:key=value (every key with that label)."
+                      properties:
+                        header:
+                          type: string
+                          description: "Header carrying the user's name; default x-portus-on-behalf-of"
+                        trustedKeys:
+                          type: array
+                          minItems: 1
+                          items:
+                            type: string
+                          description: "Keys whose header is believed, by name or tenant/name"
+                rules:
+                  type: array
+                  items:
+                    type: object
+                    required: [providerRefs]
+                    properties:
+                      matches:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            path:
+                              type: object
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, PathPrefix, RegularExpression]
+                                value:
+                                  type: string
+                            model:
+                              type: object
+                              required: [value]
+                              description: "Matches the request body's top-level model field"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
+                            stream:
+                              type: boolean
+                              description: "Matches the request body's top-level stream flag"
+                            method:
+                              type: object
+                              required: [value]
+                              description: "MCP: matches the JSON-RPC method (tools/call, tools/list, ...)"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
+                            tool:
+                              type: object
+                              required: [value]
+                              description: "MCP: matches params.name of a tools/call"
+                              properties:
+                                type:
+                                  type: string
+                                  enum: [Exact, Prefix, RegularExpression]
+                                value:
+                                  type: string
+                            headers:
+                              type: array
+                              items:
+                                type: object
+                                required: [name, value]
+                                properties:
+                                  type:
+                                    type: string
+                                    enum: [Exact, RegularExpression]
+                                  name:
+                                    type: string
+                                  value:
+                                    type: string
+                      urlRewrite:
+                        type: object
+                        required: [path]
+                        description: "Rewrite the path before forwarding, as HTTPRoute's URLRewrite filter"
+                        properties:
+                          path:
+                            type: object
+                            required: [type]
+                            properties:
+                              type:
+                                type: string
+                                enum: [ReplaceFullPath, ReplacePrefixMatch]
+                              replaceFullPath:
+                                type: string
+                              replacePrefixMatch:
+                                type: string
+                      providerRefs:
+                        type: array
+                        minItems: 1
+                        maxItems: 1
+                        description: "The AIProvider (same namespace) this rule forwards to; one per rule"
+                        items:
+                          type: object
+                          required: [name]
+                          properties:
+                            name:
+                              type: string
+                            weight:
+                              type: integer
+            status:
+              type: object
+              properties:
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      observedGeneration:
+                        type: integer
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+  scope: Namespaced
+  names:
+    plural: airoutes
+    singular: airoute
+    kind: AIRoute
+    shortNames: [air]
+{{- end }}
