@@ -144,6 +144,8 @@ Policies are CRDs that attach to Gateways, routes and Services with a `targetRef
 | RequestBodySizeLimitPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | 413 on `Content-Length` and on streamed bodies |
 | BasicAuthPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | bcrypt hashes in a Secret, cost ≥ 10 |
 | ApiKeyAuthPolicy | HTTPRoute, GRPCRoute, AIRoute, Gateway | Header against Secret values |
+| JWTAuthPolicy | HTTPRoute, GRPCRoute, Gateway | Bearer JWTs against issuers' JWKS, audiences, claims to headers |
+| ExtAuthPolicy | HTTPRoute, GRPCRoute, Gateway | Forward-auth call to an authorization Service; denials passed through |
 | AIUsagePolicy | AIRoute | Token or call budgets per key, tenant or route (0.2.4) |
 | BackendTLSPolicy | Service | Gateway API v1: CA bundle, hostname and SAN validation; client certificate from `Gateway.spec.tls.backend` |
 
@@ -151,9 +153,7 @@ Policies are CRDs that attach to Gateways, routes and Services with a `targetRef
 
 | Policy | Notes |
 |--------|-------|
-| JWTAuthPolicy | Local verification against a JWKS the ledger refreshes (in design for 0.2.5 alongside OAuth for MCP clients) |
 | LoadBalancerPolicy | Round-robin is the default; keyed selection exists for MCP session affinity and will be exposed as a policy |
-| ExtAuthPolicy | External authorization callout |
 
 ### Not Planned
 
@@ -203,8 +203,8 @@ These are proxy-level features in the Pingora-based dataplane, independent of Ga
 | CORS | Supported | Preflight and simple requests. Configurable origins, methods, headers, credentials, max-age. |
 | Basic auth | Supported | Bcrypt credential validation, configurable realm. |
 | API key auth | Supported | Header-based key validation, O(1) lookup. |
-| JWT auth | Planned | Token validation, JWKS fetching, claim extraction. |
-| External auth (ExtAuth) | Planned | Callout to external authorization service. |
+| JWT auth | Supported | JWTAuthPolicy: signature, issuer, audience, expiry; JWKS fetched by the controller; claims to headers. |
+| External auth (ExtAuth) | Supported | ExtAuthPolicy: forward-auth over HTTP; gRPC `ext_authz` not yet. |
 | IP allowlist/denylist | Supported | `IPAllowlistPolicy`: allow and deny CIDRs, trusted proxy CIDRs for `X-Forwarded-For`. |
 | Request body size limit | Supported | `RequestBodySizeLimitPolicy`: `Content-Length` and streamed bodies. |
 

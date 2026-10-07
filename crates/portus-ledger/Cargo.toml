@@ -10,7 +10,7 @@ keywords = ["proxy", "gateway-api", "llm"]
 categories = ["network-programming"]
 
 [dependencies]
-portus-types = { path = "../portus-types" }
+portus-types = { path = "../portus-types", features = ["jwks"] }
 tonic = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }

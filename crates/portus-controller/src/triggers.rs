@@ -376,6 +376,8 @@ policy_refs!(
     ConnectionPolicy,
     BasicAuthPolicy,
     APIKeyAuthPolicy,
+    JWTAuthPolicy,
+    ExtAuthPolicy,
     RetryPolicy,
     IPAllowlistPolicy,
     RequestBodySizeLimitPolicy,

@@ -1,3 +1,6 @@
+#[cfg(feature = "jwks")]
+pub mod jwks;
+
 pub mod proto {
     pub mod portus {
         pub mod config {
@@ -11,6 +14,7 @@ pub mod proto {
             }
         }
     }
+
 }
 
 // Re-export for convenience

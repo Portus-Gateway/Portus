@@ -28,7 +28,13 @@ use crate::router::{
     spawn_mirror_request, BackendTlsInfo, BodyFields, ClientIdentity, CorsConfig, ListenerBucket,
     PathRoute, ProxySnapshot, RequestHeaders, DEFAULT_MAX_REQUEST_BODY_BYTES,
 };
+use crate::ext_auth::{Decision, Original};
+use crate::jwt::JwtRefusal;
+use crate::readiness::unix_now;
 use crate::types::{AuthConfig, BackendProtocol};
+
+/// The empty mutation list, shared so an auth mutation allocates nothing for it.
+static NO_HEADERS: std::sync::LazyLock<Arc<Vec<(HeaderName, HeaderValue)>>> = std::sync::LazyLock::new(|| Arc::new(Vec::new()));
 
 /// What the stack knows about a request before routing.
 pub struct RequestFacts<'a, H: RequestHeaders + ?Sized> {
@@ -254,6 +260,11 @@ pub struct Forward {
     /// Effective request body limit (route policy or the global default).
     pub max_request_body_bytes: u64,
     pub request_headers: HeaderMutations,
+    /// Headers the route's authentication sets from the verified identity
+    /// (JWT claims, the ExtAuth service's answer), applied after
+    /// `request_headers`. The headers it owns are removed first so a client
+    /// cannot supply them.
+    pub auth_headers: Option<HeaderMutations>,
     pub response_headers: HeaderMutations,
     pub rewrite_path: Option<String>,
     pub rewrite_hostname: Option<Arc<str>>,
@@ -444,6 +455,7 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
     }
 
     // Auth, before rate limiting so unauthenticated requests spend no tokens.
+    let mut auth_headers = None;
     if let Some(auth) = &pr.auth_config {
         match auth {
             AuthConfig::BasicAuth { credentials, realm } => {
@@ -464,6 +476,46 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
                     return Plan::Respond(Reply::empty(status));
                 }
             }
+            AuthConfig::Jwt(jwt) => match jwt.authenticate(facts.headers.get("authorization"), &snap.jwks, unix_now()) {
+                Ok(set) => {
+                    auth_headers = Some(HeaderMutations { add: Arc::clone(&NO_HEADERS), set, remove: Arc::clone(&jwt.owned_headers) });
+                }
+                Err(refusal) => {
+                    let challenge = match refusal {
+                        JwtRefusal::Missing => r#"Bearer realm="portus""#,
+                        JwtRefusal::Invalid => r#"Bearer realm="portus", error="invalid_token""#,
+                    };
+                    return Plan::Respond(
+                        Reply::empty(401).with_header(http::header::WWW_AUTHENTICATE, HeaderValue::from_static(challenge)),
+                    );
+                }
+            },
+        }
+    }
+
+    // ExtAuthPolicy: the authorization service decides after built-in auth.
+    if let Some(ext) = &pr.ext_auth {
+        let pool = snap.lbs.get(&(Arc::clone(&ext.service_name), ext.port));
+        let original = Original {
+            method: facts.method,
+            scheme: original_scheme,
+            host,
+            path_and_query: facts.path_and_query,
+            client_ip,
+            headers: facts.headers,
+        };
+        match ext.check(pool.map(Arc::as_ref), &original).await {
+            Decision::Allow(set) => {
+                auth_headers = Some(match auth_headers.take() {
+                    None => HeaderMutations { add: Arc::clone(&NO_HEADERS), set, remove: Arc::clone(&ext.response_headers) },
+                    Some(jwt) => HeaderMutations {
+                        add: Arc::clone(&NO_HEADERS),
+                        set: Arc::new(jwt.set.iter().chain(set.iter()).cloned().collect()),
+                        remove: Arc::new(jwt.remove.iter().chain(ext.response_headers.iter()).cloned().collect()),
+                    },
+                });
+            }
+            Decision::Deny(reply) => return Plan::Respond(reply),
         }
     }
 
@@ -586,6 +638,7 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
         retry_codes: Arc::clone(&pr.retry_codes),
         max_request_body_bytes,
         request_headers,
+        auth_headers,
         response_headers: HeaderMutations {
             add: Arc::clone(&pr.response_headers_add),
             set: Arc::clone(&pr.response_headers_set),
@@ -1032,6 +1085,129 @@ mod tests {
             }
             _ => panic!("expected the key authorization"),
         }
+    }
+
+    /// JWTAuthPolicy end to end through the planner: no token and a bad
+    /// token are 401 with a Bearer challenge; a good token forwards with the
+    /// claim headers, and the plan strips client copies of those headers.
+    #[tokio::test]
+    async fn a_jwt_route_refuses_bad_tokens_and_forwards_claims() {
+        use crate::jwt::tests::{issuer_keys, now, token};
+        let (key, jwks) = issuer_keys("k1");
+        let mut snap = catch_all_snapshot("acme.example.com", "api");
+        snap.jwks = Arc::new(crate::jwt::Jwks::from_entries([("https://dex.example.com", jwks.as_str())]));
+        let auth = Arc::new(crate::jwt::JwtAuth::new(vec![crate::jwt::Provider {
+            issuer: Arc::from("https://dex.example.com"),
+            audiences: vec!["api".into()],
+            claim_headers: vec![("sub".into(), HeaderName::from_static("x-user"))],
+        }]));
+        for bucket in snap.listeners_by_port.get_mut(&80).unwrap() {
+            for hr in bucket.exact.values_mut() {
+                for r in &mut hr.rules {
+                    r.auth_config = Some(AuthConfig::Jwt(Arc::clone(&auth)));
+                }
+            }
+        }
+        let plan_with = |authorization: Option<String>| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-user", HeaderValue::from_static("mallory"));
+            if let Some(a) = authorization {
+                headers.insert(http::header::AUTHORIZATION, HeaderValue::from_str(&a).unwrap());
+            }
+            headers
+        };
+        let refused = |plan: Plan| match plan {
+            Plan::Respond(r) => (r.status, r.headers.iter().find(|(n, _)| n == http::header::WWW_AUTHENTICATE).map(|(_, v)| v.to_str().unwrap().to_string())),
+            _ => panic!("expected a refusal"),
+        };
+
+        let headers = plan_with(None);
+        let plan = plan_request(&snap, challenge_facts(&headers, "/", false), metrics()).await;
+        assert_eq!(refused(plan), (401, Some(r#"Bearer realm="portus""#.to_string())));
+
+        let headers = plan_with(Some("Bearer not.a.token".into()));
+        let plan = plan_request(&snap, challenge_facts(&headers, "/", false), metrics()).await;
+        assert_eq!(refused(plan), (401, Some(r#"Bearer realm="portus", error="invalid_token""#.to_string())));
+
+        let t = token(&key, "k1", serde_json::json!({"iss":"https://dex.example.com","sub":"alice","aud":"api","exp":now()+600}));
+        let headers = plan_with(Some(format!("Bearer {t}")));
+        let plan = plan_request(&snap, challenge_facts(&headers, "/", false), metrics()).await;
+        let Plan::Forward(f) = plan else { panic!("expected a forward") };
+        let mut upstream = headers.clone();
+        f.request_headers.apply(&mut upstream);
+        f.auth_headers.as_ref().expect("claim headers").apply(&mut upstream);
+        assert_eq!(upstream.get_all("x-user").iter().collect::<Vec<_>>(), vec!["alice"], "the client's x-user is replaced");
+        assert!(upstream.contains_key(http::header::AUTHORIZATION), "the token is forwarded");
+
+        // A token without the claim still removes the client's copy.
+        let auth_no_sub_header = crate::jwt::JwtAuth::new(vec![crate::jwt::Provider {
+            issuer: Arc::from("https://dex.example.com"),
+            audiences: vec![],
+            claim_headers: vec![("email".into(), HeaderName::from_static("x-user"))],
+        }]);
+        let set = auth_no_sub_header.authenticate(Some(format!("Bearer {t}").as_bytes()), &snap.jwks, now()).unwrap();
+        let mut upstream = headers.clone();
+        HeaderMutations { add: Arc::clone(&NO_HEADERS), set, remove: Arc::clone(&auth_no_sub_header.owned_headers) }.apply(&mut upstream);
+        assert!(!upstream.contains_key("x-user"));
+    }
+
+    /// ExtAuthPolicy through the planner: the service's denial is the reply,
+    /// its 2xx forwards with its headers replacing any client copies.
+    #[tokio::test]
+    async fn an_ext_auth_route_asks_the_service_first() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn service(reply: &'static str) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut sock, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        let _ = sock.write_all(reply.as_bytes()).await;
+                    });
+                }
+            });
+            addr
+        }
+        let snapshot_for = |addr: std::net::SocketAddr| {
+            let mut snap = catch_all_snapshot("acme.example.com", "api");
+            snap.lbs.insert((Arc::from("authz"), 4180), Arc::new(Pool::new([addr], None)));
+            let ext = Arc::new(crate::ext_auth::ExtAuth {
+                service_name: Arc::from("authz"),
+                port: 4180,
+                path: "/check".to_string(),
+                timeout: Duration::from_secs(1),
+                fail_open: false,
+                request_headers: None,
+                response_headers: Arc::new(vec![HeaderName::from_static("x-user")]),
+            });
+            for bucket in snap.listeners_by_port.get_mut(&80).unwrap() {
+                for hr in bucket.exact.values_mut() {
+                    for r in &mut hr.rules {
+                        r.ext_auth = Some(Arc::clone(&ext));
+                    }
+                }
+            }
+            snap
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user", HeaderValue::from_static("mallory"));
+
+        let deny = snapshot_for(service("HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Bearer\r\ncontent-length: 0\r\n\r\n").await);
+        match plan_request(&deny, challenge_facts(&headers, "/", false), metrics()).await {
+            Plan::Respond(r) => {
+                assert_eq!(r.status, 401);
+                assert!(r.headers.iter().any(|(n, v)| n == http::header::WWW_AUTHENTICATE && v == "Bearer"));
+            }
+            _ => panic!("expected the service's 401"),
+        }
+
+        let allow = snapshot_for(service("HTTP/1.1 200 OK\r\nx-user: alice\r\ncontent-length: 0\r\n\r\n").await);
+        let Plan::Forward(f) = plan_request(&allow, challenge_facts(&headers, "/", false), metrics()).await else { panic!("expected a forward") };
+        let mut upstream = headers.clone();
+        f.auth_headers.as_ref().expect("service headers").apply(&mut upstream);
+        assert_eq!(upstream.get_all("x-user").iter().collect::<Vec<_>>(), vec!["alice"]);
     }
 
     /// Kubernetes mode never registers tokens, so a challenge request routes

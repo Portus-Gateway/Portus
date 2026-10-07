@@ -127,3 +127,24 @@ pub fn find_winner_key<S: PolicyState>(
     }
     None
 }
+
+/// Request headers an auth policy may not set on the backend request: the
+/// client's credentials, routing and framing headers.
+pub const RESERVED_HEADERS: &[&str] = &[
+    "authorization", "host", "content-length", "transfer-encoding", "connection", "upgrade", "te", "trailer",
+    "keep-alive", "proxy-connection", "proxy-authorization",
+];
+
+/// An absolute http(s) URL with a host.
+pub fn is_http_url(s: &str) -> bool {
+    s.strip_prefix("https://")
+        .or_else(|| s.strip_prefix("http://"))
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/') && !rest.contains(char::is_whitespace))
+}
+
+/// RFC 9110 token characters.
+pub fn is_header_name(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+

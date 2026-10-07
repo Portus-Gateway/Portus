@@ -54,6 +54,8 @@ rules:
       - connectionpolicies
       - basicauthpolicies
       - apikeyauthpolicies
+      - jwtauthpolicies
+      - extauthpolicies
       - retrypolicies
       - ipallowlistpolicies
       - requestbodysizelimitpolicies
@@ -72,6 +74,8 @@ rules:
       - connectionpolicies/status
       - basicauthpolicies/status
       - apikeyauthpolicies/status
+      - jwtauthpolicies/status
+      - extauthpolicies/status
       - retrypolicies/status
       - ipallowlistpolicies/status
       - requestbodysizelimitpolicies/status

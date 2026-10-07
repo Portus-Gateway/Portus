@@ -236,6 +236,8 @@ pub struct PathRoute {
     pub backend_request_timeout: Option<Duration>,
     // Phase 9: Auth config
     pub auth_config: Option<crate::types::AuthConfig>,
+    /// ExtAuthPolicy: an authorization service decides after `auth_config`.
+    pub ext_auth: Option<Arc<crate::ext_auth::ExtAuth>>,
     // Phase 10: CORS config
     pub cors: Option<Arc<CorsConfig>>,
     // Phase 11: IP allowlist
@@ -847,6 +849,8 @@ pub struct ProxySnapshot {
     /// Every budget policy in the config (with fallback overflow counters),
     /// declared to the ledger so `/v1/limits` lists them before first use.
     pub budget_policies: Vec<crate::ai::budget::BudgetPolicy>,
+    /// Public keys of the issuers JWTAuthPolicies trust.
+    pub jwks: Arc<crate::jwt::Jwks>,
 }
 
 impl Default for ProxySnapshot {
@@ -863,6 +867,7 @@ impl Default for ProxySnapshot {
             backend_tls: HashMap::new(),
             backend_client_cert: None,
             lb_signatures: HashMap::new(),
+            jwks: Arc::default(),
         }
     }
 }
@@ -1266,6 +1271,7 @@ pub fn build_route_map(
                     request_timeout: None,
                     backend_request_timeout: None,
                     auth_config: None,
+                    ext_auth: None,
                     cors: None,
                     ip_allow_cidrs: Vec::new(),
                     ip_deny_cidrs: Vec::new(),
@@ -1369,6 +1375,7 @@ pub mod test_support {
             request_timeout: None,
             backend_request_timeout: None,
             auth_config: None,
+            ext_auth: None,
             cors: None,
             ip_allow_cidrs: Vec::new(),
             ip_deny_cidrs: Vec::new(),

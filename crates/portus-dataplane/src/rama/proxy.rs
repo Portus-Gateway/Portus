@@ -611,6 +611,9 @@ impl ProxyService {
             headers.insert(HOST, v);
         }
         plan.request_headers.apply(&mut HeadersMut(&mut headers));
+        if let Some(auth) = &plan.auth_headers {
+            auth.apply(&mut HeadersMut(&mut headers));
+        }
         // The usage tracker reads the provider's response bytes, so the
         // provider must not compress them: SDKs ask for gzip and Anthropic
         // compresses SSE streams, which left streamed calls unmetered.

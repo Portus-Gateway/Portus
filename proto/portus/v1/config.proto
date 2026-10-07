@@ -64,6 +64,10 @@ message CompiledConfig {
   // with namespaced tool names. Routes reference one by RouteConfig.ai_federation.
   repeated McpFederation mcp_federations = 13;
 
+  // Public keys of every issuer a JWTAuthPolicy on these routes trusts,
+  // fetched by the controller. Routes name issuers in JwtProvider.issuer.
+  repeated IssuerKeys issuer_keys = 14;
+
   // Phase 9: populated when Policy CRDs are implemented
   // (policies are resolved by controller and inlined into RouteConfig)
 }
@@ -181,6 +185,8 @@ message RouteConfig {
   // The McpFederation (namespace/name) this route fans out to, when the
   // provider is a federation rather than one server.
   string ai_federation = 43;
+  // ExtAuthPolicy: ask an authorization service before forwarding.
+  optional ExtAuthConfig ext_auth = 44;
 
   // Listener's hostname restriction used by this route (for GatewayHTTPListenerIsolation).
   // "" = empty-hostname listener (catch-all). "*.example.com" = wildcard listener.
@@ -403,7 +409,46 @@ message AuthConfig {
   oneof auth_type {
     BasicAuthConfig basic_auth = 1;
     ApiKeyAuthConfig api_key = 2;
+    JwtAuthConfig jwt = 3;
   }
+}
+
+// JWTAuthPolicy: a bearer token must verify against one of the providers.
+message JwtAuthConfig {
+  repeated JwtProvider providers = 1;
+}
+
+message JwtProvider {
+  string issuer = 1;                 // keys in CompiledConfig.issuer_keys
+  repeated string audiences = 2;     // any-of; empty = not checked
+  repeated JwtClaimHeader claim_to_headers = 3;
+}
+
+// Copy a verified claim into a request header for the backend.
+message JwtClaimHeader {
+  string claim = 1;
+  string header = 2;
+}
+
+// ExtAuthPolicy (forward-auth): a GET to the service with the client's
+// headers and X-Forwarded-{Method,Proto,Host,Uri,For}; 2xx allows, any other
+// answer is returned to the client as it is.
+message ExtAuthConfig {
+  string service_name = 1;          // empty: the reference is not permitted, every request is refused
+  uint32 port = 2;
+  string path = 3;                  // path of the check request
+  uint32 timeout_ms = 4;
+  bool fail_open = 5;               // allow when the service cannot answer
+  repeated string request_headers = 6;   // client headers sent; empty = all
+  repeated string response_headers = 7;  // service headers copied to the backend request on 2xx
+  string service_namespace = 8;     // for the controller's backend set; unused by data planes
+}
+
+// One issuer's JWKS document as the controller fetched it; empty when it
+// could not be fetched (tokens from that issuer are refused).
+message IssuerKeys {
+  string issuer = 1;
+  string jwks_json = 2;
 }
 
 message BasicAuthConfig {

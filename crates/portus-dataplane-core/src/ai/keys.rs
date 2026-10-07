@@ -89,7 +89,7 @@ impl OnBehalfOf {
 pub struct KeySet {
     pub version: u64,
     keys: HashMap<KeyHash, KeyInfo>,
-    pub jwks: super::jwt::Jwks,
+    pub jwks: crate::jwt::Jwks,
 }
 
 impl std::fmt::Debug for KeySet {
@@ -122,7 +122,7 @@ impl KeySet {
                 },
             );
         }
-        let jwks = super::jwt::Jwks::from_entries(snapshot.issuers.iter().map(|e| (e.issuer.as_str(), e.jwks_json.as_str())));
+        let jwks = crate::jwt::Jwks::from_entries(snapshot.issuers.iter().map(|e| (e.issuer.as_str(), e.jwks_json.as_str())));
         Self { version: snapshot.version, keys, jwks }
     }
 

@@ -834,6 +834,7 @@ pub fn to_compiled_config(config: &StandaloneConfig, dns: &DnsTable) -> Result<C
                         .map(|r| r.codes.iter().map(|c| u32::from(*c)).collect())
                         .unwrap_or_default(),
                     // Fields not used in standalone mode
+                    ext_auth: None,
                     upstream_tls: None,
                     grpc_match: None,
                     mirror_backend: None,

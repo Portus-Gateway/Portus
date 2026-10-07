@@ -429,8 +429,13 @@ pub fn build_listener_buckets_from_proto(
                             },
                         }
                     }
+                    portus_types::proto::portus::config::v1::auth_config::AuthType::Jwt(jwt) => {
+                        crate::types::AuthConfig::Jwt(Arc::new(jwt_auth_from_proto(jwt)))
+                    }
                 })
             });
+
+            let ext_auth = spec.ext_auth.as_ref().map(|e| Arc::new(ext_auth_from_proto(e)));
 
             // Parse CORS config from proto
             let cors_config = spec.cors.as_ref().map(|c| Arc::new(CorsConfig {
@@ -562,6 +567,7 @@ pub fn build_listener_buckets_from_proto(
                         None
                     },
                     auth_config: auth_config.clone(),
+                    ext_auth: ext_auth.clone(),
                     cors: cors_config.clone(),
                     ip_allow_cidrs: spec.ip_allowlist.as_ref().map(|ip| {
                         ip.allow_cidrs.iter().filter_map(|c| c.parse().ok()).collect()
@@ -791,6 +797,42 @@ pub fn budget_policies_from_proto(routes: &[portus_types::RouteConfig]) -> Vec<c
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
+}
+
+/// A route's ExtAuthPolicy. Header names that do not parse (the controller
+/// validates them) are dropped.
+fn ext_auth_from_proto(e: &portus_types::ExtAuthConfig) -> crate::ext_auth::ExtAuth {
+    let names = |list: &[String]| -> Vec<http::HeaderName> {
+        list.iter().filter_map(|h| http::HeaderName::from_bytes(h.to_ascii_lowercase().as_bytes()).ok()).collect()
+    };
+    crate::ext_auth::ExtAuth {
+        service_name: Arc::from(e.service_name.as_str()),
+        port: e.port as u16,
+        path: if e.path.is_empty() { "/".to_string() } else { e.path.clone() },
+        timeout: Duration::from_millis(if e.timeout_ms == 0 { 1000 } else { u64::from(e.timeout_ms) }),
+        fail_open: e.fail_open,
+        request_headers: (!e.request_headers.is_empty()).then(|| names(&e.request_headers)),
+        response_headers: Arc::new(names(&e.response_headers)),
+    }
+}
+
+/// A route's JWTAuthPolicy. Claim headers that are not valid header names
+/// (the controller validates them) are dropped.
+fn jwt_auth_from_proto(jwt: &portus_types::JwtAuthConfig) -> crate::jwt::JwtAuth {
+    let providers = jwt
+        .providers
+        .iter()
+        .map(|p| crate::jwt::Provider {
+            issuer: Arc::from(p.issuer.as_str()),
+            audiences: p.audiences.clone(),
+            claim_headers: p
+                .claim_to_headers
+                .iter()
+                .filter_map(|c| Some((c.claim.clone(), http::HeaderName::from_bytes(c.header.to_ascii_lowercase().as_bytes()).ok()?)))
+                .collect(),
+        })
+        .collect();
+    crate::jwt::JwtAuth::new(providers)
 }
 
 /// MCP federations as the stack fans out to them; members keep the pool key
@@ -1540,6 +1582,7 @@ pub fn apply_config(mut config: portus_types::CompiledConfig, state: &ProxyState
         lb_signatures: new_lb_signatures,
         federations: build_federations_from_proto(&config.mcp_federations),
         budget_policies: budget_policies_from_proto(&config.routes),
+        jwks: Arc::new(crate::jwt::Jwks::from_entries(config.issuer_keys.iter().map(|k| (k.issuer.as_str(), k.jwks_json.as_str())))),
     }));
     state.l4_config.store(Arc::new(new_l4));
 
@@ -1574,6 +1617,7 @@ pub fn apply_config(mut config: portus_types::CompiledConfig, state: &ProxyState
                                 key.zeroize();
                             }
                         }
+                        portus_types::proto::portus::config::v1::auth_config::AuthType::Jwt(_) => {}
                     }
                 }
         }
@@ -6450,5 +6494,70 @@ mod tests {
             std::env::remove_var("GATEWAY_NAME");
         }
         assert!(state.snapshot.load().backend_client_cert.is_some());
+    }
+
+    #[test]
+    fn test_apply_config_builds_jwt_auth_and_issuer_keys() {
+        let (_, jwks) = crate::jwt::tests::issuer_keys("k1");
+        let state = empty_proxy_state();
+        let auth = portus_types::AuthConfig {
+            auth_type: Some(portus_types::proto::portus::config::v1::auth_config::AuthType::Jwt(portus_types::JwtAuthConfig {
+                providers: vec![portus_types::JwtProvider {
+                    issuer: "https://dex.example.com".to_string(),
+                    audiences: vec!["api".to_string()],
+                    claim_to_headers: vec![
+                        portus_types::JwtClaimHeader { claim: "sub".to_string(), header: "X-User".to_string() },
+                        portus_types::JwtClaimHeader { claim: "bad".to_string(), header: "not a header".to_string() },
+                    ],
+                }],
+            })),
+        };
+        let config = CompiledConfig {
+            schema_version: "1.0.0".to_string(),
+            version: 1,
+            routes: vec![RouteConfig { auth: Some(auth), ..backend_route("gw", "api", 80) }],
+            issuer_keys: vec![
+                portus_types::IssuerKeys { issuer: "https://dex.example.com".to_string(), jwks_json: jwks },
+                portus_types::IssuerKeys { issuer: "https://down.example.com".to_string(), jwks_json: String::new() },
+            ],
+            ..Default::default()
+        };
+        apply_config(config, &state);
+        let snap = state.snapshot.load();
+        assert_eq!(snap.jwks.issuer_count(), 1, "an issuer the controller could not fetch has no keys");
+        let routes: Vec<&PathRoute> = snap
+            .listeners_by_port
+            .values()
+            .flatten()
+            .chain(snap.any_port_listeners.iter())
+            .flat_map(|b| b.exact.values().chain(b.catch_all.iter()))
+            .flat_map(|hr| hr.rules.iter().chain(hr.exact_map.values().flatten()).chain(hr.catch_all.iter()))
+            .collect();
+        let jwt = routes
+            .iter()
+            .find_map(|r| match &r.auth_config {
+                Some(crate::types::AuthConfig::Jwt(j)) => Some(Arc::clone(j)),
+                _ => None,
+            })
+            .expect("the route carries its JWTAuthPolicy");
+        assert_eq!(jwt.providers[0].audiences, vec!["api".to_string()]);
+        assert_eq!(jwt.providers[0].claim_headers, vec![("sub".to_string(), http::HeaderName::from_static("x-user"))], "names are lowercased; invalid ones dropped");
+    }
+
+    #[test]
+    fn test_ext_auth_from_proto_applies_defaults_and_lowercases_headers() {
+        let ext = ext_auth_from_proto(&portus_types::ExtAuthConfig {
+            service_name: "oauth2-proxy".to_string(),
+            port: 4180,
+            response_headers: vec!["X-Auth-Request-User".to_string(), "not a header".to_string()],
+            ..Default::default()
+        });
+        assert_eq!((ext.service_name.as_ref(), ext.port, ext.path.as_str()), ("oauth2-proxy", 4180, "/"));
+        assert_eq!(ext.timeout, Duration::from_millis(1000));
+        assert!(ext.request_headers.is_none(), "empty list: every client header");
+        assert_eq!(ext.response_headers.as_slice(), &[http::HeaderName::from_static("x-auth-request-user")]);
+        let limited = ext_auth_from_proto(&portus_types::ExtAuthConfig { request_headers: vec!["Cookie".to_string()], timeout_ms: 250, path: "/check".to_string(), ..Default::default() });
+        assert_eq!(limited.request_headers, Some(vec![http::HeaderName::from_static("cookie")]));
+        assert_eq!((limited.timeout, limited.path.as_str()), (Duration::from_millis(250), "/check"));
     }
 }

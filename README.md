@@ -128,6 +128,8 @@ controller compiles them into the route config and the data plane enforces them 
 | `IPAllowlistPolicy` | Allow and deny CIDRs, with trusted proxies for `X-Forwarded-For` |
 | `RequestBodySizeLimitPolicy` | 413 above `maxBytes`, streamed bodies included |
 | `BasicAuthPolicy`, `ApiKeyAuthPolicy` | HTTP Basic against bcrypt hashes; a header against keys in a Secret |
+| `JWTAuthPolicy` | Bearer JWTs verified against an issuer's keys (fetched by the controller); claims to request headers |
+| `ExtAuthPolicy` | Ask an authorization service first (forward-auth: oauth2-proxy, Authelia, Authentik) |
 | `AIUsagePolicy` | Token or call budgets on an AIRoute |
 
 Fields, examples and semantics: [`docs/policies.md`](docs/policies.md).

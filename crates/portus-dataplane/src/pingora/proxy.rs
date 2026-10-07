@@ -261,6 +261,9 @@ impl ProxyHttp for Router {
             upstream_request.insert_header("host", new_host.as_ref())?;
         }
         plan.request_headers.apply(&mut PingoraHeaders(upstream_request));
+        if let Some(auth) = &plan.auth_headers {
+            auth.apply(&mut PingoraHeaders(upstream_request));
+        }
         Ok(())
     }
 

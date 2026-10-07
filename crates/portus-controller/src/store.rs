@@ -27,6 +27,10 @@ pub struct ConfigStore {
     pub connection_policies: DashMap<NamespacedName, ConnectionPolicyState>,
     pub basic_auth_policies: DashMap<NamespacedName, BasicAuthPolicyState>,
     pub api_key_auth_policies: DashMap<NamespacedName, ApiKeyAuthPolicyState>,
+    pub jwt_auth_policies: DashMap<NamespacedName, JwtAuthPolicyState>,
+    pub ext_auth_policies: DashMap<NamespacedName, ExtAuthPolicyState>,
+    /// Issuers' public keys for JWTAuthPolicies, by issuer, as last fetched.
+    pub issuer_keys: DashMap<String, IssuerKeysState>,
     pub retry_policies: DashMap<NamespacedName, RetryPolicyState>,
     pub ip_allowlist_policies: DashMap<NamespacedName, IPAllowlistPolicyState>,
     pub request_body_size_limit_policies: DashMap<NamespacedName, RequestBodySizeLimitPolicyState>,
@@ -179,6 +183,9 @@ impl ConfigStore {
             connection_policies: DashMap::new(),
             basic_auth_policies: DashMap::new(),
             api_key_auth_policies: DashMap::new(),
+            jwt_auth_policies: DashMap::new(),
+            ext_auth_policies: DashMap::new(),
+            issuer_keys: DashMap::new(),
             retry_policies: DashMap::new(),
             ip_allowlist_policies: DashMap::new(),
             request_body_size_limit_policies: DashMap::new(),
@@ -1017,6 +1024,54 @@ pub struct BasicAuthPolicyState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct JwtAuthPolicyState {
+    pub target: PolicyTargetKey,
+    pub providers: Vec<JwtProviderState>,
+    pub generation: i64,
+    pub creation_timestamp: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JwtProviderState {
+    pub issuer: String,
+    pub audiences: Vec<String>,
+    pub jwks_uri: Option<String>,
+    /// (claim, lowercase header name)
+    pub claim_to_headers: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtAuthPolicyState {
+    pub target: PolicyTargetKey,
+    pub service_namespace: String,
+    pub service_name: String,
+    pub port: u16,
+    pub path: String,
+    pub timeout_ms: u32,
+    pub fail_open: bool,
+    /// Lowercase; empty sends every client header.
+    pub request_headers: Vec<String>,
+    /// Lowercase.
+    pub response_headers: Vec<String>,
+    pub generation: i64,
+    pub creation_timestamp: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
+    pub accepted: bool,
+}
+
+/// One issuer's keys as the controller last fetched them.
+#[derive(Debug, Clone)]
+pub struct IssuerKeysState {
+    /// The JWKS URI the keys came from (`None` = OpenID discovery).
+    pub jwks_uri: Option<String>,
+    /// The last JWKS document fetched; kept when a later fetch fails.
+    pub jwks_json: Option<String>,
+    /// Why the last fetch failed, if it did.
+    pub error: Option<String>,
+    pub fetched_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ApiKeyAuthPolicyState {
     pub target: PolicyTargetKey,
     pub secret_namespace: String,
@@ -1141,6 +1196,8 @@ impl_policy_state!(CircuitBreakerPolicyState);
 impl_policy_state!(ConnectionPolicyState);
 impl_policy_state!(BasicAuthPolicyState);
 impl_policy_state!(ApiKeyAuthPolicyState);
+impl_policy_state!(JwtAuthPolicyState);
+impl_policy_state!(ExtAuthPolicyState);
 impl_policy_state!(RetryPolicyState);
 impl_policy_state!(IPAllowlistPolicyState);
 impl_policy_state!(RequestBodySizeLimitPolicyState);

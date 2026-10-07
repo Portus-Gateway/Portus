@@ -173,6 +173,100 @@ pub struct ApiKeySpec {
     pub header_name: Option<String>,
 }
 
+// ---- JWTAuthPolicy ----
+
+#[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "portus-gateway.dev",
+    version = "v1alpha1",
+    kind = "JWTAuthPolicy",
+    plural = "jwtauthpolicies",
+    namespaced,
+    status = "PolicyStatus",
+    derive = "Default"
+)]
+pub struct JWTAuthPolicySpec {
+    #[serde(rename = "targetRef")]
+    pub target_ref: PolicyTargetRef,
+    pub jwt: JwtSpec,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct JwtSpec {
+    /// Issuers whose tokens are accepted; a token must verify against one.
+    pub providers: Vec<JwtProviderSpec>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct JwtProviderSpec {
+    /// The `iss` claim tokens carry, an http(s) URL.
+    pub issuer: String,
+    /// Accepted `aud` values (any one); empty accepts any audience.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audiences: Vec<String>,
+    /// Where the issuer publishes its keys; found by OpenID discovery when unset.
+    #[serde(rename = "jwksUri", default, skip_serializing_if = "Option::is_none")]
+    pub jwks_uri: Option<String>,
+    /// Claims copied into request headers for the backend.
+    #[serde(rename = "claimToHeaders", default, skip_serializing_if = "Vec::is_empty")]
+    pub claim_to_headers: Vec<ClaimToHeader>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ClaimToHeader {
+    pub claim: String,
+    pub header: String,
+}
+
+// ---- ExtAuthPolicy ----
+
+#[derive(CustomResource, Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "portus-gateway.dev",
+    version = "v1alpha1",
+    kind = "ExtAuthPolicy",
+    plural = "extauthpolicies",
+    namespaced,
+    status = "PolicyStatus",
+    derive = "Default"
+)]
+pub struct ExtAuthPolicySpec {
+    #[serde(rename = "targetRef")]
+    pub target_ref: PolicyTargetRef,
+    #[serde(rename = "extAuth")]
+    pub ext_auth: ExtAuthSpec,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ExtAuthSpec {
+    /// The authorization Service.
+    #[serde(rename = "backendRef")]
+    pub backend_ref: ServiceBackendRef,
+    /// Path of the check request; `/` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// How long to wait for a decision; 1000 when unset.
+    #[serde(rename = "timeoutMs", default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u32>,
+    /// Allow requests when the service cannot answer.
+    #[serde(rename = "failOpen", default)]
+    pub fail_open: bool,
+    /// Client headers sent to the service; all when empty.
+    #[serde(rename = "requestHeaders", default, skip_serializing_if = "Vec::is_empty")]
+    pub request_headers: Vec<String>,
+    /// Service response headers copied into the backend request on a 2xx.
+    #[serde(rename = "responseHeaders", default, skip_serializing_if = "Vec::is_empty")]
+    pub response_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ServiceBackendRef {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub port: u16,
+}
+
 fn default_api_key_header() -> Option<String> {
     Some("X-API-Key".to_string())
 }
@@ -383,3 +477,4 @@ pub fn is_policy_winner(
         (None, None) => existing_key.to_string() <= new_key.to_string(),
     }
 }
+

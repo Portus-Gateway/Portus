@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use hashbrown::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,8 @@ pub enum AuthConfig {
         valid_keys: HashSet<String>,
         header_name: String,
     },
+    /// JWTAuthPolicy: keys come from `ProxySnapshot::jwks`.
+    Jwt(Arc<crate::jwt::JwtAuth>),
 }
 
 impl std::fmt::Debug for AuthConfig {
@@ -32,6 +36,7 @@ impl std::fmt::Debug for AuthConfig {
                     .field("header_name", header_name)
                     .finish()
             }
+            AuthConfig::Jwt(jwt) => jwt.fmt(f),
         }
     }
 }
@@ -60,6 +65,8 @@ impl Drop for AuthConfig {
                     key.zeroize();
                 }
             }
+            // Public keys and claim mappings: nothing secret.
+            AuthConfig::Jwt(_) => {}
         }
     }
 }

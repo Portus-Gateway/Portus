@@ -95,6 +95,9 @@ pub fn scope_config(config: &CompiledConfig, namespace: &str, name: &str) -> Com
         for m in &r.mirror_backends {
             wanted.insert((m.service_name.as_str(), m.port));
         }
+        if let Some(ext) = &r.ext_auth {
+            wanted.insert((ext.service_name.as_str(), ext.port));
+        }
     }
     for t in &tls_passthrough_routes {
         if !t.backend_service.is_empty() {
@@ -131,6 +134,9 @@ pub fn scope_config(config: &CompiledConfig, namespace: &str, name: &str) -> Com
     // Federations the slice's routes fan out to.
     let wanted: std::collections::HashSet<&str> = routes.iter().map(|r| r.ai_federation.as_str()).filter(|f| !f.is_empty()).collect();
     let mcp_federations: Vec<portus_types::McpFederation> = config.mcp_federations.iter().filter(|f| wanted.contains(f.name.as_str())).cloned().collect();
+    // Keys of the issuers the slice's routes trust.
+    let wanted: std::collections::HashSet<&str> = routes.iter().flat_map(jwt_issuers).collect();
+    let issuer_keys: Vec<IssuerKeys> = config.issuer_keys.iter().filter(|k| wanted.contains(k.issuer.as_str())).cloned().collect();
     let mut scoped = CompiledConfig {
         schema_version: config.schema_version.clone(),
         version: config.version,
@@ -144,6 +150,7 @@ pub fn scope_config(config: &CompiledConfig, namespace: &str, name: &str) -> Com
         tls_passthrough_listener_hostnames,
         gateway_backend_tls,
         mcp_federations,
+        issuer_keys,
     };
     scoped.fingerprint = config_fingerprint(&scoped);
     scoped
@@ -824,6 +831,10 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
 
     // Apply policies to compiled routes
     apply_policies(store, &mut routes, &route_sources);
+    // ExtAuthPolicy Services need endpoint pools like any backend.
+    for ext in routes.iter().filter_map(|r| r.ext_auth.as_ref()).filter(|e| !e.service_name.is_empty()) {
+        backend_keys.insert(ServiceKey { namespace: ext.service_namespace.clone(), name: ext.service_name.clone(), port: ext.port as u16 });
+    }
 
     // Override backend protocol based on Service appProtocol.
     // This handles kubernetes.io/h2c and kubernetes.io/ws from backendRefs.
@@ -1200,6 +1211,7 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         }
     }
 
+    let issuer_keys = compile_issuer_keys(store, &routes);
     CompiledConfig {
         schema_version: "1.0.0".to_string(),
         version,
@@ -1212,8 +1224,31 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
         tls_passthrough_listener_hostnames,
         gateway_backend_tls: compile_gateway_backend_tls(store),
         mcp_federations,
+        issuer_keys,
         ..Default::default()
     }
+}
+
+/// The issuers JWTAuthPolicies on `routes` trust, each once, sorted, with the
+/// keys the controller last fetched (empty when it has none yet).
+fn compile_issuer_keys(store: &ConfigStore, routes: &[RouteConfig]) -> Vec<IssuerKeys> {
+    let issuers: std::collections::BTreeSet<&str> = routes.iter().flat_map(jwt_issuers).collect();
+    issuers
+        .into_iter()
+        .map(|issuer| IssuerKeys {
+            issuer: issuer.to_string(),
+            jwks_json: store.issuer_keys.get(issuer).and_then(|k| k.jwks_json.clone()).unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// The issuers a route's JWTAuthPolicy names.
+fn jwt_issuers(route: &RouteConfig) -> impl Iterator<Item = &str> {
+    let providers = match route.auth.as_ref().and_then(|a| a.auth_type.as_ref()) {
+        Some(auth_config::AuthType::Jwt(jwt)) => jwt.providers.as_slice(),
+        _ => &[],
+    };
+    providers.iter().map(|p| p.issuer.as_str())
 }
 
 /// TCPRoutes (`protocol` "TCP") or UDPRoutes ("UDP") into L4 proxy routes: one
@@ -1538,6 +1573,14 @@ fn apply_policies(
         .filter(|e| e.value().accepted)
         .map(|e| e.value().clone())
         .collect();
+    let jwt_auths: Vec<_> = store.jwt_auth_policies.iter()
+        .filter(|e| e.value().accepted)
+        .map(|e| e.value().clone())
+        .collect();
+    let ext_auths: Vec<_> = store.ext_auth_policies.iter()
+        .filter(|e| e.value().accepted)
+        .map(|e| e.value().clone())
+        .collect();
     let retries: Vec<_> = store.retry_policies.iter()
         .filter(|e| e.value().accepted)
         .map(|e| e.value().clone())
@@ -1565,6 +1608,8 @@ fn apply_policies(
     let (cn_ri, cn_gi) = index_policies(&connections, |p| &p.target);
     let (ba_ri, ba_gi) = index_policies(&basic_auths, |p| &p.target);
     let (ak_ri, ak_gi) = index_policies(&api_key_auths, |p| &p.target);
+    let (jw_ri, jw_gi) = index_policies(&jwt_auths, |p| &p.target);
+    let (ea_ri, ea_gi) = index_policies(&ext_auths, |p| &p.target);
     let (rt_ri, rt_gi) = index_policies(&retries, |p| &p.target);
     let (ip_ri, ip_gi) = index_policies(&ip_allowlists, |p| &p.target);
     let (bs_ri, bs_gi) = index_policies(&body_size_limits, |p| &p.target);
@@ -1646,6 +1691,47 @@ fn apply_policies(
                     });
                 }
             }
+
+        // JWTAuthPolicy: keys travel once per issuer in `issuer_keys`.
+        if route.auth.is_none()
+            && let Some(idx) = find_matching_policy(&jwt_auths, &jw_ri, &jw_gi, source, |p| &p.target)
+        {
+            route.auth = Some(AuthConfig {
+                auth_type: Some(auth_config::AuthType::Jwt(JwtAuthConfig {
+                    providers: jwt_auths[idx]
+                        .providers
+                        .iter()
+                        .map(|p| JwtProvider {
+                            issuer: p.issuer.clone(),
+                            audiences: p.audiences.clone(),
+                            claim_to_headers: p
+                                .claim_to_headers
+                                .iter()
+                                .map(|(claim, header)| JwtClaimHeader { claim: claim.clone(), header: header.clone() })
+                                .collect(),
+                        })
+                        .collect(),
+                })),
+            });
+        }
+
+        // ExtAuthPolicy: runs after the route's own authentication. A Service
+        // the policy may not reference compiles to an empty name, which
+        // refuses every request rather than leaving the route open.
+        if let Some(idx) = find_matching_policy(&ext_auths, &ea_ri, &ea_gi, source, |p| &p.target) {
+            let p = &ext_auths[idx];
+            let permitted = crate::reconcilers::ext_auth_policy::reference_permitted(store, &p.target.namespace, p);
+            route.ext_auth = Some(ExtAuthConfig {
+                service_name: if permitted { p.service_name.clone() } else { String::new() },
+                service_namespace: p.service_namespace.clone(),
+                port: u32::from(p.port),
+                path: p.path.clone(),
+                timeout_ms: p.timeout_ms,
+                fail_open: p.fail_open,
+                request_headers: p.request_headers.clone(),
+                response_headers: p.response_headers.clone(),
+            });
+        }
 
         // RetryPolicy: the rule's own `retry` (HTTPRouteRetry) wins over a policy.
         if route.max_retries == 0
@@ -2172,6 +2258,7 @@ pub(crate) fn config_fingerprint(config: &CompiledConfig) -> u64 {
     }
     for g in &config.gateway_backend_tls { fp = fp.wrapping_add(hash_msg(g)); }
     for f in &config.mcp_federations { fp = fp.wrapping_add(hash_msg(f)); }
+    for k in &config.issuer_keys { fp = fp.wrapping_add(hash_msg(k)); }
     fp
 }
 
@@ -8095,6 +8182,228 @@ mod tests {
             }
             other => panic!("expected BasicAuth auth, got {:?}", other),
         }
+    }
+
+    // ---- JWTAuthPolicy -------------------------------------------------------
+
+    fn insert_prefix_route(store: &ConfigStore, parent: &ParentRefState, name: &str, host: &str) {
+        store.http_routes.insert(
+            NamespacedName { namespace: "default".to_string(), name: name.to_string() },
+            HTTPRouteState {
+                namespace: "default".to_string(),
+                hostnames: vec![host.to_string()],
+                parent_refs: vec![parent.clone()],
+                rules: vec![HTTPRouteRuleState {
+                    matches: vec![HTTPRouteMatchState { path: Some(("/".to_string(), "Prefix".to_string())), headers: vec![], method: None, query_params: vec![] }],
+                    filters: vec![],
+                    backend_refs: vec![BackendRefState { namespace: "default".to_string(), name: "backend-svc".to_string(), port: 8080, weight: 1, filters: vec![] }],
+                    request_timeout_ms: None,
+                    backend_request_timeout_ms: None,
+                    retry: None,
+                }],
+                generation: 1,
+            },
+        );
+    }
+
+    fn jwt_policy(kind: &str, target: &str, issuers: &[&str]) -> crate::store::JwtAuthPolicyState {
+        crate::store::JwtAuthPolicyState {
+            target: PolicyTargetKey {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: kind.to_string(),
+                namespace: "default".to_string(),
+                name: target.to_string(),
+                section_name: None,
+            },
+            providers: issuers
+                .iter()
+                .map(|i| crate::store::JwtProviderState {
+                    issuer: i.to_string(),
+                    audiences: vec!["api".to_string()],
+                    jwks_uri: None,
+                    claim_to_headers: vec![("sub".to_string(), "x-user".to_string())],
+                })
+                .collect(),
+            generation: 1,
+            creation_timestamp: None,
+            accepted: true,
+        }
+    }
+
+    fn keys(store: &ConfigStore, issuer: &str, json: Option<&str>) {
+        store.issuer_keys.insert(
+            issuer.to_string(),
+            crate::store::IssuerKeysState { jwks_uri: None, jwks_json: json.map(str::to_string), error: None, fetched_at: Instant::now() },
+        );
+    }
+
+    fn jwt_of(route: &RouteConfig) -> Option<&JwtAuthConfig> {
+        match route.auth.as_ref()?.auth_type.as_ref()? {
+            auth_config::AuthType::Jwt(j) => Some(j),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_jwt_policy_compiles_onto_its_route_with_issuer_keys_once() {
+        let store = empty_store();
+        let parent = setup_default_gateway(&store);
+        insert_prefix_route(&store, &parent, "api", "api.example.com");
+        insert_prefix_route(&store, &parent, "web", "web.example.com");
+        insert_prefix_route(&store, &parent, "open", "open.example.com");
+        let nn = |n: &str| NamespacedName { namespace: "default".to_string(), name: n.to_string() };
+        store.jwt_auth_policies.insert(nn("api-jwt"), jwt_policy("HTTPRoute", "api", &["https://dex.example.com", "https://down.example.com"]));
+        store.jwt_auth_policies.insert(nn("web-jwt"), jwt_policy("HTTPRoute", "web", &["https://dex.example.com"]));
+        let mut rejected = jwt_policy("HTTPRoute", "open", &["https://other.example.com"]);
+        rejected.accepted = false;
+        store.jwt_auth_policies.insert(nn("open-jwt"), rejected);
+        keys(&store, "https://dex.example.com", Some(r#"{"keys":[1]}"#));
+        keys(&store, "https://down.example.com", None);
+        keys(&store, "https://unused.example.com", Some(r#"{"keys":[2]}"#));
+
+        let config = compile_config(&store);
+        let route = |host: &str| config.routes.iter().find(|r| r.host == host).unwrap();
+        let api = jwt_of(route("api.example.com")).expect("api is protected");
+        assert_eq!(api.providers.len(), 2);
+        assert_eq!(api.providers[0].audiences, vec!["api".to_string()]);
+        assert_eq!(api.providers[0].claim_to_headers, vec![JwtClaimHeader { claim: "sub".to_string(), header: "x-user".to_string() }]);
+        assert!(jwt_of(route("web.example.com")).is_some());
+        assert!(route("open.example.com").auth.is_none(), "a policy that is not accepted applies nothing");
+
+        let issuers: Vec<(&str, &str)> = config.issuer_keys.iter().map(|k| (k.issuer.as_str(), k.jwks_json.as_str())).collect();
+        assert_eq!(
+            issuers,
+            vec![("https://dex.example.com", r#"{"keys":[1]}"#), ("https://down.example.com", "")],
+            "once per issuer, only issuers a route uses, empty when unfetched"
+        );
+
+        // Key rotation is a config change.
+        let before = config_fingerprint(&config);
+        keys(&store, "https://dex.example.com", Some(r#"{"keys":[3]}"#));
+        assert_ne!(config_fingerprint(&compile_config(&store)), before);
+    }
+
+    #[test]
+    fn test_jwt_policy_on_a_gateway_covers_its_routes_and_route_auth_wins() {
+        let store = empty_store();
+        let parent = setup_default_gateway(&store);
+        insert_prefix_route(&store, &parent, "api", "api.example.com");
+        insert_prefix_route(&store, &parent, "basic", "basic.example.com");
+        let nn = |n: &str| NamespacedName { namespace: "default".to_string(), name: n.to_string() };
+        store.jwt_auth_policies.insert(nn("gw-jwt"), jwt_policy("Gateway", "test-gw", &["https://dex.example.com"]));
+        store.basic_auth_policies.insert(
+            nn("basic-auth"),
+            BasicAuthPolicyState {
+                target: PolicyTargetKey {
+                    group: "gateway.networking.k8s.io".to_string(),
+                    kind: "HTTPRoute".to_string(),
+                    namespace: "default".to_string(),
+                    name: "basic".to_string(),
+                    section_name: None,
+                },
+                secret_namespace: "default".to_string(),
+                secret_name: "creds".to_string(),
+                realm: "Restricted".to_string(),
+                generation: 1,
+                creation_timestamp: None,
+                accepted: true,
+            },
+        );
+        let config = compile_config(&store);
+        let route = |host: &str| config.routes.iter().find(|r| r.host == host).unwrap();
+        assert!(jwt_of(route("api.example.com")).is_some(), "the Gateway policy covers the route");
+        assert!(
+            matches!(route("basic.example.com").auth.as_ref().unwrap().auth_type, Some(auth_config::AuthType::BasicAuth(_))),
+            "one auth policy per route: BasicAuth before JWT"
+        );
+    }
+
+    #[test]
+    fn test_scope_config_keeps_only_the_slice_issuers() {
+        let store = empty_store();
+        let parent = setup_default_gateway(&store);
+        insert_prefix_route(&store, &parent, "api", "api.example.com");
+        let nn = |n: &str| NamespacedName { namespace: "default".to_string(), name: n.to_string() };
+        store.jwt_auth_policies.insert(nn("api-jwt"), jwt_policy("HTTPRoute", "api", &["https://dex.example.com"]));
+        keys(&store, "https://dex.example.com", Some(r#"{"keys":[1]}"#));
+        let mut config = compile_config(&store);
+        config.issuer_keys.push(IssuerKeys { issuer: "https://elsewhere.example.com".to_string(), jwks_json: "{}".to_string() });
+        let mine = scope_config(&config, "default", "test-gw");
+        assert_eq!(mine.issuer_keys.iter().map(|k| k.issuer.as_str()).collect::<Vec<_>>(), vec!["https://dex.example.com"]);
+        assert!(scope_config(&config, "default", "other-gw").issuer_keys.is_empty());
+    }
+
+    // ---- ExtAuthPolicy -------------------------------------------------------
+
+    fn ext_auth_policy(target: &str, service_ns: &str) -> crate::store::ExtAuthPolicyState {
+        crate::store::ExtAuthPolicyState {
+            target: PolicyTargetKey {
+                group: "gateway.networking.k8s.io".to_string(),
+                kind: "HTTPRoute".to_string(),
+                namespace: "default".to_string(),
+                name: target.to_string(),
+                section_name: None,
+            },
+            service_namespace: service_ns.to_string(),
+            service_name: "oauth2-proxy".to_string(),
+            port: 4180,
+            path: "/oauth2/auth".to_string(),
+            timeout_ms: 500,
+            fail_open: false,
+            request_headers: vec![],
+            response_headers: vec!["x-auth-request-user".to_string()],
+            generation: 1,
+            creation_timestamp: None,
+            accepted: true,
+        }
+    }
+
+    #[test]
+    fn test_ext_auth_policy_compiles_with_a_pool_for_its_service() {
+        let store = empty_store();
+        let parent = setup_default_gateway(&store);
+        insert_prefix_route(&store, &parent, "web", "web.example.com");
+        insert_prefix_route(&store, &parent, "open", "open.example.com");
+        store.endpoints.insert(
+            ServiceKey { namespace: "default".to_string(), name: "oauth2-proxy".to_string(), port: 4180 },
+            vec![BackendEndpoint { address: "10.1.0.7".to_string(), port: 4180 }],
+        );
+        store.ext_auth_policies.insert(NamespacedName { namespace: "default".to_string(), name: "web-auth".to_string() }, ext_auth_policy("web", "default"));
+
+        let config = compile_config(&store);
+        let route = |host: &str| config.routes.iter().find(|r| r.host == host).unwrap();
+        let ext = route("web.example.com").ext_auth.as_ref().expect("web asks the service");
+        assert_eq!((ext.service_name.as_str(), ext.port, ext.path.as_str(), ext.timeout_ms), ("oauth2-proxy", 4180, "/oauth2/auth", 500));
+        assert_eq!(ext.response_headers, vec!["x-auth-request-user".to_string()]);
+        assert!(route("open.example.com").ext_auth.is_none());
+        let pool = config.backends.iter().find(|b| b.service_name == "oauth2-proxy").expect("the auth Service has a backend group");
+        assert_eq!(pool.endpoints.len(), 1);
+
+        let slice = scope_config(&config, "default", "test-gw");
+        assert!(slice.backends.iter().any(|b| b.service_name == "oauth2-proxy"), "the Gateway's slice carries the auth Service's endpoints");
+    }
+
+    #[test]
+    fn test_ext_auth_policy_without_a_reference_grant_refuses_rather_than_opens() {
+        let store = empty_store();
+        let parent = setup_default_gateway(&store);
+        insert_prefix_route(&store, &parent, "web", "web.example.com");
+        store.ext_auth_policies.insert(NamespacedName { namespace: "default".to_string(), name: "web-auth".to_string() }, ext_auth_policy("web", "auth"));
+        let config = compile_config(&store);
+        let ext = config.routes[0].ext_auth.as_ref().expect("the route keeps its policy");
+        assert!(ext.service_name.is_empty(), "no grant: no service, every request refused");
+        assert!(!config.backends.iter().any(|b| b.service_name == "oauth2-proxy"));
+
+        store.reference_grants.insert(
+            NamespacedName { namespace: "auth".to_string(), name: "allow".to_string() },
+            crate::store::ReferenceGrantState {
+                namespace: "auth".to_string(),
+                from: vec![crate::store::ReferenceGrantFrom { group: "portus-gateway.dev".to_string(), kind: "ExtAuthPolicy".to_string(), namespace: "default".to_string() }],
+                to: vec![crate::store::ReferenceGrantTo { group: String::new(), kind: "Service".to_string(), name: Some("oauth2-proxy".to_string()) }],
+            },
+        );
+        let config = compile_config(&store);
+        assert_eq!(config.routes[0].ext_auth.as_ref().unwrap().service_name, "oauth2-proxy", "the grant is checked at compile time");
     }
 
     // ---- Policy sectionName targeting tests --------------------------------

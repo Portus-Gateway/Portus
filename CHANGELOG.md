@@ -4,6 +4,17 @@ All notable changes to Portus are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **JWTAuthPolicy.** Bearer JWTs on HTTPRoutes, GRPCRoutes and Gateways, verified against one or more issuers (`jwt.providers[]`: `issuer`, `audiences`, optional `jwksUri`, `claimToHeaders`). The controller fetches each issuer's JWKS (OpenID discovery, refreshed every 5 minutes) and ships it in the config; data planes never call the issuer. Unfetchable keys refuse every token and report `ResolvedRefs: False` (`JWKSUnavailable`). Claim headers replace any client-sent copies. See [`docs/policies.md`](docs/policies.md#jwtauthpolicy).
+- **ExtAuthPolicy.** Forward-auth on HTTPRoutes, GRPCRoutes and Gateways: a `GET` to an authorization Service with the client's headers and `X-Forwarded-*`; a 2xx forwards (copying `responseHeaders` into the backend request), anything else is returned to the client as it is. Works with oauth2-proxy, Authelia and Authentik. `timeoutMs`, `failOpen`, `requestHeaders`. See [`docs/policies.md`](docs/policies.md#extauthpolicy).
+
+### Changed
+
+- Data plane: request metrics are resolved once per endpoint pool, request headers use typed names, and the HTTP/2 upstream connection set is lock-free (about 3 % less CPU per request at a fixed rate).
+
 ## [0.2.12] - 2026-10-01
 
 Standalone mode (`PORTUS_CONFIG_FILE`) as a plain reverse proxy: [`docs/standalone.md`](docs/standalone.md).

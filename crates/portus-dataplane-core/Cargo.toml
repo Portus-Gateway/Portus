@@ -43,3 +43,6 @@ rand = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }
 instant-acme = "0.8.5"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+http-body-util = "0.1"

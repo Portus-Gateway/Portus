@@ -27,7 +27,7 @@ use crate::ai_types::{AIProvider, AIRoute, AIUsagePolicy};
 use crate::gateway_types::{GRPCRoute, Gateway, GatewayClass, HTTPRoute, ListenerSet, ReferenceGrant, TCPRoute, TLSRoute, UDPRoute};
 use crate::policy_types::{
     APIKeyAuthPolicy, BasicAuthPolicy, CORSPolicy, CircuitBreakerPolicy, ConnectionPolicy,
-    HealthCheckPolicy, IPAllowlistPolicy, RateLimitPolicy, RequestBodySizeLimitPolicy,
+    ExtAuthPolicy, HealthCheckPolicy, IPAllowlistPolicy, JWTAuthPolicy, RateLimitPolicy, RequestBodySizeLimitPolicy,
     RetryPolicy, TimeoutPolicy,
 };
 use crate::gateway_types::BackendTLSPolicy;
@@ -38,6 +38,8 @@ use crate::reconcilers::ai_route::reconcile_ai_route;
 use crate::reconcilers::ai_usage_policy::reconcile_ai_usage_policy;
 use crate::reconcilers::api_key_auth_policy::reconcile_api_key_auth_policy;
 use crate::reconcilers::basic_auth_policy::reconcile_basic_auth_policy;
+use crate::reconcilers::jwt_auth_policy::reconcile_jwt_auth_policy;
+use crate::reconcilers::ext_auth_policy::reconcile_ext_auth_policy;
 use crate::reconcilers::circuit_breaker_policy::reconcile_circuit_breaker_policy;
 use crate::reconcilers::connection_policy::reconcile_connection_policy;
 use crate::reconcilers::cors_policy::reconcile_cors_policy;
@@ -289,6 +291,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cp_reader = spawn("ConnectionPolicy", policy_controller::<ConnectionPolicy>(&client, &ctx.store), reconcile_connection_policy, ctx.clone(), Some(gone_policy("ConnectionPolicy", |s| &s.connection_policies)));
     let bap_reader = spawn("BasicAuthPolicy", policy_controller::<BasicAuthPolicy>(&client, &ctx.store), reconcile_basic_auth_policy, ctx.clone(), Some(gone_policy("BasicAuthPolicy", |s| &s.basic_auth_policies)));
     let akp_reader = spawn("APIKeyAuthPolicy", policy_controller::<APIKeyAuthPolicy>(&client, &ctx.store), reconcile_api_key_auth_policy, ctx.clone(), Some(gone_policy("APIKeyAuthPolicy", |s| &s.api_key_auth_policies)));
+    let jwt_reader = spawn("JWTAuthPolicy", policy_controller::<JWTAuthPolicy>(&client, &ctx.store), reconcile_jwt_auth_policy, ctx.clone(), Some(gone_policy("JWTAuthPolicy", |s| &s.jwt_auth_policies)));
+    let eap_reader = spawn("ExtAuthPolicy", policy_controller::<ExtAuthPolicy>(&client, &ctx.store), reconcile_ext_auth_policy, ctx.clone(), Some(gone_policy("ExtAuthPolicy", |s| &s.ext_auth_policies)));
     let rp_reader = spawn("RetryPolicy", policy_controller::<RetryPolicy>(&client, &ctx.store), reconcile_retry_policy, ctx.clone(), Some(gone_policy("RetryPolicy", |s| &s.retry_policies)));
     let iap_reader = spawn("IPAllowlistPolicy", policy_controller::<IPAllowlistPolicy>(&client, &ctx.store), reconcile_ip_allowlist_policy, ctx.clone(), Some(gone_policy("IPAllowlistPolicy", |s| &s.ip_allowlist_policies)));
     let bsl_reader = spawn("RequestBodySizeLimitPolicy", policy_controller::<RequestBodySizeLimitPolicy>(&client, &ctx.store), reconcile_request_body_size_limit_policy, ctx.clone(), Some(gone_policy("RequestBodySizeLimitPolicy", |s| &s.request_body_size_limit_policies)));
@@ -358,6 +362,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             connection_policies: cp_reader,
             basic_auth_policies: bap_reader,
             api_key_auth_policies: akp_reader,
+            jwt_auth_policies: jwt_reader,
+            ext_auth_policies: eap_reader,
             retry_policies: rp_reader,
             ip_allowlist_policies: iap_reader,
             request_body_size_limit_policies: bsl_reader,
@@ -543,6 +549,8 @@ struct PruneReaders {
     connection_policies: kube::runtime::reflector::Store<ConnectionPolicy>,
     basic_auth_policies: kube::runtime::reflector::Store<BasicAuthPolicy>,
     api_key_auth_policies: kube::runtime::reflector::Store<APIKeyAuthPolicy>,
+    jwt_auth_policies: kube::runtime::reflector::Store<JWTAuthPolicy>,
+    ext_auth_policies: kube::runtime::reflector::Store<ExtAuthPolicy>,
     retry_policies: kube::runtime::reflector::Store<RetryPolicy>,
     ip_allowlist_policies: kube::runtime::reflector::Store<IPAllowlistPolicy>,
     request_body_size_limit_policies: kube::runtime::reflector::Store<RequestBodySizeLimitPolicy>,
@@ -607,6 +615,8 @@ impl PruneReaders {
         self.connection_policies.wait_until_ready().await?;
         self.basic_auth_policies.wait_until_ready().await?;
         self.api_key_auth_policies.wait_until_ready().await?;
+        self.jwt_auth_policies.wait_until_ready().await?;
+        self.ext_auth_policies.wait_until_ready().await?;
         self.retry_policies.wait_until_ready().await?;
         self.ip_allowlist_policies.wait_until_ready().await?;
         self.request_body_size_limit_policies.wait_until_ready().await?;
@@ -639,6 +649,8 @@ impl PruneReaders {
         pruned += prune_map(&store.connection_policies, &live_names(&self.connection_policies), "ConnectionPolicy");
         pruned += prune_map(&store.basic_auth_policies, &live_names(&self.basic_auth_policies), "BasicAuthPolicy");
         pruned += prune_map(&store.api_key_auth_policies, &live_names(&self.api_key_auth_policies), "ApiKeyAuthPolicy");
+        pruned += prune_map(&store.jwt_auth_policies, &live_names(&self.jwt_auth_policies), "JWTAuthPolicy");
+        pruned += prune_map(&store.ext_auth_policies, &live_names(&self.ext_auth_policies), "ExtAuthPolicy");
         pruned += prune_map(&store.retry_policies, &live_names(&self.retry_policies), "RetryPolicy");
         pruned += prune_map(&store.ip_allowlist_policies, &live_names(&self.ip_allowlist_policies), "IPAllowlistPolicy");
         pruned += prune_map(&store.request_body_size_limit_policies, &live_names(&self.request_body_size_limit_policies), "RequestBodySizeLimitPolicy");

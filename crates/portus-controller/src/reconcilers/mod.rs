@@ -12,12 +12,14 @@ pub mod configmap;
 pub mod connection_policy;
 pub mod cors_policy;
 pub mod endpointslice;
+pub mod ext_auth_policy;
 pub mod gateway;
 pub mod gateway_class;
 pub mod grpc_route;
 pub mod health_check_policy;
 pub mod http_route;
 pub mod ip_allowlist_policy;
+pub mod jwt_auth_policy;
 pub mod listener_set;
 pub mod namespace;
 pub mod rate_limit_policy;
@@ -309,6 +311,20 @@ pub fn is_reference_allowed(
     to_kind: &str,
     to_name: Option<&str>,
 ) -> bool {
+    is_reference_allowed_from(grants, "gateway.networking.k8s.io", from_namespace, from_kind, to_namespace, to_kind, to_name)
+}
+
+/// [`is_reference_allowed`] for a referencing kind outside the Gateway API
+/// group (Portus's own policies are `portus-gateway.dev`).
+pub fn is_reference_allowed_from(
+    grants: &DashMap<NamespacedName, ReferenceGrantState>,
+    from_group: &str,
+    from_namespace: &str,
+    from_kind: &str,
+    to_namespace: &str,
+    to_kind: &str,
+    to_name: Option<&str>,
+) -> bool {
     // Same namespace is always allowed
     if from_namespace == to_namespace {
         return true;
@@ -321,7 +337,7 @@ pub fn is_reference_allowed(
         }
         for from in &grant.from {
             // Gateway API spec: from.group must match the referencing resource's group
-            if from.group != "gateway.networking.k8s.io" {
+            if from.group != from_group {
                 continue;
             }
             if from.namespace == from_namespace && from.kind == from_kind {

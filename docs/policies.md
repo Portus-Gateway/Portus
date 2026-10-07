@@ -2,7 +2,8 @@
 
 Portus policies are CRDs in the `portus-gateway.dev/v1alpha1` group that attach to a
 Gateway API object with a `targetRef` (GEP-713 style). The controller compiles them into
-the route config; the data plane enforces them on the request path with no call-outs.
+the route config; the data plane enforces them on the request path. The only call-out on
+the request path is the one an ExtAuthPolicy asks for.
 
 Common rules:
 
@@ -31,6 +32,8 @@ printer columns.
 | [RequestBodySizeLimitPolicy](#requestbodysizelimitpolicy) | HTTPRoute, GRPCRoute, AIRoute, Gateway | 413 above `maxBytes`, streamed bodies included |
 | [BasicAuthPolicy](#basicauthpolicy) | HTTPRoute, GRPCRoute, AIRoute, Gateway | HTTP Basic against bcrypt hashes in a Secret |
 | [ApiKeyAuthPolicy](#apikeyauthpolicy) | HTTPRoute, GRPCRoute, AIRoute, Gateway | A header checked against keys in a Secret |
+| [JWTAuthPolicy](#jwtauthpolicy) | HTTPRoute, GRPCRoute, Gateway | Bearer JWTs verified against an issuer's published keys; claims to headers |
+| [ExtAuthPolicy](#extauthpolicy) | HTTPRoute, GRPCRoute, Gateway | Ask an authorization service (forward-auth: oauth2-proxy, Authelia, Authentik) |
 | [AIUsagePolicy](ai-gateway.md#aiusagepolicy) | AIRoute | Token or call budgets per key, tenant or route |
 | BackendTLSPolicy | Service | Gateway API v1: CA bundle and SANs for TLS to a backend |
 
@@ -195,3 +198,76 @@ spec:
 Every value in the Secret's data is a valid key (the data keys are labels). A missing or
 unknown key gets `401`. This is the plain header check for ordinary routes; AI routes
 use the ledger-issued keys described in [ai-gateway.md](ai-gateway.md#keys).
+
+## JWTAuthPolicy
+
+```yaml
+spec:
+  targetRef: {group: gateway.networking.k8s.io, kind: HTTPRoute, name: api}
+  jwt:
+    providers:
+      - issuer: https://dex.example.com      # the tokens' iss claim
+        audiences: [api]                     # any one; omit to accept any audience
+        # jwksUri: https://dex.example.com/keys   # default: OpenID discovery, then <issuer>/keys
+        claimToHeaders:
+          - {claim: sub, header: X-User}
+          - {claim: groups, header: X-Groups}  # arrays are comma-joined
+```
+
+Requests need `Authorization: Bearer <token>`. The token must be signed by one of the
+issuer's published keys, name that issuer, carry `sub` and an unexpired `exp` (60 s
+leeway), not be before its `nbf`, and carry one of `audiences` when set. A missing token
+gets `401` with `WWW-Authenticate: Bearer realm="portus"`; a rejected one adds
+`error="invalid_token"`. The token is forwarded to the backend unchanged.
+
+`claimToHeaders` copies verified claims into request headers. Any copy of those headers
+the client sent is removed first, so a backend can trust them. Strings are copied as
+they are, numbers and booleans as text, arrays of those comma-joined; objects are skipped.
+`Authorization`, `Host` and framing headers cannot be targets.
+
+The controller fetches each issuer's keys (JWKS) and ships them to the data planes in the
+config, so data planes never call the issuer. Keys are refreshed every five minutes; a
+rotation reaches the data planes as a config update. While an issuer's keys cannot be
+fetched, every token from it is refused (the route stays closed) and the policy reports
+`ResolvedRefs: False`, reason `JWKSUnavailable`, with the error. A failed refresh keeps
+the keys already fetched. The controller therefore needs network access to each issuer.
+
+A route has one authentication policy: when several target it, BasicAuthPolicy wins over
+ApiKeyAuthPolicy, which wins over JWTAuthPolicy. AIRoutes take OAuth tokens through their
+own `auth.jwt` ([ai-gateway.md](ai-gateway.md)).
+
+## ExtAuthPolicy
+
+```yaml
+spec:
+  targetRef: {group: gateway.networking.k8s.io, kind: HTTPRoute, name: dashboard}
+  extAuth:
+    backendRef: {name: oauth2-proxy, namespace: auth, port: 4180}
+    path: /oauth2/auth                 # default /
+    timeoutMs: 1000                    # default
+    failOpen: false                    # default: 503 when the service cannot answer
+    # requestHeaders: [cookie, authorization]   # default: every client header
+    responseHeaders: [X-Auth-Request-User, X-Auth-Request-Email]
+```
+
+Before forwarding, the data plane sends `GET <path>` to the Service with the client's
+headers (all of them, or `requestHeaders`) and `X-Forwarded-Method`, `X-Forwarded-Proto`,
+`X-Forwarded-Host`, `X-Forwarded-Uri` and `X-Forwarded-For`, and no body. This is the
+forward-auth contract of Traefik's ForwardAuth and nginx's `auth_request`, so oauth2-proxy
+(`/oauth2/auth`), Authelia (`/api/authz/forward-auth`) and Authentik's outposts work
+unchanged.
+
+- **2xx**: the request is forwarded. The `responseHeaders` the service set are copied into
+  the backend request; client copies of them are removed first.
+- **Anything else** goes back to the client as it is (status, headers, up to 64 KiB of
+  body), so a `302` to a login page or a `401` with its challenge reaches the browser.
+- **No answer** (no ready endpoint, connection error, `timeoutMs` passed): `503`, or the
+  request is forwarded when `failOpen` is true.
+
+The check runs after the route's own authentication policy (Basic, API key or JWT), so a
+route can require a JWT and also ask a service. A Service in another namespace needs a
+ReferenceGrant in that namespace with `from: {group: portus-gateway.dev, kind:
+ExtAuthPolicy, namespace: <policy namespace>}` and `to: {group: "", kind: Service}`.
+Without one the route refuses every request with `500` (it is never left open) and the
+policy reports `ResolvedRefs: False`, reason `RefNotPermitted`. Connections to the service
+are plain HTTP and kept alive.
