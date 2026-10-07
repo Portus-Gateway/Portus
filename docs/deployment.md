@@ -74,6 +74,8 @@ The stream between controller and dataplanes carries the compiled routing config
 | `dataplane.networkStack` | `rama` | Network stack the dataplane pods serve on (`PORTUS_NETWORK_STACK`). The release image carries `rama` (default since 0.2.4) and `pingora`; a value the image does not carry fails the pod at start with a log line naming it |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
 | `dataplane.accessLog` | `false` | One line per request on the `portus_dataplane::access` target (`PORTUS_ACCESS_LOG`) |
+| `dataplane.tracing.endpoint` | `""` | OTLP/gRPC collector for request spans (`http://` or `https://`); empty turns tracing off. See [Tracing](#tracing) |
+| `dataplane.tracing.sampler` / `.samplerArg` | `""` / `""` | `OTEL_TRACES_SAMPLER` and its ratio; empty is `parentbased_always_on` |
 | `dataplane.controllerUrl` | `""` | `host:port` the dataplanes dial; empty means the controller Service (`<release>-portus-gateway-controller.<namespace>:<grpcPort>`) |
 | `dataplane.service.type` | `LoadBalancer` | Type of every per-Gateway Service; `ClusterIP` on k3d and for in-cluster clients |
 | `dataplane.service.annotations` | `{}` | Annotations on every per-Gateway Service |
@@ -180,6 +182,7 @@ The controller hardcodes the gRPC listen address to `[::]:50051`. This is not co
 | `CONTROLLER_ADDR` | `portus-controller:50051` | gRPC address of the controller. The Helm chart auto-generates this from the controller Service name and port. |
 | `L4_IDLE_TIMEOUT_SECS` | `3600` | Idle timeout for L4 sessions (SNI mux passthrough/terminate, TCPRoute). A session is closed only when neither direction has carried bytes for this long, so long-lived protocols such as MQTT stay up as long as they exchange keepalives. |
 | `UDP_IDLE_TIMEOUT_SECS` | `60` | Idle timeout for UDPRoute client sessions (one per client source address per listener port). A client that stays quiet this long gets a fresh backend choice on its next datagram. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | OTLP/gRPC collector; set turns tracing on. The other standard `OTEL_*` variables apply too: see [Tracing](#tracing). |
 | `PORTUS_DRAIN_SECONDS` | `25` | Rama stack: how long a pod keeps serving requests already in flight after SIGTERM. The provisioner sets the pod's `terminationGracePeriodSeconds` to 30, so raise both together. |
 
 ## Health Checks
@@ -222,6 +225,26 @@ The dataplane exposes Prometheus metrics on port 9090 (configurable via `datapla
 The two most important operational metrics are `grpc_stream_connected` and `config_last_update_timestamp`. If `grpc_stream_connected` drops to 0 and stays there, the dataplane is running on stale config. If `config_last_update_timestamp` stops advancing, the compilation loop in the controller may have stalled (see Troubleshooting below).
 
 `proxy_tls_cert_expiry_seconds` is useful for certificate rotation monitoring. The dataplane hot-reloads TLS certs without restart -- the controller pushes new certs over the gRPC stream and the dataplane swaps them atomically via `ArcSwap`. But if the controller isn't sending updated certs, this metric will tell you how much time you have.
+
+### Tracing
+
+With `dataplane.tracing.endpoint` set, every Gateway's pods export one OpenTelemetry span per forwarded request over OTLP/gRPC:
+
+```yaml
+dataplane:
+  tracing:
+    endpoint: http://otel-collector.observability:4317
+    sampler: parentbased_traceidratio
+    samplerArg: "0.1"
+```
+
+- **Propagation.** A valid W3C `traceparent` from the client is continued; otherwise the span starts a new trace. The backend always receives a `traceparent` naming the gateway's span as its parent, so its own spans nest under it. A client `tracestate` passes through with the trace it belongs to and is dropped when the span starts a new trace.
+- **Sampling.** The standard samplers (`always_on`, `always_off`, `traceidratio`, and their `parentbased_` forms). The default, `parentbased_always_on`, follows the client's sampled flag and samples every new trace. An unsampled request still propagates its context with the flag cleared.
+- **Span contents.** A `SERVER` span named after the method, with `http.request.method`, `url.path`, `url.scheme`, `server.address`, `client.address`, `user_agent.original`, `http.response.status_code`, `portus.backend.service` and `portus.backend.port`. A 5xx, or no response at all, marks it as an error. The resource carries `service.name=portus-dataplane`, `k8s.namespace.name` and `gateway.name`.
+- **What is not traced.** Requests the gateway answers itself (redirects, auth refusals, rate limits, CORS preflights) have no span.
+- **Export.** Spans are batched (up to 512, at least every 5 s) on a thread of their own. When the collector is down or the 8192-span queue is full, spans are dropped and the pod logs a warning; requests are never held up.
+
+Standalone and hand-run pods read the same standard variables: `OTEL_EXPORTER_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`), `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG`, `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_EXPORTER_OTLP_TIMEOUT`. `OTEL_SDK_DISABLED=true` or `OTEL_TRACES_EXPORTER=none` turn tracing off. The chart does not yet pass collector headers, so a collector that needs an auth header is reachable from standalone mode only.
 
 ## Troubleshooting
 

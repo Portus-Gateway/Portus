@@ -15,6 +15,33 @@ pub mod proto {
         }
     }
 
+    /// OTLP (vendored opentelemetry-proto), for exporting traces.
+    pub mod opentelemetry {
+        pub mod proto {
+            pub mod common {
+                pub mod v1 {
+                    tonic::include_proto!("opentelemetry.proto.common.v1");
+                }
+            }
+            pub mod resource {
+                pub mod v1 {
+                    tonic::include_proto!("opentelemetry.proto.resource.v1");
+                }
+            }
+            pub mod trace {
+                pub mod v1 {
+                    tonic::include_proto!("opentelemetry.proto.trace.v1");
+                }
+            }
+            pub mod collector {
+                pub mod trace {
+                    pub mod v1 {
+                        tonic::include_proto!("opentelemetry.proto.collector.trace.v1");
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Re-export for convenience

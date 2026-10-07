@@ -23,6 +23,7 @@ pub mod h2;
 pub mod jwt;
 pub mod l4_proxy;
 pub mod metrics;
+pub mod otel;
 pub mod outlier;
 pub mod plan;
 pub mod pool;

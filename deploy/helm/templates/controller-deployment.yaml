@@ -81,6 +81,20 @@ spec:
             {{- end }}
             - name: PORTUS_DATAPLANE_NETWORK_STACK
               value: {{ .Values.dataplane.networkStack | default "rama" | quote }}
+            {{- with .Values.dataplane.tracing }}
+            {{- if .endpoint }}
+            - name: PORTUS_DATAPLANE_OTLP_ENDPOINT
+              value: {{ .endpoint | quote }}
+            {{- if .sampler }}
+            - name: PORTUS_DATAPLANE_TRACES_SAMPLER
+              value: {{ .sampler | quote }}
+            {{- end }}
+            {{- if .samplerArg }}
+            - name: PORTUS_DATAPLANE_TRACES_SAMPLER_ARG
+              value: {{ .samplerArg | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.aiGateway.enabled }}
             # Data planes report AI usage records here.
             - name: PORTUS_DATAPLANE_LEDGER_ADDR

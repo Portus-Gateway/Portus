@@ -12,7 +12,7 @@ categories = ["network-programming"]
 [dependencies]
 portus-types = { path = "../portus-types" }
 arc-swap = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["tls-webpki-roots"] }
 tokio = { workspace = true }
 prometheus = { workspace = true }
 log = { workspace = true }

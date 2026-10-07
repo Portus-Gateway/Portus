@@ -280,6 +280,31 @@ pub struct Forward {
     /// The AI provider behind the route, when there is one: the adapter
     /// reads token usage from the response and records the request.
     pub ai: Option<crate::router::AiBackend>,
+    /// The request's span when tracing is on: the stack sends its
+    /// `traceparent` to the backend and ends it where the request is counted.
+    pub trace: Option<crate::otel::Span>,
+}
+
+impl Forward {
+    /// Set the backend's `traceparent` to this request's span. A client
+    /// `tracestate` without a valid `traceparent` belongs to no trace the
+    /// backend will see, so it is dropped.
+    pub fn apply_trace<H: HeaderSink>(&self, headers: &mut H) {
+        if let Some(span) = &self.trace {
+            headers.insert(HeaderName::from_static(crate::otel::TRACEPARENT), span.traceparent());
+            if !span.continued() {
+                headers.remove(&HeaderName::from_static(crate::otel::TRACESTATE));
+            }
+        }
+    }
+
+    /// Count the request in the route's metrics and end its span.
+    pub fn finish(&self, status: u16) {
+        self.metrics.count(status);
+        if let Some(span) = &self.trace {
+            span.end(status);
+        }
+    }
 }
 
 /// Label for the protocol dimension of the request metrics.
@@ -618,6 +643,19 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
         other => other.clone(),
     };
 
+    let trace = crate::otel::start_span(
+        facts.headers,
+        &crate::otel::RequestInfo {
+            method: facts.method,
+            path: facts.path,
+            host,
+            scheme: original_scheme,
+            peer_ip: facts.peer_ip,
+            service: &service_name,
+            port,
+        },
+    );
+
     Plan::Forward(Box::new(Forward {
         service_name,
         port,
@@ -651,6 +689,7 @@ pub async fn plan_request<H: RequestHeaders + ?Sized>(
         connection_limiter,
         metrics: route_metrics,
         ai: pr.ai.clone(),
+        trace,
     }))
 }
 
@@ -1208,6 +1247,45 @@ mod tests {
         let mut upstream = headers.clone();
         f.auth_headers.as_ref().expect("service headers").apply(&mut upstream);
         assert_eq!(upstream.get_all("x-user").iter().collect::<Vec<_>>(), vec!["alice"]);
+    }
+
+    /// Tracing off (no tracer installed): no span, and the client's
+    /// `traceparent` reaches the backend untouched. With a span, the backend's
+    /// `traceparent` continues the client's trace with this span as parent.
+    #[tokio::test]
+    async fn forwarded_requests_carry_the_span_to_the_backend() {
+        const CLIENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let snap = catch_all_snapshot("acme.example.com", "orders");
+        let mut headers = HeaderMap::new();
+        headers.insert(crate::otel::TRACEPARENT, HeaderValue::from_static(CLIENT));
+        let Plan::Forward(mut f) = plan_request(&snap, challenge_facts(&headers, "/", false), metrics()).await else { panic!("expected a forward") };
+        assert!(f.trace.is_none(), "tracing is off without an endpoint");
+        let mut upstream = headers.clone();
+        f.apply_trace(&mut upstream);
+        assert_eq!(upstream.get(crate::otel::TRACEPARENT).unwrap(), CLIENT);
+
+        f.trace = Some(crate::otel::test_span(&headers));
+        f.apply_trace(&mut upstream);
+        assert_eq!(upstream.get_all(crate::otel::TRACEPARENT).iter().count(), 1, "replaced, not appended");
+        let sent = crate::otel::parse_traceparent(upstream[crate::otel::TRACEPARENT].as_bytes()).unwrap();
+        let client = crate::otel::parse_traceparent(CLIENT.as_bytes()).unwrap();
+        assert_eq!(sent.trace_id, client.trace_id);
+        assert_ne!(sent.span_id, client.span_id);
+        f.finish(200);
+
+        // A tracestate is kept with the trace it belongs to, dropped with a new one.
+        let mut continued = headers.clone();
+        continued.insert(crate::otel::TRACESTATE, HeaderValue::from_static("vendor=1"));
+        let mut upstream = continued.clone();
+        f.apply_trace(&mut upstream);
+        assert_eq!(upstream.get(crate::otel::TRACESTATE).unwrap(), "vendor=1");
+        let mut orphan = HeaderMap::new();
+        orphan.insert(crate::otel::TRACESTATE, HeaderValue::from_static("vendor=1"));
+        f.trace = Some(crate::otel::test_span(&orphan));
+        let mut upstream = orphan.clone();
+        f.apply_trace(&mut upstream);
+        assert!(!upstream.contains_key(crate::otel::TRACESTATE));
+        assert!(upstream.contains_key(crate::otel::TRACEPARENT));
     }
 
     /// Kubernetes mode never registers tokens, so a challenge request routes

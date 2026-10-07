@@ -264,6 +264,7 @@ impl ProxyHttp for Router {
         if let Some(auth) = &plan.auth_headers {
             auth.apply(&mut PingoraHeaders(upstream_request));
         }
+        plan.apply_trace(&mut PingoraHeaders(upstream_request));
         Ok(())
     }
 
@@ -453,7 +454,7 @@ impl ProxyHttp for Router {
         let host = ctx.plan.as_ref().map_or("no_route", |plan| plan.service_name.as_ref());
         match ctx.plan.as_ref() {
             Some(plan) => {
-                plan.metrics.count(status_u16);
+                plan.finish(status_u16);
                 plan.metrics.duration.observe(duration);
             }
             None => {

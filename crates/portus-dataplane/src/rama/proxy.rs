@@ -366,7 +366,7 @@ impl ProxyService {
                     }
                     let reply = reply.with_header(http::header::HeaderName::from_static(REQUEST_ID_HEADER), request_id_value(gateway_request_id));
                     let status = reply.status;
-                    plan.metrics.count(status);
+                    plan.finish(status);
                     if let Some(ledger) = self.ledger.as_ref() {
                         // A model or tool refusal knows its subject; an authentication one does not.
                         // A trusted caller's refusal is the named user's refusal.
@@ -461,7 +461,7 @@ impl ProxyService {
                 let reply = exhausted_reply(ai.dialect, budget.unit, retry, remaining, needed, request_id)
                     .with_header(http::header::HeaderName::from_static(REQUEST_ID_HEADER), request_id_value(gateway_request_id));
                 let status = reply.status;
-                plan.metrics.count(status);
+                plan.finish(status);
                 if let Some(ledger) = self.ledger.as_ref() {
                     let side = RequestSide { ai, host, body_fields: body_fields.as_ref(), request_bytes, start, key_id, tenant: tenant.as_deref(), subject: acting.as_deref(), on_behalf_of: on_behalf_of.as_deref(), request_id: gateway_request_id, client_request_id: client_request_id.as_deref(), rule: Some(budget.id.as_ref()), reservation: None };
                     record_refusal(status, RefusalKind::BudgetExhausted, side, &ledger.ring);
@@ -526,7 +526,7 @@ impl ProxyService {
             *response.body_mut() = observe(body, status, side, Arc::clone(&ledger.ring), readable);
         }
         let host_label = plan.service_name.as_ref();
-        plan.metrics.count(status);
+        plan.finish(status);
         plan.metrics.duration.observe(start.elapsed().as_secs_f64());
         if let Some(cb) = &plan.circuit_breaker {
             if status >= 500 {
@@ -614,6 +614,7 @@ impl ProxyService {
         if let Some(auth) = &plan.auth_headers {
             auth.apply(&mut HeadersMut(&mut headers));
         }
+        plan.apply_trace(&mut HeadersMut(&mut headers));
         // The usage tracker reads the provider's response bytes, so the
         // provider must not compress them: SDKs ask for gzip and Anthropic
         // compresses SSE streams, which left streamed calls unmetered.

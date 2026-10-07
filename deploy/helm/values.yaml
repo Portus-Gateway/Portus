@@ -57,6 +57,14 @@ dataplane:
   # carries both: `rama` (the default since 0.2.4) and `pingora`. A value the
   # image does not carry fails the pod at start with a log line naming it.
   networkStack: rama
+  # OpenTelemetry tracing: one span per forwarded request, exported over
+  # OTLP/gRPC. Off while endpoint is empty. The span continues the client's W3C
+  # traceparent and the backend receives one naming it as parent.
+  tracing:
+    endpoint: ""  # e.g. http://otel-collector.observability:4317
+    # Any OTEL_TRACES_SAMPLER value; empty is parentbased_always_on.
+    sampler: ""
+    samplerArg: ""  # ratio for the *traceidratio samplers, 0 to 1
   controllerUrl: ""  # gRPC config stream; auto-generated from the controller Service if empty
   service:
     type: LoadBalancer

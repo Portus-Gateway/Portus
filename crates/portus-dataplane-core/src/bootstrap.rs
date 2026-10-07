@@ -68,6 +68,8 @@ pub fn bootstrap() -> Result<Bootstrap, String> {
         std::env::var("PORTUS_ACCESS_LOG").ok().as_deref(),
     ));
 
+    crate::otel::init_from_env()?;
+
     let controller_addr =
         std::env::var("CONTROLLER_ADDR").unwrap_or_else(|_| "portus-controller:50051".to_string());
 

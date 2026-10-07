@@ -78,12 +78,26 @@ pub struct DataplaneTemplate {
     /// `host:port` of the AI gateway ledger's gRPC ingest, when the AI
     /// gateway is enabled (`PORTUS_LEDGER_ADDR` on the pods).
     pub ledger_addr: Option<String>,
+    /// OpenTelemetry tracing for the pods, when an OTLP endpoint is set.
+    pub tracing: Option<TracingTemplate>,
     /// ServiceAccount for dataplane pods. Must exist in every Gateway's
     /// namespace, so it is normally unset (default SA, token automount off).
     pub service_account: Option<String>,
     pub cpu_request: String,
     pub memory_request: String,
     pub memory_limit: String,
+}
+
+/// Where the dataplane pods export spans and how they sample, passed to them
+/// as the standard `OTEL_*` variables.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracingTemplate {
+    /// OTLP/gRPC endpoint (`OTEL_EXPORTER_OTLP_ENDPOINT`).
+    pub endpoint: String,
+    /// `OTEL_TRACES_SAMPLER`; None leaves the SDK default (`parentbased_always_on`).
+    pub sampler: Option<String>,
+    /// `OTEL_TRACES_SAMPLER_ARG`, the ratio for the `traceidratio` samplers.
+    pub sampler_arg: Option<String>,
 }
 
 impl DataplaneTemplate {
@@ -120,6 +134,11 @@ impl DataplaneTemplate {
             threads: var("PORTUS_DATAPLANE_THREADS").and_then(|v| v.trim().parse().ok()).filter(|n: &usize| *n > 0),
             network_stack: network_stack_value(var("PORTUS_DATAPLANE_NETWORK_STACK").as_deref()),
             ledger_addr: var("PORTUS_DATAPLANE_LEDGER_ADDR"),
+            tracing: var("PORTUS_DATAPLANE_OTLP_ENDPOINT").map(|endpoint| TracingTemplate {
+                endpoint,
+                sampler: var("PORTUS_DATAPLANE_TRACES_SAMPLER"),
+                sampler_arg: var("PORTUS_DATAPLANE_TRACES_SAMPLER_ARG"),
+            }),
             service_account: var("PORTUS_DATAPLANE_SERVICE_ACCOUNT"),
             cpu_request: var("PORTUS_DATAPLANE_CPU_REQUEST").unwrap_or_else(|| "250m".into()),
             memory_request: var("PORTUS_DATAPLANE_MEMORY_REQUEST").unwrap_or_else(|| "256Mi".into()),
@@ -387,6 +406,20 @@ pub fn desired_deployment(gw: &GatewayRef, tpl: &DataplaneTemplate) -> Deploymen
     }
     if let Some(ledger) = &tpl.ledger_addr {
         envs.push(env("PORTUS_LEDGER_ADDR", ledger));
+    }
+    if let Some(tracing) = &tpl.tracing {
+        envs.push(env("OTEL_EXPORTER_OTLP_ENDPOINT", &tracing.endpoint));
+        envs.push(env("OTEL_SERVICE_NAME", "portus-dataplane"));
+        envs.push(env(
+            "OTEL_RESOURCE_ATTRIBUTES",
+            &format!("k8s.namespace.name={},gateway.name={}", gw.namespace, gw.name),
+        ));
+        if let Some(sampler) = &tracing.sampler {
+            envs.push(env("OTEL_TRACES_SAMPLER", sampler));
+        }
+        if let Some(arg) = &tracing.sampler_arg {
+            envs.push(env("OTEL_TRACES_SAMPLER_ARG", arg));
+        }
     }
     let mut volumes = Vec::new();
     let mut mounts = Vec::new();
@@ -714,6 +747,7 @@ mod tests {
             access_log: false,
             network_stack: "pingora".into(),
             ledger_addr: None,
+            tracing: None,
             threads: None,
             service_account: Some("portus-dataplane".into()),
             cpu_request: "250m".into(),
@@ -960,6 +994,41 @@ mod tests {
             .collect();
         assert_eq!(envs["DATAPLANE_THREADS"], "8");
         assert_eq!(envs["PORTUS_ACCESS_LOG"], "true");
+    }
+
+    fn pod_env(dep: Deployment) -> BTreeMap<String, String> {
+        dep.spec.unwrap().template.spec.unwrap().containers[0]
+            .env
+            .clone()
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.name, e.value.unwrap_or_default()))
+            .collect()
+    }
+
+    #[test]
+    fn tracing_reaches_the_pod_env_only_when_an_endpoint_is_set() {
+        let off = pod_env(desired_deployment(&gw(), &tpl()));
+        assert!(off.keys().all(|k| !k.starts_with("OTEL_")), "no OTEL_* without an endpoint: {off:?}");
+
+        let mut t = tpl();
+        t.tracing = Some(TracingTemplate {
+            endpoint: "http://otel-collector.observability:4317".into(),
+            sampler: Some("parentbased_traceidratio".into()),
+            sampler_arg: Some("0.1".into()),
+        });
+        let on = pod_env(desired_deployment(&gw(), &t));
+        assert_eq!(on["OTEL_EXPORTER_OTLP_ENDPOINT"], "http://otel-collector.observability:4317");
+        assert_eq!(on["OTEL_SERVICE_NAME"], "portus-dataplane");
+        assert_eq!(on["OTEL_RESOURCE_ATTRIBUTES"], "k8s.namespace.name=infra,gateway.name=same-namespace");
+        assert_eq!(on["OTEL_TRACES_SAMPLER"], "parentbased_traceidratio");
+        assert_eq!(on["OTEL_TRACES_SAMPLER_ARG"], "0.1");
+
+        t.tracing.as_mut().unwrap().sampler = None;
+        t.tracing.as_mut().unwrap().sampler_arg = None;
+        let defaults = pod_env(desired_deployment(&gw(), &t));
+        assert!(!defaults.contains_key("OTEL_TRACES_SAMPLER"), "the dataplane's default sampler applies");
+        assert!(!defaults.contains_key("OTEL_TRACES_SAMPLER_ARG"));
     }
 
     #[test]

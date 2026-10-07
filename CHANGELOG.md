@@ -11,6 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **JWTAuthPolicy.** Bearer JWTs on HTTPRoutes, GRPCRoutes and Gateways, verified against one or more issuers (`jwt.providers[]`: `issuer`, `audiences`, optional `jwksUri`, `claimToHeaders`). The controller fetches each issuer's JWKS (OpenID discovery, refreshed every 5 minutes) and ships it in the config; data planes never call the issuer. Unfetchable keys refuse every token and report `ResolvedRefs: False` (`JWKSUnavailable`). Claim headers replace any client-sent copies. See [`docs/policies.md`](docs/policies.md#jwtauthpolicy).
 - **ExtAuthPolicy.** Forward-auth on HTTPRoutes, GRPCRoutes and Gateways: a `GET` to an authorization Service with the client's headers and `X-Forwarded-*`; a 2xx forwards (copying `responseHeaders` into the backend request), anything else is returned to the client as it is. Works with oauth2-proxy, Authelia and Authentik. `timeoutMs`, `failOpen`, `requestHeaders`. See [`docs/policies.md`](docs/policies.md#extauthpolicy).
 
+- **OpenTelemetry tracing.** One `SERVER` span per forwarded request, exported over OTLP/gRPC, continuing the client's W3C `traceparent` and passing the backend a `traceparent` with the gateway's span as parent. Standard `OTEL_*` configuration (samplers, service name, resource attributes, headers, timeout); in the chart, `dataplane.tracing.endpoint`, `.sampler` and `.samplerArg`. Off by default. See [`docs/deployment.md`](docs/deployment.md#tracing).
+
 ### Changed
 
 - Data plane: request metrics are resolved once per endpoint pool, request headers use typed names, and the HTTP/2 upstream connection set is lock-free (about 3 % less CPU per request at a fixed rate).
