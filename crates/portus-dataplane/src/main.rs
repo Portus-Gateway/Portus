@@ -1,16 +1,9 @@
-//! Portus data plane: `portus-dataplane-core` bootstrapped onto a network stack.
+//! Portus data plane: `portus-dataplane-core` bootstrapped onto the Rama
+//! network stack.
 
-#[cfg(feature = "pingora")]
-mod pingora;
-#[cfg(feature = "rama")]
 mod rama;
-mod stack;
-
-use log::info;
 
 use portus_dataplane_core::bootstrap::{bootstrap, fatal};
-
-use crate::stack::NetworkStack;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -21,7 +14,7 @@ fn init_logging() {
     // filtered out — profiling showed 13% of CPU burned on mutex contention.
     // tracing-subscriber's EnvFilter uses lock-free atomics for level filtering:
     // filtered-out messages have zero contention across worker threads.
-    // LogTracer bridges the stacks' log:: macros through tracing's filter path.
+    // LogTracer bridges the log:: macros (core and Rama) through tracing's filter path.
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::{fmt, EnvFilter};
 
@@ -39,29 +32,6 @@ fn main() {
         .expect("failed to install rustls crypto provider");
     init_logging();
 
-    let stack = NetworkStack::from_env().unwrap_or_else(|e| fatal(&e));
     let boot = bootstrap().unwrap_or_else(|e| fatal(&e));
-    info!("starting the {} network stack", stack.name());
-    match stack {
-        NetworkStack::Pingora => {
-            #[cfg(feature = "pingora")]
-            pingora::run(boot);
-            #[cfg(not(feature = "pingora"))]
-            {
-                drop(boot);
-                log::error!("the pingora network stack is not built into this binary");
-                std::process::exit(1)
-            }
-        }
-        NetworkStack::Rama => {
-            #[cfg(feature = "rama")]
-            rama::run(boot);
-            #[cfg(not(feature = "rama"))]
-            {
-                drop(boot);
-                log::error!("the rama network stack is not built into this binary");
-                std::process::exit(1)
-            }
-        }
-    }
+    rama::run(boot);
 }

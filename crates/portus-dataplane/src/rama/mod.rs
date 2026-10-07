@@ -1,8 +1,6 @@
 //! The Rama network stack: turns a [`Bootstrap`] into a running proxy on one
 //! multi-thread tokio runtime.
 //!
-//! Experimental: compared against the Pingora stack on the same benchmarks
-//! and conformance suite. Selected with `PORTUS_NETWORK_STACK=rama`.
 
 mod body;
 mod client;

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **The Pingora network stack.** Rama, the default since 0.2.4, is the only stack: it measured 3–31 % more throughput on every payload rung with 2–2.6× less memory. `dataplane.networkStack` and `PORTUS_NETWORK_STACK` are gone (a leftover value is ignored), as are the `pingora` cargo feature and the vendored `pingora-core` patch. The full test suite runs in about 30 s instead of 2.5 min.
+
 ## [0.3.0] - 2026-10-07
 
 New auth policies, request tracing, and CRDs at `v1beta1` that the chart now upgrades. Installs from 0.2.12 or earlier hand the CRDs to Helm once before upgrading: [`docs/deployment.md`](docs/deployment.md#upgrading).

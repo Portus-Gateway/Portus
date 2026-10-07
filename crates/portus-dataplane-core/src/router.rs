@@ -2,7 +2,7 @@ use http::{HeaderName, HeaderValue};
 use log::warn;
 use hashbrown::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -60,20 +60,6 @@ pub fn listener_scheme_and_port(local_port: u16, is_tls: bool) -> (&'static str,
 // SEC-4: Default request body size limit (10 MB) when no policy is configured.
 // ---------------------------------------------------------------------------
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 10 * 1024 * 1024;
-
-// ---------------------------------------------------------------------------
-// PERF-1: Static empty Arc singletons — avoids 9 heap allocations per request
-// in new_ctx(). All Arc::clone() on these is a single atomic increment.
-// ---------------------------------------------------------------------------
-pub static EMPTY_HEADER_VEC: LazyLock<Arc<Vec<(HeaderName, HeaderValue)>>> =
-    LazyLock::new(|| Arc::new(Vec::new()));
-pub static EMPTY_NAME_VEC: LazyLock<Arc<Vec<HeaderName>>> =
-    LazyLock::new(|| Arc::new(Vec::new()));
-pub static EMPTY_STRING_VEC: LazyLock<Arc<Vec<String>>> =
-    LazyLock::new(|| Arc::new(Vec::new()));
-pub static EMPTY_CODES: LazyLock<Arc<Vec<u16>>> = LazyLock::new(|| Arc::new(Vec::new()));
-pub static EMPTY_SNI: LazyLock<Arc<str>> =
-    LazyLock::new(|| Arc::from(""));
 
 // ---------------------------------------------------------------------------
 // Internal types

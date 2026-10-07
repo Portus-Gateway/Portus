@@ -40,8 +40,7 @@ use rama::tls::rustls::client::TlsConnector;
 
 use portus_dataplane_core::h2::{UPSTREAM_H2_CONNECTION_WINDOW, UPSTREAM_H2_STREAM_WINDOW};
 
-/// Idle HTTP/1 upstream connections kept per pod across all targets; the
-/// Pingora stack keeps 2048. At 64 KiB of read buffer each this is 64 MiB
+/// Idle HTTP/1 upstream connections kept per pod across all targets. At 64 KiB of read buffer each this is 64 MiB
 /// worst case, and a full budget evicts the oldest idle connection rather
 /// than dropping a live one.
 const MAX_IDLE_TOTAL: usize = 1024;
@@ -77,7 +76,7 @@ pub struct UpstreamTarget {
     pub h2: bool,
 }
 
-/// Dials upstreams with TCP_NODELAY, as Pingora's connector does. Rama's
+/// Dials upstreams with TCP_NODELAY. Rama's
 /// default connector leaves Nagle on, which stalls request/response bodies
 /// written in two segments behind delayed ACKs.
 #[derive(Debug, Clone, Default)]

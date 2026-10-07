@@ -1,7 +1,7 @@
 # Portus
 
 A Kubernetes gateway in Rust: the Gateway API, an AI gateway for LLM providers and an MCP gateway
-for tool servers, on one data plane with a swappable network stack.
+for tool servers, on one data plane.
 
 <!-- badges -->
 [![Gateway API Conformance](https://img.shields.io/badge/Gateway%20API-v1.6.2%20%C2%B7%20130%2F130-blue)](https://gateway-api.sigs.k8s.io/)
@@ -25,9 +25,8 @@ for tool servers, on one data plane with a swappable network stack.
 Three rules shape the design. The data plane never calls anything on the request path: keys,
 budgets and token verification are local lookups against state the ledger pushes in. Config
 changes swap atomically (`ArcSwap`), so a reload never drops a connection. And the network stack
-is an adapter: everything Portus decides lives in a stack-independent core, and the release image
-carries both [Rama](https://github.com/plabayo/rama) (default) and
-[Pingora](https://github.com/cloudflare/pingora).
+is an adapter: everything Portus decides lives in a stack-independent core, served on
+[Rama](https://github.com/plabayo/rama).
 
 ## Quick Start
 
@@ -296,22 +295,18 @@ Details: [`benchmarks/head-to-head-aws-2026-10-06.md`](benchmarks/head-to-head-a
 and the `bench-*` control-plane targets.
 
 
-### Network stacks
+### Network stack
 
 Everything the data plane decides (routing, policies, TLS material, endpoint pools, the SNI mux, the
 L4 and UDP proxies, the AI and MCP logic) lives in `portus-dataplane-core` and knows nothing about
 the proxy framework underneath. The framework is an adapter that extracts a request's facts, asks
-the core for a plan and carries it out. The release image carries two:
+the core for a plan and carries it out. That adapter is [Rama](https://github.com/plabayo/rama) 0.4,
+used unpatched with Portus's own upstream connection pool.
 
-| Stack | Status | Select with |
-|---|---|---|
-| [Rama](https://github.com/plabayo/rama) 0.4 | Default since 0.2.4: conformance 130/130, the AI and MCP gateways run on it. Rama is used unpatched; the upstream connection pool is Portus's own | `dataplane.networkStack: rama` (default) |
-| [Pingora](https://github.com/cloudflare/pingora) 0.9 | The stack behind releases up to 0.2.3; a small patch to `pingora-core` is vendored | `dataplane.networkStack: pingora` |
-
-On the same machine Rama measured 3–31 % more throughput than Pingora on every payload rung and used
-2–2.6× less memory in a single round
-([`benchmarks/rama-vs-pingora-2026-09-15.md`](benchmarks/rama-vs-pingora-2026-09-15.md)); a
-three-round comparison is due with the next release's numbers.
+Releases up to 0.2.3 ran on Pingora, and up to 0.3.0 the image carried both. On the same machine
+Rama measured 3–31 % more throughput on every payload rung and used 2–2.6× less memory
+([`benchmarks/rama-vs-pingora-2026-09-15.md`](benchmarks/rama-vs-pingora-2026-09-15.md)), so 0.4.0
+dropped Pingora.
 
 ## Architecture
 
@@ -346,7 +341,7 @@ message; each dataplane receives only its own Gateway's slice over gRPC and ackn
 content fingerprint it applied, which drives the Gateway's `Programmed` condition.
 
 The **dataplane** builds route maps keyed by `listener_port:hostname`, binds every listener port
-and serves traffic through the selected network stack. Failing endpoints are ejected from load
+and serves traffic on Rama. Failing endpoints are ejected from load
 balancing passively (a connect failure or five consecutive 5xx) and readmitted after a growing
 back-off. Route matching follows Gateway API precedence: exact paths before prefix paths, longest
 prefix first, header, method and query matches as tiebreakers. Config updates swap atomically via
@@ -384,7 +379,6 @@ helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway
 | `dataplane.replicasPerGateway` | `2` | Pods per Gateway |
 | `dataplane.resources` | 250m / 256Mi requests, 512Mi limit | No CPU limit |
 | `dataplane.threads` | `""` | Proxy worker threads per pod; empty sizes from the cgroup CPU limit, else the node's CPU count |
-| `dataplane.networkStack` | `rama` | Network stack the dataplane pods serve on: `rama` (default) or `pingora`, both in the release image |
 | `dataplane.accessLog` | `false` | One log line per request (`portus_dataplane::access`) |
 | `dataplane.service.type` | `LoadBalancer` | Per-Gateway Service type; use `ClusterIP` on k3d |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
@@ -420,13 +414,13 @@ make build      # images
 make deploy     # Gateway API CRDs, image import, helm install (ClusterIP Services, one pod per Gateway)
 ```
 
-The workspace contains five crates plus the patched `pingora-core`:
+The workspace contains five crates:
 
 | Crate | Path | Description |
 |-------|------|-------------|
 | `portus-controller` | `crates/portus-controller` | Kubernetes controller: reconcilers, config store, compiler, gRPC server |
 | `portus-dataplane-core` | `crates/portus-dataplane-core` | Network-stack-independent data plane: config receiver, route matching, policies, endpoint pools, TLS material, SNI mux, L4/UDP proxies, AI and MCP logic, metrics |
-| `portus-dataplane` | `crates/portus-dataplane` | The data plane binary: network-stack adapters over the core (Rama by default, Pingora), selected with `PORTUS_NETWORK_STACK` |
+| `portus-dataplane` | `crates/portus-dataplane` | The data plane binary: the core served on Rama |
 | `portus-ledger` | `crates/portus-ledger` | The AI gateway's companion: keys, budgets, usage store, JWKS refresh |
 | `portus-types` | `crates/portus-types` | Protobuf-generated types shared by all three |
 

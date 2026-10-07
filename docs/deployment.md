@@ -1,6 +1,6 @@
 # Portus Deployment and Operations Guide
 
-Portus is a Kubernetes Gateway API implementation built on Pingora. It deploys as a controller (a Kubernetes operator) that watches Gateway API resources, compiles routing config and streams it over mTLS gRPC to the dataplanes (Pingora proxies) it provisions: one Deployment, Service and PodDisruptionBudget per Gateway.
+Portus is a Kubernetes Gateway API implementation in Rust. It deploys as a controller (a Kubernetes operator) that watches Gateway API resources, compiles routing config and streams it over mTLS gRPC to the dataplanes (proxies on the Rama network stack) it provisions: one Deployment, Service and PodDisruptionBudget per Gateway.
 
 ## Prerequisites
 
@@ -91,7 +91,6 @@ The stream between controller and dataplanes carries the compiled routing config
 | `dataplane.replicasPerGateway` | `2` | Pods per Gateway; the PDB keeps one available |
 | `dataplane.resources` | 250m / 256Mi requests, 512Mi memory limit | No CPU limit |
 | `dataplane.threads` | `""` | Proxy worker threads per pod (`DATAPLANE_THREADS`); empty sizes from the cgroup CPU limit if one is set, else the node's CPU count |
-| `dataplane.networkStack` | `rama` | Network stack the dataplane pods serve on (`PORTUS_NETWORK_STACK`). The release image carries `rama` (default since 0.2.4) and `pingora`; a value the image does not carry fails the pod at start with a log line naming it |
 | `dataplane.logLevel` | `info` | `RUST_LOG` |
 | `dataplane.accessLog` | `false` | One line per request on the `portus_dataplane::access` target (`PORTUS_ACCESS_LOG`) |
 | `dataplane.tracing.endpoint` | `""` | OTLP/gRPC collector for request spans (`http://` or `https://`); empty turns tracing off. See [Tracing](#tracing) |

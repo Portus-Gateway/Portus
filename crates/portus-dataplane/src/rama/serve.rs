@@ -43,10 +43,11 @@ where
             }
         };
         let local = stream.local_addr().ok();
-        // Rama sets no socket options; Pingora sets TCP_NODELAY on every accepted
-        // and dialled socket. Without it, a response whose header and body are
-        // written separately (bodies above hyper's coalescing threshold) stalls
-        // on Nagle + delayed ACK: the 16 KB rungs measured p99 47 ms.
+        // Rama sets no socket options, so TCP_NODELAY is set here on every
+        // accepted socket (the upstream connector sets it on dialled ones).
+        // Without it, a response whose header and body are written separately
+        // (bodies above hyper's coalescing threshold) stalls on Nagle +
+        // delayed ACK: the 16 KB rungs measured p99 47 ms.
         if let Err(e) = stream.set_nodelay(true) {
             debug!("rama: TCP_NODELAY on handed-off socket: {e}");
         }

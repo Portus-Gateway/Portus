@@ -8,16 +8,13 @@
 #   2. tls-alpn-01: switching the challenge in the YAML (hot reload, no
 #      restart) issues a certificate for alpn.test over the HTTPS listener;
 #   3. a restart re-issues nothing (the cache is reused).
-# The whole scenario runs once per network stack (STACKS, default both).
 #
 # Needs: go (installs pebble + pebble-challtestsrv), curl, python3.
-# Usage: [STACKS="rama pingora"] [KEEP=1] tests/standalone/acme-pebble-e2e.sh
+# Usage: [KEEP=1] tests/standalone/acme-pebble-e2e.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/portus-acme-e2e.XXXXXX")"
-STACKS="${STACKS:-rama pingora}"
-STACK=setup
 RUN="$WORK"
 PIDS=()
 cleanup() {
@@ -26,7 +23,7 @@ cleanup() {
   [[ "${KEEP:-}" == 1 ]] && echo "kept $WORK" || rm -rf "$WORK"
 }
 trap cleanup EXIT
-fail() { echo "FAIL ($STACK): $*" >&2; echo "--- dataplane log tail:" >&2; tail -40 "$RUN/dataplane.log" >&2; exit 1; }
+fail() { echo "FAIL: $*" >&2; echo "--- dataplane log tail:" >&2; tail -40 "$RUN/dataplane.log" >&2; exit 1; }
 orders() { awk '/ordering a certificate/{n++} END{print n+0}' "$RUN/dataplane.log"; }
 
 export GOBIN="$WORK/bin"
@@ -35,8 +32,8 @@ GOTOOLCHAIN=auto go install github.com/letsencrypt/pebble/v2/cmd/pebble@v2.10.1 
   github.com/letsencrypt/pebble/v2/cmd/pebble-challtestsrv@v2.10.1
 PEBBLE_SRC="$(GOTOOLCHAIN=auto go env GOMODCACHE)/github.com/letsencrypt/pebble/v2@v2.10.1"
 
-echo "building the dataplane (pingora + rama, as the image does)"
-(cd "$ROOT" && cargo build -q -p portus-dataplane --features rama)
+echo "building the dataplane"
+(cd "$ROOT" && cargo build -q -p portus-dataplane)
 DATAPLANE="$ROOT/target/debug/portus-dataplane"
 
 # Pebble validates http-01 on :5002 and tls-alpn-01 on :5001 (its config);
@@ -83,7 +80,7 @@ EOF
 }
 
 start_dataplane() {
-  PORTUS_NETWORK_STACK="$STACK" PORTUS_CONFIG_FILE="$RUN/portus.yaml" RUST_LOG=info \
+  PORTUS_CONFIG_FILE="$RUN/portus.yaml" RUST_LOG=info \
     "$DATAPLANE" >>"$RUN/dataplane.log" 2>&1 &
   DP_PID=$!
   PIDS+=("$DP_PID")
@@ -112,9 +109,8 @@ check_https() { # $1 = domain
 }
 
 scenario() {
-  RUN="$WORK/$STACK"
+  RUN="$WORK/run"
   mkdir -p "$RUN"
-  echo "== $STACK"
   echo "1. http-01 for portus.test"
   write_config http-01 portus.test
   start_dataplane
@@ -145,5 +141,5 @@ scenario() {
   kill -INT "$DP_PID"; wait "$DP_PID" 2>/dev/null || true
 }
 
-for STACK in $STACKS; do scenario; done
+scenario
 echo "PASS"

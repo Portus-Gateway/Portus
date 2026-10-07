@@ -1071,7 +1071,7 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
             });
         } else if !effective_hostnames.is_empty() {
             // No backend but route has effective hostnames — register SNI so the
-            // mux rejects instead of forwarding to Pingora HTTPS
+            // mux rejects instead of forwarding to the HTTPS service
             tls_passthrough_routes.push(TlsPassthroughRoute {
                 sni_hostnames: effective_hostnames,
                 backend_service: String::new(),
@@ -1200,7 +1200,7 @@ pub fn compile_config(store: &ConfigStore) -> CompiledConfig {
 
     // Collect all TLS Passthrough listener hostnames for SNI rejection.
     // If the SNI matches a listener hostname but no passthrough route exists,
-    // the connection should be rejected (not forwarded to Pingora for HTTPS termination).
+    // the connection should be rejected (not forwarded to the HTTPS service for termination).
     let mut tls_passthrough_listener_hostnames = Vec::new();
     for (_key, gw) in &gateways {
         for listener in &gw.listeners {
@@ -3470,7 +3470,7 @@ mod tests {
         // When a TLSRoute is accepted but has no valid backends (e.g., InvalidKind,
         // BackendNotFound), the SNI hostnames should still be registered in the
         // passthrough map so the SNI mux rejects the connection instead of
-        // forwarding to Pingora HTTPS (which would complete a TLS handshake).
+        // forwarding to the HTTPS service (which would complete a TLS handshake).
         let store = empty_store();
         setup_tls_gateway(&store, "default", "my-gw", "tls-listener", None);
         let key = NamespacedName {

@@ -53,10 +53,6 @@ dataplane:
   # CPU limit if one is set, else the node's CPU count (the pods have no CPU
   # limit by default, so they can use spare cores under load).
   threads: ""
-  # Network stack the dataplane pods serve traffic on. The release image
-  # carries both: `rama` (the default since 0.2.4) and `pingora`. A value the
-  # image does not carry fails the pod at start with a log line naming it.
-  networkStack: rama
   # OpenTelemetry tracing: one span per forwarded request, exported over
   # OTLP/gRPC. Off while endpoint is empty. The span continues the client's W3C
   # traceparent and the backend receives one naming it as parent.

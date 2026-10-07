@@ -3,36 +3,18 @@ name = "portus-dataplane"
 version = "0.3.0"
 edition = "2024"
 rust-version.workspace = true
-description = "Portus data plane: the network-stack adapters (Pingora) over portus-dataplane-core"
+description = "Portus data plane: portus-dataplane-core served on the Rama network stack"
 license = "Apache-2.0"
 repository = "https://github.com/Portus-Gateway/Portus"
-keywords = ["proxy", "gateway-api", "pingora", "networking"]
+keywords = ["proxy", "gateway-api", "rama", "networking"]
 categories = ["network-programming"]
-
-[features]
-default = ["pingora"]
-# The Pingora network stack (the release stack).
-pingora = [
-    "dep:pingora-core",
-    "dep:pingora-proxy",
-    "dep:pingora-http",
-    "dep:pingora-prometheus",
-    "dep:async-trait",
-]
-# The Rama network stack (experimental; compared against pingora).
-rama = ["dep:rama", "dep:x509-parser", "dep:dashmap", "dep:futures"]
 
 [dependencies]
 portus-dataplane-core = { path = "../portus-dataplane-core" }
-pingora-core = { workspace = true, optional = true }
-pingora-proxy = { workspace = true, optional = true }
-pingora-http = { workspace = true, optional = true }
-pingora-prometheus = { workspace = true, optional = true }
-async-trait = { workspace = true, optional = true }
-rama = { version = "0.4.0", features = ["http-full", "rustls", "ring"], optional = true }
-x509-parser = { workspace = true, optional = true }
-dashmap = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
+rama = { version = "0.4.0", features = ["http-full", "rustls", "ring"] }
+x509-parser = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
 tokio = { workspace = true }
 prometheus = { workspace = true }
 log = { workspace = true }

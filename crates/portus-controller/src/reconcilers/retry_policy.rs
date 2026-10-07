@@ -113,8 +113,8 @@ pub fn reconcile_inner(
     let mut conditions = Vec::new();
 
     if accepted {
-        // The dataplane retries at connection-establishment time only (Pingora's
-        // fail_to_connect); a response that has already started cannot be
+        // The dataplane retries at connection-establishment time only (a
+        // connection that could not be made); a response that has already started cannot be
         // replayed. Say so in the status rather than let `gateway-error` look
         // like response-level retry.
         let message = if policy

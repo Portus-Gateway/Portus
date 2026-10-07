@@ -689,7 +689,7 @@ spec:
         <text class="d-s" x="402" y="400">Gateway B · rama</text>
         <rect class="d-box hot" x="670" y="340" width="200" height="80" rx="16"/>
         <text class="d-t" x="692" y="374">dataplane</text>
-        <text class="d-s" x="692" y="400">Gateway C · pingora</text>
+        <text class="d-s" x="692" y="400">Gateway C · rama</text>
 
         <path class="d-wire" d="M190 420V452M480 420V452M770 420V452"/>
         <text class="d-l" x="200" y="450">your services</text>
@@ -710,22 +710,22 @@ spec:
     <div class="head">
       <span class="eyebrow">Network stack</span>
       <h2>We tested two engines. Rama won.</h2>
-      <p>Everything Portus decides lives in a core that knows nothing about the proxy framework underneath. So we ran the same gateway on Rama and on Pingora, on the same machine, and measured. Rama was faster on every payload rung and used 2–2.6× less memory, so it became the default in 0.2.4.</p>
+      <p>Everything Portus decides lives in a core that knows nothing about the proxy framework underneath. So we ran the same gateway on Rama and on Pingora, on the same machine, and measured. Rama was faster on every payload rung and used 2–2.6× less memory, so it became the default in 0.2.4 and the only stack in 0.4.0.</p>
     </div>
     <div class="duo">
       <div class="stack on">
-        <span class="tag">Default since 0.2.4</span>
+        <span class="tag">The data plane since 0.4.0</span>
         <h3>Rama 0.4</h3>
         <p>Used unpatched, with Portus's own upstream connection pool. 130/130 conformance, and the AI and MCP gateways run on it.</p>
         <div class="figs"><div><b>+3–31 %</b><span>throughput vs Pingora, every rung</span></div><div><b>2–2.6×</b><span>less memory</span></div></div>
       </div>
       <div class="stack">
-        <span class="tag">Default until 0.2.3</span>
+        <span class="tag">Removed in 0.4.0</span>
         <h3>Pingora 0.9</h3>
         <p>Cloudflare's proxy framework carried Portus through its first releases and the benchmarks above. Rama measured faster than it on every payload rung.</p>
       </div>
     </div>
-    <p class="method">Rama against Pingora: a single round on the same machine, 2026-09-15. A three-round comparison ships with the next release's numbers.</p>
+    <p class="method">Rama against Pingora: a single round on the same machine, 2026-09-15.</p>
   </div>
 </section>
 

@@ -1,6 +1,6 @@
 # Contributing to Portus
 
-Portus is a Kubernetes Gateway API implementation built on Cloudflare's Pingora proxy framework, written in Rust. Contributions are welcome -- bug fixes, new features, conformance improvements, documentation, and performance work.
+Portus is a Kubernetes Gateway API implementation written in Rust, with its data plane on the Rama network stack. Contributions are welcome -- bug fixes, new features, conformance improvements, documentation, and performance work.
 
 ## Getting Started
 
@@ -25,7 +25,8 @@ The workspace contains three crates:
 | Crate | Path | What it does |
 |-------|------|--------------|
 | `portus-controller` | `crates/portus-controller` | Kubernetes controller -- reconcilers, config store, compiler, gRPC server |
-| `portus-dataplane` | `crates/portus-dataplane` | Pingora-based proxy -- config receiver, router, TLS, health/metrics |
+| `portus-dataplane-core` | `crates/portus-dataplane-core` | Network-stack-independent data plane -- config receiver, router, policies, TLS, SNI mux, L4/UDP proxies |
+| `portus-dataplane` | `crates/portus-dataplane` | The data plane binary -- the core served on Rama, health/metrics |
 | `portus-types` | `crates/portus-types` | Protobuf-generated types shared between controller and dataplane |
 
 ## Development Workflow

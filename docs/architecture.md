@@ -1,6 +1,6 @@
 # Portus Architecture
 
-Portus is a Kubernetes Gateway API implementation built on Cloudflare's Pingora proxy framework. It ships as two binaries — a controller that watches Gateway API CRDs and compiles them into a protobuf config, and a dataplane that receives that config over gRPC and routes live traffic.
+Portus is a Kubernetes Gateway API implementation in Rust; its data plane serves traffic on the [Rama](https://github.com/plabayo/rama) network stack. It ships as two binaries — a controller that watches Gateway API CRDs and compiles them into a protobuf config, and a dataplane that receives that config over gRPC and routes live traffic.
 
 ## System Overview
 
@@ -39,7 +39,7 @@ Portus is a Kubernetes Gateway API implementation built on Cloudflare's Pingora 
                                  |
                                  v
   +----------------------------------------------------------+
-  |        portus-dataplane (core + network-stack adapter)     |
+  |        portus-dataplane (core + Rama adapter)              |
   |                                                          |
   |  +----------------------------+                          |
   |  | Config Receiver Thread     |                          |
@@ -58,7 +58,7 @@ Portus is a Kubernetes Gateway API implementation built on Cloudflare's Pingora 
   |          |              |               |        |       |
   |          v              v               v        v       |
   |    +-----------+  +-----------+  +----------+ +------+   |
-  |    | Pingora   |  | Pingora   |  | SNI Mux  | | L4   |   |
+  |    | Rama      |  | Rama      |  | SNI Mux  | | L4   |   |
   |    | HTTP :80  |  | HTTPS     |<-| :443 TCP | | Proxy|   |
   |    | (h2c)     |  | (hand-off)|  | (peek)   | | :NNN |   |
   |    +-----------+  +-----------+  +----------+ +------+   |
@@ -132,11 +132,11 @@ state.connection_limiters.store(Arc::new(new_cls));
 state.l4_config.store(Arc::new(new_l4));
 ```
 
-Pingora worker threads calling `routes.load()` get a snapshot — either entirely the old config or entirely the new one. There's no lock, no mutex, no blocking. Readers on the old config drain naturally as the `Arc` refcount drops to zero.
+Worker threads calling `routes.load()` get a snapshot — either entirely the old config or entirely the new one. There's no lock, no mutex, no blocking. Readers on the old config drain naturally as the `Arc` refcount drops to zero.
 
 ### 8. Request routing
 
-A request arrives at Pingora on the original client socket (the listener manager hands it over in-process, so the local port is the real listener port). The `Router::request_filter` implementation extracts the Host header and the socket's local port, and looks up the route:
+A request arrives at the Rama HTTP service on the original client socket (the listener manager hands it over in-process, so the local port is the real listener port). `plan::plan_request` in the core takes the Host header and the socket's local port, and looks up the route:
 
 1. Try `host:port` key in the route map (for port-specific listeners)
 2. Fall back to plain `host`
@@ -188,35 +188,31 @@ The pruning covers HTTPRoutes, Gateways, ReferenceGrants, GRPCRoutes, TLSRoutes,
 
 ### Startup Sequence
 
-The dataplane `main()` starts by spawning the config receiver thread, then blocks the main thread waiting for the first config with a 60-second deadline. This ensures Pingora doesn't start accepting connections until routes are loaded. If the controller is unreachable for 60 seconds, the process exits (the pod restarts via Kubernetes).
+The dataplane `main()` starts by spawning the config receiver thread, then blocks the main thread waiting for the first config with a 60-second deadline. This ensures the proxy doesn't start accepting connections until routes are loaded. If the controller is unreachable for 60 seconds, the process exits (the pod restarts via Kubernetes).
 
 Once the first config arrives:
 
 1. The listener manager (`l4_proxy::run_l4_proxy`) spawns on its own OS thread. It binds every listener port in the compiled config (HTTP, HTTPS, TLS, TCP as TCP sockets; UDP as UDP sockets) and follows config changes: a new listener port is bound within a second, a removed one released.
-2. Pingora's HTTP and HTTPS services have no sockets of their own: they accept connections the listener manager hands over in-process (`HandoffSource` channels in the patched pingora-core) on the original client socket. HTTP ports go straight to the HTTP service (h2c enabled for gRPC); HTTPS/TLS ports go through the SNI decision first.
+2. The Rama HTTP and HTTPS services have no sockets of their own: they accept connections the listener manager hands over in-process (`serve::handoff_loop` reads an mpsc channel of accepted `std::net::TcpStream`s and serves each with `SocketInfo` carrying the real peer and listener port). HTTP ports go straight to the HTTP service (h2c enabled for gRPC); HTTPS/TLS ports go through the SNI decision first.
 3. UDP ports are served by `udp_proxy.rs` (per-client sessions to UDPRoute backends).
 4. Health check endpoint binds `0.0.0.0:8081`
 5. Prometheus metrics endpoint binds `0.0.0.0:9090`
 
 The dataplane uses mimalloc as the global allocator for better multi-threaded allocation performance.
 
-### Pingora Worker Threads
+### Worker Threads
 
-Pingora spawns `available_parallelism()` worker threads with work stealing enabled and a 1024-connection upstream keepalive pool. Each worker runs the `ProxyHttp` trait implementation on the `Router` struct.
+The Rama stack runs on one multi-thread tokio runtime with `runtime::worker_threads()` workers: `DATAPLANE_THREADS` if set, else the cgroup CPU quota, else the host's cores. HTTP/1.1 and HTTP/2 (prior knowledge or ALPN) share one `HttpServer::auto` with bounded h2 settings (100 concurrent streams, 64 KiB header lists, 64 KiB frames) and a 64 KiB HTTP/1 read buffer. Health (`:8081`) and metrics (`:9090`) run outside the graceful-shutdown guard so they answer during a drain.
 
-### ProxyHttp Request Flow
+### Request Flow
 
-The request lifecycle through Pingora follows this path:
+The network stack is a thin adapter; every decision is the core's.
 
-**`request_filter`** — Route matching and early returns. This is where the route lookup, redirect handling, CORS preflight, rate limiting, circuit breaker checks, and authentication all happen. For redirect routes, a 3xx response is sent directly and the function returns `Ok(true)` to short-circuit proxying. For normal routes, the matched `PathRoute`'s settings (timeouts, headers, TLS config, backend info) are cached into the per-request `RouterCtx`.
+**Plan** — `ProxyService` extracts the request's facts (host, path, method, headers, listener port, TLS, peer) and calls `plan::plan_request`, which answers one of three ways. `Respond` is a reply the gateway sends itself: redirects, CORS preflights, IP filter and body-limit refusals, authentication challenges (Basic, API key, JWT, the ExtAuth service's denial), rate limits, open circuits. `NeedsBody` asks the stack to scan the body for the JSON fields an AI or MCP route matches on, then plan again. `Forward` carries everything needed to proxy: the chosen backend and its endpoint pool (weighted backends chosen by `select_weighted_backend`), upstream TLS and BackendTLSPolicy, timeouts, retries, header mutations, auth headers, URL rewrites, CORS response headers, the circuit breaker and connection-limit slot, the route's metrics and the request's trace span.
 
-**`upstream_peer`** — Backend selection. Loads the `ServiceLbMap` from ArcSwap, builds the LB key from the service name and port stored in `RouterCtx`, selects a backend via round-robin, and constructs an `HttpPeer`. For weighted backends, `select_weighted_backend` uses a global atomic counter with modular arithmetic for deterministic proportional distribution. If the backend requires TLS (upstream_tls), the peer is configured with SNI and cert verification settings.
+**Forward** — `proxy.rs` applies the request header mutations, auth headers and `traceparent`, rewrites path and host, and sends through `client::Upstream`: Portus's own connector over Rama's TCP and TLS connectors, with idle connections sharded per target (address, HTTP version and TLS fingerprint, so a connection verified under one BackendTLSPolicy never serves another). Retries replay buffered bodies on the configured codes and connection errors. Upstream errors map to Gateway API statuses: 502 for a refused or reset backend, 504 for a configured timeout, 503 for no endpoints.
 
-**`upstream_request_filter`** — Header mutation. Applies request header add/set/remove operations from the route's `HeaderMutation` config. Also applies URL rewrites (path and hostname) and sets the `:authority` header for H2C/gRPC backends.
-
-**`response_filter`** — Response header mutation and CORS. Applies response header add/set/remove, then adds CORS response headers (Access-Control-Allow-Origin, etc.) if the request matched a CORS-configured route.
-
-**`fail_to_proxy`** — Error handling. Maps Pingora errors to HTTP status codes per Gateway API semantics. When timeouts are configured, `ReadTimedout` and `ConnectTimedout` become 504 Gateway Timeout. Connection limiter permits are released here.
+**Finish** — Response header mutations and CORS headers are applied, the request is counted (`Forward::finish`, which also ends the span), the circuit breaker records the outcome and the connection-limit slot is released.
 
 ### ArcSwap for Zero-Lock Config Reads
 
@@ -234,7 +230,7 @@ type TlsCertSlot = Arc<ArcSwap<Option<TlsCertData>>>;
 
 `ArcSwap::load()` returns a guard that holds an `Arc` pointing to the current value. This is wait-free on the read path (no CAS loop, no spinlock). The writer calls `store(Arc::new(new_value))`, which atomically swaps the pointer. Old values are deallocated when all readers drop their guards.
 
-We considered `RwLock` and rejected it because Pingora worker threads would contend on the read lock during high-throughput traffic. With ArcSwap, every `request_filter` call loads a snapshot independently — there's zero contention between workers.
+We considered `RwLock` and rejected it because worker threads would contend on the read lock during high-throughput traffic. With ArcSwap, every request loads a snapshot independently — there's zero contention between workers.
 
 ### Mirror Requests
 
@@ -270,7 +266,7 @@ An HTTPS or TLS listener port is shared between three modes of traffic, and the 
 |   |   to backend (TLSRoute Terminate)     |
 |   |                                       |
 |   +-- Terminate: hand the socket to       |
-|   |   Pingora HTTPS (in-process channel)  |
+|   |   Rama HTTPS (in-process channel)     |
 |   |                                       |
 |   +-- Reject: drop connection             |
 |       (SNI matches listener but no route) |
@@ -279,17 +275,17 @@ An HTTPS or TLS listener port is shared between three modes of traffic, and the 
 
 The decision logic in `sni_mux_decision()`:
 
-1. If no SNI is present, hand the connection to Pingora's HTTPS service (Terminate).
+1. If no SNI is present, hand the connection to the HTTPS service (Terminate).
 2. Find the most specific TLS listener whose hostname matches the SNI. Specificity scoring: exact hostname = 1000, wildcard = (number of dots + 2), empty (match-all) = 1.
 3. If a listener matches, look up a route within that listener's scope (exact hostname first, then wildcard).
 4. If route found on a Passthrough listener: proxy bidirectionally to the backend. The TLS is never decrypted.
 5. If route found on a Terminate listener: perform TLS termination using the listener's certificate (from the Gateway's Secret reference), then proxy plaintext to the backend. This is for TLSRoute with mode=Terminate.
 6. If a listener matches but no route exists: reject (drop the connection). This prevents TLS passthrough listeners from leaking traffic to the HTTPS handler.
-7. If no listener matches at all: hand the connection to Pingora's HTTPS service. This handles HTTPS traffic for HTTPRoutes and GRPCRoutes.
+7. If no listener matches at all: hand the connection to the HTTPS service. This handles HTTPS traffic for HTTPRoutes and GRPCRoutes.
 
 ### HTTPS hand-off (no loopback hop)
 
-The SNI mux owns the `:443` socket. When a connection is to be terminated as HTTPS, the mux converts the accepted `tokio::net::TcpStream` to a `std::net::TcpStream` and sends it over an in-process channel; Pingora's HTTPS service is registered with `add_tls_handoff(...)` (a `ServerAddress::Handoff` endpoint added to the patched pingora-core) and accepts from that channel on its own runtime. The peeked ClientHello is still in the kernel buffer, so the TLS handshake proceeds normally, and the socket digest carries the real client address and the real local port (443). Consequences: no second TCP connection or extra copy per HTTPS byte, per-IP rate limiting / IP allowlists / `X-Forwarded-For` see the client rather than `127.0.0.1`, and the router needs no internal-port remapping (`listener_scheme_and_port()` only picks the scheme). Before 2026-09-05 the mux proxied to `127.0.0.1:18443`, which made every HTTPS client look like loopback.
+The SNI mux owns the `:443` socket. When a connection is to be terminated as HTTPS, the mux converts the accepted `tokio::net::TcpStream` to a `std::net::TcpStream` and sends it over an in-process channel; the Rama HTTPS service (`PortTlsAcceptor`, which picks the per-port rustls config for client-certificate validation) accepts from that channel. The peeked ClientHello is still in the kernel buffer, so the TLS handshake proceeds normally, and the socket digest carries the real client address and the real local port (443). Consequences: no second TCP connection or extra copy per HTTPS byte, per-IP rate limiting / IP allowlists / `X-Forwarded-For` see the client rather than `127.0.0.1`, and the router needs no internal-port remapping (`listener_scheme_and_port()` only picks the scheme). Before 2026-09-05 the mux proxied to `127.0.0.1:18443`, which made every HTTPS client look like loopback.
 
 ### TLS Certificate Hot-Reload
 
@@ -303,9 +299,9 @@ The result is zero-downtime certificate rotation with no restarts and no disk I/
 
 ### mTLS
 
-**Frontend (client certificates).** `Gateway.spec.tls.frontend` gives every HTTPS listener a client-validation policy: `default.validation` unless a `perPort[]` entry matches the listener port. The Gateway reconciler resolves each `caCertificateRefs` entry (core ConfigMap, key `ca.crt`, same namespace or granted by a ReferenceGrant) into `store.gateway_tls`; the compiler inlines the PEM bundles as `Listener.client_validation` (`ca_cert_pems`, `mode`). On the dataplane `client_validation_from_listeners` collapses that to one policy per port and the cert hot-reload thread builds one rustls `ServerConfig` per port (`tls::build_port_configs`: shared `ReloadableCertResolver`, plus a `WebPkiClientVerifier`, wrapped in `InsecureFallbackVerifier` for `AllowInsecureFallback`, or a fail-closed verifier when the bundle is unusable). Every HTTPS port shares Pingora's one hand-off endpoint, so the choice is made per connection: the patched `TlsSettings::from_config_chooser` reads the ClientHello with tokio-rustls's `LazyConfigAcceptor` and asks `PortServerConfigs` for the config matching the socket's local port, falling back to the default (no client auth) config. Status: unresolvable CA → listener `ResolvedRefs=False` (`InvalidCACertificateRef`, `InvalidCACertificateKind`, `RefNotPermitted`); no usable CA at all → `Accepted=False/NoValidCACertificate`, and the listener is not compiled (its port is not bound). Any insecure-fallback block → Gateway `InsecureFrontendValidationMode=True`.
+**Frontend (client certificates).** `Gateway.spec.tls.frontend` gives every HTTPS listener a client-validation policy: `default.validation` unless a `perPort[]` entry matches the listener port. The Gateway reconciler resolves each `caCertificateRefs` entry (core ConfigMap, key `ca.crt`, same namespace or granted by a ReferenceGrant) into `store.gateway_tls`; the compiler inlines the PEM bundles as `Listener.client_validation` (`ca_cert_pems`, `mode`). On the dataplane `client_validation_from_listeners` collapses that to one policy per port and the cert hot-reload thread builds one rustls `ServerConfig` per port (`tls::build_port_configs`: shared `ReloadableCertResolver`, plus a `WebPkiClientVerifier`, wrapped in `InsecureFallbackVerifier` for `AllowInsecureFallback`, or a fail-closed verifier when the bundle is unusable). Every HTTPS port shares one hand-off channel, so the choice is made per connection: `PortTlsAcceptor` asks `PortServerConfigs` for the config matching the socket's local port, falling back to the default (no client auth) config, and Rama resolves it after reading the ClientHello. Status: unresolvable CA → listener `ResolvedRefs=False` (`InvalidCACertificateRef`, `InvalidCACertificateKind`, `RefNotPermitted`); no usable CA at all → `Accepted=False/NoValidCACertificate`, and the listener is not compiled (its port is not bound). Any insecure-fallback block → Gateway `InsecureFrontendValidationMode=True`.
 
-**Backend (client certificate).** `spec.tls.backend.clientCertificateRef` names a TLS Secret; the compiler emits one `CompiledConfig.gateway_backend_tls` entry per Gateway (scoped per Gateway by `scope_config`, part of the fingerprint). The dataplane parses it once into Pingora's `CertKey` and indexes it by the `(service, port)` backends of that Gateway's routes (`build_backend_client_certs_from_proto`); `request_filter` caches it in `RouterCtx` and `upstream_peer` sets `HttpPeer.client_cert_key` on TLS peers, where the patched rustls connector presents it. The Gateway reports `ResolvedRefs` for the reference (`InvalidClientCertificateRef` / `RefNotPermitted`).
+**Backend (client certificate).** `spec.tls.backend.clientCertificateRef` names a TLS Secret; the compiler emits one `CompiledConfig.gateway_backend_tls` entry per Gateway (scoped per Gateway by `scope_config`, part of the fingerprint). The dataplane parses it once into a `ClientIdentity` and indexes it by the `(service, port)` backends of that Gateway's routes; the plan carries it in `Forward.client_identity`, and the upstream client presents it on TLS connections (`rama::tls::client_auth_for`, built once per identity). The Gateway reports `ResolvedRefs` for the reference (`InvalidClientCertificateRef` / `RefNotPermitted`).
 
 ## Config Change Detection
 
@@ -360,7 +356,7 @@ The cost is a few extra OS threads, which is negligible.
 
 ### ArcSwap over RwLock
 
-Covered above, but the core reason: RwLock introduces contention on the read path. Even "uncontended" RwLock has a CAS loop that cache-bounces across cores. With Pingora handling tens of thousands of requests per second across multiple worker threads, each doing a route lookup, even brief contention adds up. ArcSwap's `load()` is a single atomic load — it reads the pointer, increments a refcount, done. The writer path (`store()`) is slightly more expensive, but config updates happen at most a few times per second.
+Covered above, but the core reason: RwLock introduces contention on the read path. Even "uncontended" RwLock has a CAS loop that cache-bounces across cores. With the proxy handling tens of thousands of requests per second across multiple worker threads, each doing a route lookup, even brief contention adds up. ArcSwap's `load()` is a single atomic load — it reads the pointer, increments a refcount, done. The writer path (`store()`) is slightly more expensive, but config updates happen at most a few times per second.
 
 ### DashMap over RwLock<HashMap>
 

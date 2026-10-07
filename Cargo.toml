@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/portus-types", "crates/portus-controller", "crates/portus-dataplane-core", "crates/portus-dataplane", "crates/portus-ledger", "crates/pingora-core-patch"]
+members = ["crates/portus-types", "crates/portus-controller", "crates/portus-dataplane-core", "crates/portus-dataplane", "crates/portus-ledger"]
 resolver = "3"
 
 [workspace.package]
@@ -17,11 +17,6 @@ serde_yaml_ng = "0.10"
 schemars = "1"
 arc-swap = "1"
 prometheus = { version = "0.14", default-features = false }
-pingora-core = { version = "0.9.0", features = ["rustls"] }
-pingora-proxy = { version = "0.9.0", features = ["rustls"] }
-pingora-http = "0.9.0"
-pingora-load-balancing = "0.9.0"
-pingora-prometheus = "0.9.0"
 async-trait = "0.1"
 log = "0.4"
 env_logger = "0.11"
@@ -62,9 +57,6 @@ arrayvec = "0.7"
 regex = "1"
 hashbrown = "0.17"
 arcstr = "1"
-
-[patch.crates-io]
-pingora-core = { path = "crates/pingora-core-patch" }
 
 [profile.release]
 opt-level = 3

@@ -7,7 +7,7 @@
 //! outlier ejection), TLS material and hot reload, the SNI mux and the L4/UDP
 //! proxies, metrics and readiness.
 //!
-//! A network stack adapter (Pingora today) turns a [`bootstrap::Bootstrap`] into
+//! The network stack adapter (Rama, in `portus-dataplane`) turns a [`bootstrap::Bootstrap`] into
 //! a running proxy: it accepts the connections the listener manager hands off,
 //! drives one request through [`router`]'s decisions and talks to the backend
 //! the [`pool::Pool`] picked. Nothing in this crate names a proxy framework.

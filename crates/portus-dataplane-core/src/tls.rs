@@ -1021,9 +1021,8 @@ mlMFuOUI1YNH4Hyldg8G3cWE
     #[test]
     fn test_server_config_with_resolver_swap() {
         // Verify that a ServerConfig built with our resolver allows cert swap.
-        // Pingora internally wraps this in a TlsAcceptor via
-        // TlsAcceptor::from(Arc<ServerConfig>); the resolver's ArcSwap is
-        // what makes new handshakes pick up swapped certs.
+        // The stack's TLS acceptor serves this ServerConfig as-is; the
+        // resolver's ArcSwap is what makes new handshakes pick up swapped certs.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ck = load_certified_key_from_pem(TEST_CERT_PEM, TEST_KEY_PEM).unwrap();
         let resolver = Arc::new(ReloadableCertResolver::new(ck));

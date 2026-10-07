@@ -6,13 +6,13 @@ Prior context lives in Grimoire under the root doc **Portus** (architecture, con
 
 ## What This Project Is
 
-Portus is a **Kubernetes Gateway API implementation** built on Cloudflare's [Pingora](https://github.com/cloudflare/pingora) proxy framework. It consists of:
+Portus is a **Kubernetes Gateway API implementation** in Rust; the data plane serves traffic on the [Rama](https://github.com/plabayo/rama) network stack. It consists of:
 
 - **portus-controller** — Kubernetes controller that watches Gateway API CRDs (Gateways, HTTPRoutes, GRPCRoutes, TCPRoutes, TLSRoutes, etc.), reconciles them into a `ConfigStore`, and compiles that state into a `CompiledConfig` proto message.
-- **portus-dataplane** — Pingora-based proxy that receives `CompiledConfig` from the controller, builds route maps, and handles live traffic with full Gateway API routing semantics.
+- **portus-dataplane-core** / **portus-dataplane** — the network-stack-independent core and the binary that serves it on Rama: receives `CompiledConfig` from the controller, builds route maps, and handles live traffic with full Gateway API routing semantics.
 - **portus-types** — Shared protobuf-generated types (`CompiledConfig`, `RouteConfig`, `Listener`, etc.) used by both controller and dataplane.
 
-The data pipeline is: **Gateway API CRDs → Reconcilers → ConfigStore → compile_config → proto → config_receiver → router (Pingora)**.
+The data pipeline is: **Gateway API CRDs → Reconcilers → ConfigStore → compile_config → proto → config_receiver → router → plan (Rama)**.
 
 ## Goal: Full Gateway API Conformance
 
@@ -86,8 +86,6 @@ When a test failure is surprising:
 export PATH="$HOME/.cargo/bin:$PATH"
 cargo test --workspace -- --test-threads=1 -q
 ```
-
-The workspace includes `crates/pingora-core-patch` (our patched pingora-core), so the full run also executes upstream Pingora's ~330 unit tests (~45 s). One upstream h2 test is `#[ignore]`d with the reason inline; do not "fix" it by loosening the patch.
 
 Run a single test with output:
 ```bash

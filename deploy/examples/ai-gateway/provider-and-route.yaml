@@ -2,9 +2,8 @@
 # API to llm.example.com with a Portus API key, the gateway swaps in the
 # provider credential and records usage in the ledger.
 #
-# Needs: dataplane.networkStack=rama, aiGateway.enabled=true (the chart
-# installs the AI CRDs), and a Gateway named `gateway` in this
-# namespace with an HTTP or HTTPS listener.
+# Needs: aiGateway.enabled=true (the chart installs the AI CRDs) and a
+# Gateway named `gateway` in this namespace with an HTTP or HTTPS listener.
 apiVersion: v1
 kind: Secret
 metadata:

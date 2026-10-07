@@ -42,7 +42,7 @@ These are the request routing and traffic management features defined in the Gat
 | Request timeout | Supported | Extended (`HTTPRouteRequestTimeout`). Per-rule timeout on the full request lifecycle. |
 | Backend request timeout | Supported | Extended (`HTTPRouteBackendTimeout`). Timeout on the backend connection specifically. |
 | Backend protocol H2C | Supported | Extended (`HTTPRouteBackendProtocolH2C`). Forces HTTP/2 cleartext to backend via `appProtocol: kubernetes.io/h2c`. |
-| Backend protocol WebSocket | Supported | Extended (`HTTPRouteBackendProtocolWebSocket`). Native Pingora WebSocket handling via `appProtocol: kubernetes.io/ws`. |
+| Backend protocol WebSocket | Supported | Extended (`HTTPRouteBackendProtocolWebSocket`). Native WebSocket upgrade via `appProtocol: kubernetes.io/ws`. |
 | CORS | Supported | Extended (`HTTPRouteCORS`). Preflight and simple request handling. Configurable origins, methods, headers, credentials, max-age. |
 | Retry (`rules[].retry`) | Supported | Extended (`HTTPRouteRetry`). Upstream responses with a listed status are retried up to `attempts` more times before the last response is passed through; `backoff` is accepted but not applied (`HTTPRouteRetryBackoff` / `HTTPRouteRetryConnectionError` not claimed). Takes precedence over a `RetryPolicy` on the same route. |
 | Named route rules | Supported | Extended (`HTTPRouteNamedRouteRule`). |
@@ -98,7 +98,7 @@ These are the request routing and traffic management features defined in the Gat
 | TLSRoute Terminate | Supported | Extended (`TLSRouteModeTerminate`). TLS decrypted at proxy, TCP proxied to backend. |
 | TLSRoute mixed mode | Supported | Extended (`TLSRouteModeMixed`). Passthrough and Terminate listeners on same Gateway. |
 | SNI extraction (ClientHello peek) | Supported | Uses rustls Acceptor to parse SNI from ClientHello. |
-| SNI multiplexer | Supported | Routes to Passthrough backend, Terminate (Pingora HTTPS), or TlsTerminate (decrypt + TCP proxy). |
+| SNI multiplexer | Supported | Routes to Passthrough backend, Terminate (the HTTPS service), or TlsTerminate (decrypt + TCP proxy). |
 | Wildcard hostname matching | Supported | Both listener hostname and route hostname wildcards. |
 | Per-listener scoped routing | Supported | Most-specific listener match first, then route lookup within that listener's scope. |
 | Certificate from Secret | Supported | TLS certs loaded from Kubernetes Secrets, updated on reconciliation. |
@@ -108,7 +108,7 @@ These are the request routing and traffic management features defined in the Gat
 | Feature | Status | Notes |
 |---------|--------|-------|
 | TCPRoute | Supported | Raw bidirectional byte copying; weighted backendRefs; oldest route wins per listener. |
-| TCP proxy (L4) | Supported | Runs as separate async task alongside Pingora HTTP proxy. |
+| TCP proxy (L4) | Supported | Runs as a separate async task alongside the HTTP proxy. |
 
 ### UDP Features
 
@@ -166,7 +166,7 @@ Policies are CRDs that attach to Gateways, routes and Services with a `targetRef
 
 ## 3. Dataplane Capabilities
 
-These are proxy-level features in the Pingora-based dataplane, independent of Gateway API spec compliance.
+These are proxy-level features in the dataplane, independent of Gateway API spec compliance.
 
 ### Protocol Support
 
@@ -175,7 +175,7 @@ These are proxy-level features in the Pingora-based dataplane, independent of Ga
 | HTTP/1.1 proxying | Supported | Default upstream protocol. |
 | HTTP/2 cleartext (h2c) | Supported | Via `appProtocol: kubernetes.io/h2c` on the backend Service. |
 | gRPC proxying | Supported | Forces HTTP/2 with appropriate stream concurrency and keepalive. |
-| WebSocket | Supported | Native Pingora handling via `appProtocol: kubernetes.io/ws`. |
+| WebSocket | Supported | Native upgrade handling via `appProtocol: kubernetes.io/ws`. |
 | TLS termination | Supported | Certificates from Kubernetes Secrets, loaded via SNI multiplexer. |
 | TLS passthrough (SNI routing) | Supported | SNI extracted from ClientHello via rustls Acceptor. |
 | mTLS to backends | Supported | `Gateway.spec.tls.backend.clientCertificateRef` (TLS Secret) is presented on every TLS connection the Gateway's routes make (`CompiledConfig.gateway_backend_tls` → `HttpPeer.client_cert_key`, part of the connection-reuse hash). |

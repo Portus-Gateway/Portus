@@ -123,7 +123,7 @@ as an ordinary HTTPRoute, and HTTPS listeners do not offer `acme-tls/1`.
 ### Testing ACME locally
 
 `tests/standalone/acme-pebble-e2e.sh` runs the whole flow against
-[Pebble](https://github.com/letsencrypt/pebble) on both network stacks:
+[Pebble](https://github.com/letsencrypt/pebble):
 issuance over HTTP-01, a hot switch to TLS-ALPN-01, backends by DNS name, and
 a restart that orders nothing. It needs Go, curl and python3.
 

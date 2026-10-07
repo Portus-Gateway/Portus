@@ -222,6 +222,7 @@ mod tests {
 
     #[test]
     fn upstream_tls_views_are_cached_and_keyed_by_policy_content() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let (chain, key) = self_signed_der();
         let a = BackendTlsInfo {
             ca_certs_der: Arc::new(chain.clone()),
