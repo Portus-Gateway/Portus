@@ -45,9 +45,16 @@ Dataplanes are not chart objects. For every accepted Gateway the controller prov
 **From 0.2.12 or earlier**, once: those charts installed the CRDs from `crds/`, which Helm never upgrades and does not own, so hand them to the release first or the upgrade fails with `invalid ownership metadata`:
 
 ```bash
-deploy/helm/adopt-crds.sh portus portus   # <release> <namespace>, from the new tag
+# What deploy/helm/adopt-crds.sh <release> <namespace> does; release `portus` in namespace `portus` here.
+for crd in $(kubectl get crd -o name | grep '\.portus-gateway\.dev$'); do
+  kubectl label "$crd" app.kubernetes.io/managed-by=Helm --overwrite
+  kubectl annotate "$crd" meta.helm.sh/release-name=portus meta.helm.sh/release-namespace=portus \
+    helm.sh/resource-policy=keep --overwrite
+done
 helm upgrade portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version <new> -n portus -f my-values.yaml
 ```
+
+A plain `helm upgrade` without the loop changes nothing and fails with `invalid ownership metadata`; run the loop and upgrade again.
 
 **`v1alpha1` → `v1beta1`.** The CRDs moved to `v1beta1`. `v1alpha1` is still served, with the same schema and a deprecation warning, so existing objects and manifests keep working; `kubectl get` returns them as `v1beta1` once its discovery cache refreshes (up to 10 minutes; `kubectl api-resources` refreshes it now). Change `apiVersion: portus-gateway.dev/v1alpha1` to `v1beta1` in your manifests: a later release stops serving `v1alpha1`.
 
