@@ -5,7 +5,7 @@ Portus API keys, enforces token budgets and records usage in the ledger.
 Clients keep speaking the provider's native API.
 
 1. Install with the ledger:
-   `helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.12 -n portus --create-namespace --set aiGateway.enabled=true`.
+   `helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.3.0 -n portus --create-namespace --set aiGateway.enabled=true`.
    The chart installs and upgrades the AI CRDs; an install from 0.2.12 or
    earlier runs `deploy/helm/adopt-crds.sh <release> <namespace>` once first.
    Pass your values with `-f`, not a reuse flag. Installs first created before 0.2.6 also delete the

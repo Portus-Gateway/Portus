@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-07
+
+New auth policies, request tracing, and CRDs at `v1beta1` that the chart now upgrades. Installs from 0.2.12 or earlier hand the CRDs to Helm once before upgrading: [`docs/deployment.md`](docs/deployment.md#upgrading).
+
 ### Added
 
 - **JWTAuthPolicy.** Bearer JWTs on HTTPRoutes, GRPCRoutes and Gateways, verified against one or more issuers (`jwt.providers[]`: `issuer`, `audiences`, optional `jwksUri`, `claimToHeaders`). The controller fetches each issuer's JWKS (OpenID discovery, refreshed every 5 minutes) and ships it in the config; data planes never call the issuer. Unfetchable keys refuse every token and report `ResolvedRefs: False` (`JWKSUnavailable`). Claim headers replace any client-sent copies. See [`docs/policies.md`](docs/policies.md#jwtauthpolicy).

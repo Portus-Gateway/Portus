@@ -385,7 +385,7 @@ footer .sp { margin-left: auto; font-family: var(--mono); font-size: 12.5px; }
 
 <header class="hero" id="top">
   <div class="wrap">
-    <a class="release rise" href="https://github.com/Portus-Gateway/Portus/blob/main/CHANGELOG.md"><b>0.2.12</b> Standalone mode with ACME certificates</a>
+    <a class="release rise" href="https://github.com/Portus-Gateway/Portus/blob/main/CHANGELOG.md"><b>0.3.0</b> JWT and forward auth, OpenTelemetry tracing</a>
     <h1 class="rise d1">Portus <span class="lit">API &amp; AI Gateway</span></h1>
     <p class="lead rise d2">A fully conformant Kubernetes gateway, built in Rust for speed. It carries your <strong>HTTP, LLM and MCP traffic</strong> on one data plane.</p>
     <div class="hero-cta rise d3">
@@ -502,7 +502,7 @@ footer .sp { margin-left: auto; font-family: var(--mono); font-size: 12.5px; }
         <ul class="points">
           <li><span><b>Every route kind.</b> HTTPRoute, GRPCRoute, TLSRoute, TCPRoute, UDPRoute, ListenerSet and BackendTLSPolicy.</span></li>
           <li><span><b>A data plane per Gateway.</b> Each Gateway gets its own Deployment, Service and PodDisruptionBudget, with its address in <code>status.addresses</code>.</span></li>
-          <li><span><b>Twelve policy CRDs.</b> Timeouts, retries, rate limits, circuit breakers, health checks, CORS, IP allow lists, body limits, Basic and API-key auth.</span></li>
+          <li><span><b>Fourteen policy CRDs.</b> Timeouts, retries, rate limits, circuit breakers, health checks, CORS, IP allow lists, body limits, and Basic, API-key, JWT and forward auth.</span></li>
           <li><span><b>No intermediate config language.</b> The controller compiles your CRDs into one protobuf message and streams each Gateway its slice.</span></li>
         </ul>
       </div>
@@ -550,7 +550,7 @@ spec:
       </div>
       <div class="code">
         <div class="code-bar"><span>ai-gateway.yaml</span><button class="copy" type="button" data-copy="y-ai">Copy</button></div>
-        <pre><code data-lang="yaml" id="y-ai">apiVersion: portus-gateway.dev/v1alpha1
+        <pre><code data-lang="yaml" id="y-ai">apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata: {name: anthropic}
 spec:
@@ -558,7 +558,7 @@ spec:
   url: https://api.anthropic.com
   credential: {secretRef: {name: anthropic-key}}
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIRoute
 metadata: {name: claude}
 spec:
@@ -570,7 +570,7 @@ spec:
     - model: {type: Prefix, value: claude-}
     providerRefs: [{name: anthropic}]
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIUsagePolicy
 metadata: {name: daily-cap}
 spec:
@@ -595,14 +595,14 @@ spec:
       </div>
       <div class="code">
         <div class="code-bar"><span>mcp-gateway.yaml</span><button class="copy" type="button" data-copy="y-mcp">Copy</button></div>
-        <pre><code data-lang="yaml" id="y-mcp">apiVersion: portus-gateway.dev/v1alpha1
+        <pre><code data-lang="yaml" id="y-mcp">apiVersion: portus-gateway.dev/v1beta1
 kind: AIProvider
 metadata: {name: github-mcp}
 spec:
   kind: mcp
   url: http://github-mcp.tools.svc.cluster.local:3001
 ---
-apiVersion: portus-gateway.dev/v1alpha1
+apiVersion: portus-gateway.dev/v1beta1
 kind: AIRoute
 metadata: {name: mcp}
 spec:
@@ -782,7 +782,7 @@ kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
 # Portus: controller, GatewayClass, policy CRDs, mTLS material
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.12 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.3.0 \
   --namespace portus --create-namespace</code></pre>
     </div>
     <div class="row-btns">

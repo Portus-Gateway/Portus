@@ -24,7 +24,7 @@ kubectl apply --server-side --force-conflicts \
 The chart is published to GHCR as an OCI artifact with every release, and its images (`ghcr.io/portus-gateway/controller`, `ghcr.io/portus-gateway/dataplane`, `linux/amd64` and `linux/arm64`) are tagged with the same version, which the chart pins as its `appVersion`:
 
 ```bash
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.2.12 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.3.0 \
   --namespace portus --create-namespace
 ```
 
@@ -101,6 +101,7 @@ The stream between controller and dataplanes carries the compiled routing config
 | `dataplane.service.annotations` | `{}` | Annotations on every per-Gateway Service |
 | `grpcTls.enabled` | `true` | mTLS on the config stream |
 | `grpcTls.secretName` | `""` | Your own Secret (`ca.crt`, `tls.crt`, `tls.key`); empty generates one |
+| `crds.install` | `true` | Install and upgrade Portus's CRDs with the chart (kept on uninstall); `false` leaves them to you |
 | `serviceAccount.create` / `.name` / `.annotations` | `true` / `""` / `{}` | Controller ServiceAccount |
 | `nameOverride` / `fullnameOverride` | `""` | Resource naming |
 
