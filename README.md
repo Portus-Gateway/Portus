@@ -38,7 +38,7 @@ kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
 # Portus: controller, GatewayClass `portus-gateway`, policy CRDs, mTLS material for the config stream
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.3.0 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.4.0 \
   --namespace portus --create-namespace
 ```
 
@@ -361,7 +361,7 @@ budget syncs and usage records on the ledger stream.
 ### Helm Values
 
 ```bash
-helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.3.0 \
+helm upgrade --install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.4.0 \
   --namespace portus --create-namespace \
   --set dataplane.replicasPerGateway=3
 ```

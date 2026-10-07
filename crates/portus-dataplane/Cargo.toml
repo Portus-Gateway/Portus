@@ -1,6 +1,6 @@
 [package]
 name = "portus-dataplane"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version.workspace = true
 description = "Portus data plane: portus-dataplane-core served on the Rama network stack"

@@ -385,7 +385,7 @@ footer .sp { margin-left: auto; font-family: var(--mono); font-size: 12.5px; }
 
 <header class="hero" id="top">
   <div class="wrap">
-    <a class="release rise" href="https://github.com/Portus-Gateway/Portus/blob/main/CHANGELOG.md"><b>0.3.0</b> JWT and forward auth, OpenTelemetry tracing</a>
+    <a class="release rise" href="https://github.com/Portus-Gateway/Portus/blob/main/CHANGELOG.md"><b>0.4.0</b> One network stack: Rama</a>
     <h1 class="rise d1">Portus <span class="lit">API &amp; AI Gateway</span></h1>
     <p class="lead rise d2">A fully conformant Kubernetes gateway, built in Rust for speed. It carries your <strong>HTTP, LLM and MCP traffic</strong> on one data plane.</p>
     <div class="hero-cta rise d3">
@@ -782,7 +782,7 @@ kubectl apply --server-side --force-conflicts \
   -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.6.2/experimental-install.yaml
 
 # Portus: controller, GatewayClass, policy CRDs, mTLS material
-helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.3.0 \
+helm install portus oci://ghcr.io/portus-gateway/charts/portus-gateway --version 0.4.0 \
   --namespace portus --create-namespace</code></pre>
     </div>
     <div class="row-btns">

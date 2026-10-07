@@ -2869,7 +2869,7 @@ dependencies = [
 
 [[package]]
 name = "portus-controller"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "criterion",
  "dashmap",
@@ -2899,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "portus-dataplane"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -2926,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "portus-dataplane-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -2968,7 +2968,7 @@ dependencies = [
 
 [[package]]
 name = "portus-ledger"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "env_logger",
@@ -2990,7 +2990,7 @@ dependencies = [
 
 [[package]]
 name = "portus-types"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "prost",
  "prost-types",
