@@ -19,6 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The chart upgrades Portus's CRDs.** They moved from `crds/` into the templates with `helm.sh/resource-policy: keep` (`crds.install`, default true). Installs from 0.2.12 or earlier run `deploy/helm/adopt-crds.sh <release> <namespace>` once before upgrading. See [`docs/deployment.md`](docs/deployment.md#upgrading).
 - Data plane: request metrics are resolved once per endpoint pool, request headers use typed names, and the HTTP/2 upstream connection set is lock-free (about 3 % less CPU per request at a fixed rate).
 
+### Fixed
+
+- BasicAuthPolicy and APIKeyAuthPolicy accepted a cross-namespace Secret only through a ReferenceGrant whose `from.group` was `gateway.networking.k8s.io`, a group those kinds are not in. They now require `portus-gateway.dev`, like ExtAuthPolicy; a grant written for the old group must change its `from.group`.
+
 ## [0.2.12] - 2026-10-01
 
 Standalone mode (`PORTUS_CONFIG_FILE`) as a plain reverse proxy: [`docs/standalone.md`](docs/standalone.md).

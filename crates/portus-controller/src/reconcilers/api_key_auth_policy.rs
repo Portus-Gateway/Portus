@@ -5,7 +5,7 @@
 //! ConfigStore, writes status conditions.
 
 use super::policy_common::{find_winner_key, resolve_conflicts};
-use super::{is_reference_allowed, ReconcileContext, ReconcileError};
+use super::{is_reference_allowed_from, ReconcileContext, ReconcileError};
 use crate::policy_types::APIKeyAuthPolicy;
 use crate::status;
 use crate::store::{ApiKeyAuthPolicyState, ConfigStore, NamespacedName, PolicyTargetKey};
@@ -68,8 +68,9 @@ pub fn reconcile_inner(
 
     // Cross-namespace secret reference requires a ReferenceGrant
     if secret_ns != namespace
-        && !is_reference_allowed(
+        && !is_reference_allowed_from(
             &store.reference_grants,
+            "portus-gateway.dev",
             namespace,
             "APIKeyAuthPolicy",
             secret_ns,
@@ -300,6 +301,43 @@ mod tests {
             },
             status: None,
         }
+    }
+
+    /// A Secret in another namespace needs a ReferenceGrant from this
+    /// policy's own group, `portus-gateway.dev`; one naming the Gateway API
+    /// group grants nothing to a Portus kind (it was the only group accepted).
+    #[test]
+    fn test_cross_namespace_secret_needs_a_grant_from_the_portus_group() {
+        use crate::store::{ReferenceGrantFrom, ReferenceGrantState, ReferenceGrantTo};
+        let reconcile_with_grant = |from_group: &str| {
+            let store = ConfigStore::new();
+            store.secrets.insert(
+                NamespacedName { namespace: "creds".to_string(), name: "shared".to_string() },
+                SecretState { data: HashMap::new() },
+            );
+            store.reference_grants.insert(
+                NamespacedName { namespace: "creds".to_string(), name: "allow".to_string() },
+                ReferenceGrantState {
+                    namespace: "creds".to_string(),
+                    from: vec![ReferenceGrantFrom {
+                        group: from_group.to_string(),
+                        kind: "APIKeyAuthPolicy".to_string(),
+                        namespace: "apps".to_string(),
+                    }],
+                    to: vec![ReferenceGrantTo { group: String::new(), kind: "Secret".to_string(), name: None }],
+                },
+            );
+            let mut policy = make_policy("p", "apps", "my-route", "shared");
+            policy.spec.api_key.secret_ref.namespace = Some("creds".to_string());
+            reconcile_inner(&policy, &store).unwrap()
+        };
+
+        let granted = reconcile_with_grant("portus-gateway.dev");
+        assert_eq!((granted[0].type_.as_str(), granted[0].status.as_str()), ("Accepted", "True"));
+
+        let wrong_group = reconcile_with_grant("gateway.networking.k8s.io");
+        assert_eq!(wrong_group[0].status, "False");
+        assert_eq!(wrong_group[0].reason, "RefNotPermitted");
     }
 
     #[test]

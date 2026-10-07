@@ -181,7 +181,9 @@ spec:
 ```
 
 The Secret's data is `username: bcrypt-hash`, one entry per user (cost ≥ 10; hashes
-with a lower cost are rejected). A missing or wrong credential gets `401` with
+with a lower cost are rejected). A Secret in another namespace needs a ReferenceGrant there
+with `from: {group: portus-gateway.dev, kind: BasicAuthPolicy, namespace: <policy's>}`
+and `to: {group: "", kind: Secret}`; the same holds for APIKeyAuthPolicy. A missing or wrong credential gets `401` with
 `WWW-Authenticate: Basic realm="…"`. Verification is constant-time and bounded to half
 the CPUs so a flood of bad passwords cannot starve the proxy.
 
